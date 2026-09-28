@@ -41,7 +41,11 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
+      # Full history and tags: the changelog is every commit since the
+      # previous tag.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install Linux dependencies
         if: matrix.os == 'linux'
@@ -101,6 +105,35 @@ jobs:
           esac
           ls -la dist-release
 
+      # The release page is the Downloads table and the changelog, nothing
+      # else. Install and first-launch notes live in README.md. Every OS job
+      # writes the same notes, so whichever publishes last changes nothing.
+      - name: Release notes
+        shell: bash
+        run: |
+          cat > notes.md <<EOF
+          ## Downloads
+
+          | File | For |
+          |---|---|
+          | \`Polygluttony-$TAG-windows.exe\` | Windows 10/11 (x64) installer |
+          | \`Polygluttony-$TAG-macos.zip\` | macOS (Apple Silicon) |
+          | \`Polygluttony-$TAG-linux.AppImage\` | Linux x86_64, any distribution |
+
+          ## Changelog
+
+          EOF
+          # A manual run can name a tag that does not exist yet (the release
+          # creates it), so fall back to the commit being built.
+          ref=$TAG
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || ref=HEAD
+          # Since the previous v* tag, or all history for the first release.
+          # "chore(release)" is the version bump the tag sits on, not a change.
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$ref^" 2>/dev/null || true)
+          git log --no-merges --format='- %s (%h)' "${prev:+$prev..}$ref" \
+            | grep -Ev '^- chore\(release\)' >> notes.md || echo "- No changes." >> notes.md
+          cat notes.md
+
       - name: Publish to release
         uses: softprops/action-gh-release@v3
         with:
@@ -109,15 +142,4 @@ jobs:
           draft: true
           fail_on_unmatched_files: true
           files: dist-release/*
-          body: |
-            Download the build for your platform below.
-
-            These builds are not signed with a paid developer certificate, so the OS
-            warns on first launch:
-
-            - **macOS** — the first launch is blocked. Open **System Settings →
-              Privacy & Security**, scroll to the bottom, and click **Open Anyway**;
-              then launch Polygluttony again and confirm. (Right-click → Open no longer
-              works on recent macOS.)
-            - **Windows** — on the SmartScreen prompt, click **More info → Run anyway**.
-            - **Linux** — `chmod +x Polygluttony-*.AppImage`, then run it.
+          body_path: notes.md
