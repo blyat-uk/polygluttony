@@ -105,21 +105,13 @@ jobs:
           esac
           ls -la dist-release
 
-      # The release page is the Downloads table and the changelog, nothing
+      # The release page is the changelog, then the Downloads table, nothing
       # else. Install and first-launch notes live in README.md. Every OS job
       # writes the same notes, so whichever publishes last changes nothing.
       - name: Release notes
         shell: bash
         run: |
           cat > notes.md <<EOF
-          ## Downloads
-
-          | File | For |
-          |---|---|
-          | \`Polygluttony-$TAG-windows.exe\` | Windows 10/11 (x64) installer |
-          | \`Polygluttony-$TAG-macos.zip\` | macOS (Apple Silicon) |
-          | \`Polygluttony-$TAG-linux.AppImage\` | Linux x86_64, any distribution |
-
           ## Changelog
 
           EOF
@@ -132,6 +124,16 @@ jobs:
           prev=$(git describe --tags --abbrev=0 --match 'v*' "$ref^" 2>/dev/null || true)
           git log --no-merges --format='- %s (%h)' "${prev:+$prev..}$ref" \
             | grep -Ev '^- chore\(release\)' >> notes.md || echo "- No changes." >> notes.md
+          cat >> notes.md <<EOF
+
+          ## Downloads
+
+          | File | For |
+          |---|---|
+          | \`Polygluttony-$TAG-windows.exe\` | Windows 10/11 (x64) installer |
+          | \`Polygluttony-$TAG-macos.zip\` | macOS (Apple Silicon) |
+          | \`Polygluttony-$TAG-linux.AppImage\` | Linux x86_64, any distribution |
+          EOF
           cat notes.md
 
       - name: Publish to release
