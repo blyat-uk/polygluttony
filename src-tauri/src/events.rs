@@ -105,6 +105,11 @@ pub struct FileResult {
 }
 
 /// Everything the UI hears during a run, on `TRANSLATION_EVENT`.
+///
+/// The `#[ts(skip)]` variants are internal: the pipeline sends them down the
+/// same channel so they stay ordered with the rest, the run forwarder folds
+/// them into the live board (`translation::live`) and never emits them to the
+/// webview. Episode windows read the board through `episode_snapshot`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "../../src/types/generated/")]
@@ -115,6 +120,129 @@ pub enum RunEvent {
     FileDone { file: String, has_warnings: bool, issues: Vec<VerifyIssue> },
     Error { file: String, message: String },
     RunFinished { results: Vec<FileResult> },
+    /// The episode's dialogue lines, once parsed.
+    #[ts(skip)]
+    EpisodeLines { file: String, lines: Vec<EpisodeSource> },
+    /// These line ids just went to the model.
+    #[ts(skip)]
+    Sending { file: String, ids: Vec<u32>, activity: EpisodeActivity },
+    /// Translations merged into the episode by any stage, tags stripped.
+    #[ts(skip)]
+    Landed { file: String, lines: Vec<(u32, String)> },
+    /// The request announced by the last `Sending` is over, whatever came back.
+    #[ts(skip)]
+    Idle { file: String },
+}
+
+impl RunEvent {
+    /// True for the live-board variants the forwarder keeps from the webview.
+    pub fn is_internal(&self) -> bool {
+        matches!(
+            self,
+            RunEvent::EpisodeLines { .. }
+                | RunEvent::Sending { .. }
+                | RunEvent::Landed { .. }
+                | RunEvent::Idle { .. }
+        )
+    }
+}
+
+/// Channel that tells episode windows to fetch a fresh snapshot.
+pub const EPISODE_CHANGED_EVENT: &str = "episode://changed";
+
+/// Payload of `EPISODE_CHANGED_EVENT`. `file: None` means every episode: a run
+/// started or finished.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct EpisodeChanged {
+    pub file: Option<String>,
+}
+
+/// One dialogue line as the live board first learns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct EpisodeSource {
+    /// 1-based, the pipeline's line id.
+    pub id: u32,
+    /// Centiseconds.
+    pub start_cs: u32,
+    pub end_cs: u32,
+    /// ASS override tags stripped; `\N` and `\n` kept for the view to break on.
+    pub text: String,
+}
+
+/// What the model is doing for an episode right now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub enum EpisodeActivity {
+    /// A first-pass (or full-redo) batch, 1-based.
+    Batch { batch: u32, total_batches: u32 },
+    /// The cleanup pass re-sending lines that still carry source text.
+    Cleanup,
+    /// Verify asked for these lines again.
+    Retranslate { attempt: u32, max_attempts: u32 },
+}
+
+/// What a line's Translation cell shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub enum LineStatus {
+    /// Not sent yet.
+    Waiting,
+    /// Sent, no translation yet.
+    Sending,
+    Translated,
+    /// Sent again (cleanup or verify) while an older translation stands.
+    Resending,
+    /// The episode finished without translating it.
+    Untranslated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct EpisodeLine {
+    pub id: u32,
+    pub start_cs: u32,
+    pub end_cs: u32,
+    pub source: String,
+    /// Latest translation, tags stripped.
+    pub translation: Option<String>,
+    pub status: LineStatus,
+}
+
+/// One episode as its live window shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct EpisodeSnapshot {
+    pub file: String,
+    pub state: FileStateKind,
+    pub detail: Option<String>,
+    pub error: Option<String>,
+    /// False once the run has finished or been cancelled.
+    pub run_active: bool,
+    pub activity: Option<EpisodeActivity>,
+    /// Epoch ms the current activity's request went out.
+    #[ts(type = "number | null")]
+    pub activity_since_ms: Option<u64>,
+    /// Lines with any translation.
+    pub translated: u32,
+    pub total: u32,
+    pub lines: Vec<EpisodeLine>,
+    /// Final verify issues; empty until the episode finishes.
+    pub issues: Vec<VerifyIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub enum EpisodeView {
+    /// No run this session, or the current run doesn't include this episode.
+    NotInRun,
+    /// In the run, but its source file couldn't be read.
+    Unreadable { message: String },
+    Live(EpisodeSnapshot),
 }
 
 /// Channel for all step-4 glossary events.
