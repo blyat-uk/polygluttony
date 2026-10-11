@@ -1,5 +1,6 @@
 //! Run manager: one active run; spawns ≤concurrency file pipelines; forwards
-//! engine events to the webview.
+//! engine events to the webview and folds them into the live board
+//! (`translation::live`) that episode windows read.
 //!
 //! # tx lifecycle — why the forwarder terminates
 //!
@@ -33,11 +34,12 @@ use crate::config::projects::Tone;
 use crate::config::store as config_store;
 use crate::config::Step;
 use crate::error::{AppError, AppResult};
-use crate::events::{self, FileResult, RunEvent};
+use crate::events::{self, EpisodeChanged, FileResult, RunEvent, EPISODE_CHANGED_EVENT};
 use crate::glossary::io::load_folder_glossary;
 use crate::glossary::model::Glossary;
 use crate::llm::service::LlmService;
 use crate::models::language_pair::LanguagePair;
+use crate::translation::live::LiveBoard;
 use crate::translation::pipeline::{translate_file, FileJob};
 
 /// Managed Tauri state.
@@ -125,7 +127,14 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     *guard = Some(RunHandle { cancel: cancel.clone() });
     drop(guard);
 
-    // Forwarder: engine events → webview; clears state.
+    // A fresh board before any file task can send to it; open episode windows
+    // refetch and see the new run (or that they are no longer in it).
+    app.state::<LiveBoard>().reset(&folder, &args.files);
+    let _ = app.emit(EPISODE_CHANGED_EVENT, EpisodeChanged { file: None });
+
+    // Forwarder: engine events → live board + webview; clears state. Internal
+    // (board-only) events never reach the webview; every board change nudges
+    // the episode windows.
     //
     // `rx.recv()` returns None once all Sender clones are dropped. The spawner
     // holds `tx` (dropped at end of spawner body) and `svc` (which holds one
@@ -135,8 +144,15 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     // exits naturally after RunFinished is sent and all tasks have finished.
     let app_fwd = app.clone();
     tauri::async_runtime::spawn(async move {
+        let board = app_fwd.state::<LiveBoard>();
         while let Some(ev) = rx.recv().await {
-            let _ = app_fwd.emit(events::TRANSLATION_EVENT, &ev);
+            let change = board.apply(&ev);
+            if !ev.is_internal() {
+                let _ = app_fwd.emit(events::TRANSLATION_EVENT, &ev);
+            }
+            if let Some(payload) = change.into_event() {
+                let _ = app_fwd.emit(EPISODE_CHANGED_EVENT, payload);
+            }
         }
         if let Some(state) = app_fwd.try_state::<RunState>() {
             *state.0.lock().await = None;

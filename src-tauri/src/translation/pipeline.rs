@@ -38,15 +38,19 @@ use crate::ass::decode::decode_file;
 use crate::ass::parse::{parse_dialogues, DialogueLine};
 use crate::ass::tags::strip_for_text;
 use crate::ass::writer::write_translated;
-use crate::events::{FileResult, FileStateKind, LogLevel, LogPhase, RunEvent, VerifyIssue};
+use crate::events::{
+    EpisodeActivity, FileResult, FileStateKind, LogLevel, LogPhase, RunEvent, VerifyIssue,
+};
 use crate::glossary::model::Glossary;
 use crate::llm::service::LlmService;
 use crate::models::language_pair::{output_filename, warning_filename, LanguagePair};
 use crate::translation::batch::{translate_batch_tagged, BatchOutcome, BatchSettings};
 use crate::translation::batching::{
-    halved, initial_batch_size, CONTEXT_CARRYOVER_LINES, MAX_RETRANSLATION_ATTEMPTS,
+    halved, initial_batch_size, CONTEXT_CARRYOVER_LINES, MAX_CLEANUP_LINES,
+    MAX_RETRANSLATION_ATTEMPTS,
 };
 use crate::translation::cleanup::cleanup_pass;
+use crate::translation::live::episode_sources;
 use crate::translation::source_detect::SourceDetector;
 use crate::translation::verify::{verify_file, VerifyReport};
 use crate::validation::drift;
@@ -127,6 +131,11 @@ async fn run(job: FileJob<'_>) -> Result<FileResult, String> {
         settings,
     };
 
+    st.emit(RunEvent::EpisodeLines {
+        file: job.file_name.clone(),
+        lines: episode_sources(&st.lines),
+    })
+    .await;
     st.state(FileStateKind::Translating, None).await;
     st.log(LogLevel::Info, LogPhase::Parse, format!("{} dialogue lines", st.lines.len())).await;
     if st.lines.is_empty() {
@@ -216,7 +225,7 @@ async fn run(job: FileJob<'_>) -> Result<FileResult, String> {
             )
             .await;
             for scope in &scopes {
-                st.retranslate_scope(scope).await?;
+                st.retranslate_scope(scope, attempt).await?;
             }
         }
         // Re-run cleanup after any retranslation (`translator.py:307-311`).
@@ -377,6 +386,29 @@ impl FileState<'_, '_> {
         .await;
     }
 
+    /// Live board: these ids just went to the model.
+    async fn sending(&self, ids: Vec<u32>, activity: EpisodeActivity) {
+        self.emit(RunEvent::Sending { file: self.job.file_name.clone(), ids, activity }).await;
+    }
+
+    /// Live board: what these ids read now that their translations merged.
+    async fn landed(&self, ids: &[u32]) {
+        let lines: Vec<(u32, String)> = ids
+            .iter()
+            .filter_map(|id| self.translations.get(id).map(|t| (*id, strip_for_text(t))))
+            .collect();
+        if !lines.is_empty() {
+            self.emit(RunEvent::Landed { file: self.job.file_name.clone(), lines }).await;
+        }
+    }
+
+    /// Live board: the request announced by the last `sending` is over. Not
+    /// sent after a Fatal outcome: that returns Err, and the Error event
+    /// settles the board instead.
+    async fn idle(&self) {
+        self.emit(RunEvent::Idle { file: self.job.file_name.clone() }).await;
+    }
+
     /// id → (stripped src, stripped tgt) for every translated line — the
     /// verifier's input shape.
     fn stripped_pairs(&self) -> BTreeMap<u32, (String, String)> {
@@ -409,6 +441,8 @@ impl FileState<'_, '_> {
             let raw: Vec<(u32, String)> =
                 take.iter().map(|id| (*id, self.raw_text(*id).to_string())).collect();
 
+            self.sending(take.clone(), EpisodeActivity::Batch { batch: batch_num, total_batches })
+                .await;
             let outcome = translate_batch_tagged(
                 self.job.svc,
                 &raw,
@@ -432,6 +466,7 @@ impl FileState<'_, '_> {
                     let d = drift::detect(&pairs, &self.job.glossary.all_terms());
                     let merged: Vec<u32> = map.keys().copied().collect();
                     self.translations.extend(map);
+                    self.landed(&merged).await;
                     // Carry the last ≤7 freshly translated pairs forward.
                     let from = merged.len().saturating_sub(CONTEXT_CARRYOVER_LINES);
                     let context: Vec<(String, String)> = merged[from..]
@@ -460,8 +495,10 @@ impl FileState<'_, '_> {
                     }
                 }
                 BatchOutcome::Partial { translated, failed_from } => {
-                    let merged_count = translated.len();
+                    let merged: Vec<u32> = translated.keys().copied().collect();
+                    let merged_count = merged.len();
                     self.translations.extend(translated);
+                    self.landed(&merged).await;
                     // Re-queue the unfinished tail at the front
                     // (`translator.py:518-521`); unmerged ids below
                     // `failed_from` are dropped, exactly as in Python.
@@ -525,6 +562,7 @@ impl FileState<'_, '_> {
                     return Err(message);
                 }
             }
+            self.idle().await;
         }
         Ok(())
     }
@@ -540,6 +578,18 @@ impl FileState<'_, '_> {
             .enumerate()
             .map(|(idx, d)| (idx as u32 + 1, d.text.clone()))
             .collect();
+        // The same dirty set `cleanup_pass` computes, so the live board can
+        // show the request it is about to make. Over the cap it sends nothing.
+        let dirty: Vec<u32> = self
+            .translations
+            .iter()
+            .filter(|(_, text)| det.needs_cleanup(text))
+            .map(|(id, _)| *id)
+            .collect();
+        let announced = !dirty.is_empty() && dirty.len() <= MAX_CLEANUP_LINES;
+        if announced {
+            self.sending(dirty, EpisodeActivity::Cleanup).await;
+        }
         let report = cleanup_pass(
             self.job.svc,
             det,
@@ -549,9 +599,13 @@ impl FileState<'_, '_> {
             &self.settings,
         )
         .await;
+        self.landed(&report.cleaned).await;
         if let Some(msg) = report.fatal {
             self.job.cancel.cancel();
             return Err(format!("cleanup aborted: {msg}"));
+        }
+        if announced {
+            self.idle().await;
         }
         if report.skipped_too_many {
             self.log(
@@ -579,7 +633,9 @@ impl FileState<'_, '_> {
     /// Deviation from Python: scope lines are chunked by `initial_batch_size`
     /// (sequential, merging each outcome) so large scopes don't blow the
     /// model's context window.
-    async fn retranslate_scope(&mut self, scope: &Scope) -> Result<(), String> {
+    ///
+    /// `attempt` is the verify loop's, for the live board's activity line.
+    async fn retranslate_scope(&mut self, scope: &Scope, attempt: u32) -> Result<(), String> {
         let mut context: Vec<(String, String)> = self
             .translations
             .range(..scope.context_start)
@@ -598,6 +654,11 @@ impl FileState<'_, '_> {
         }
         let chunk_size = initial_batch_size(self.job.batch_limit) as usize;
         for chunk in raw.chunks(chunk_size) {
+            self.sending(
+                chunk.iter().map(|(id, _)| *id).collect(),
+                EpisodeActivity::Retranslate { attempt, max_attempts: MAX_RETRANSLATION_ATTEMPTS },
+            )
+            .await;
             match translate_batch_tagged(
                 self.job.svc,
                 chunk,
@@ -607,12 +668,11 @@ impl FileState<'_, '_> {
             )
             .await
             {
-                BatchOutcome::Success(map) => {
+                // Partial: keep what we got; the next verify pass decides if it stuck.
+                BatchOutcome::Success(map) | BatchOutcome::Partial { translated: map, .. } => {
+                    let merged: Vec<u32> = map.keys().copied().collect();
                     self.translations.extend(map);
-                }
-                BatchOutcome::Partial { translated, .. } => {
-                    // Keep what we got; the next verify pass decides if it stuck.
-                    self.translations.extend(translated);
+                    self.landed(&merged).await;
                 }
                 BatchOutcome::Failure(message) => {
                     self.log(LogLevel::Warning, LogPhase::Retranslate, message).await;
@@ -623,6 +683,7 @@ impl FileState<'_, '_> {
                     return Err(message);
                 }
             }
+            self.idle().await;
         }
         Ok(())
     }
@@ -728,6 +789,80 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, RunEvent::FileDone { has_warnings: false, .. })));
     }
 
+    /// The live-board events, in order, as compact tags.
+    fn board_events(events: &[RunEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|e| e.is_internal())
+            .map(|e| match e {
+                RunEvent::EpisodeLines { lines, .. } => format!("lines {}", lines.len()),
+                RunEvent::Sending { ids, activity, .. } => format!("sending {ids:?} {activity:?}"),
+                RunEvent::Landed { lines, .. } => format!("landed {lines:?}"),
+                RunEvent::Idle { .. } => "idle".into(),
+                _ => unreachable!("filtered to internal events"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn batch_tells_the_live_board_sending_landed_idle() {
+        let src = ass_source(&["{\\an8}你好", "再见"]);
+        let (result, events, _, _dir) = run_pipeline(
+            &src,
+            vec![
+                Ok(ok_batch(&[(1, "Hello there friend"), (2, "Goodbye for now")])),
+                Ok(r#"{"issues":[]}"#.into()),
+            ],
+        )
+        .await;
+        assert!(result.success);
+        let lines = events
+            .iter()
+            .find_map(|e| match e {
+                RunEvent::EpisodeLines { lines, .. } => Some(lines.clone()),
+                _ => None,
+            })
+            .expect("EpisodeLines after parse");
+        assert_eq!((lines[0].id, lines[0].text.as_str()), (1, "你好"));
+        assert_eq!((lines[0].start_cs, lines[0].end_cs), (100, 150));
+        // Landed text is stripped: the reapplied {\an8} never reaches the board.
+        assert_eq!(
+            board_events(&events),
+            vec![
+                "lines 2".to_string(),
+                "sending [1, 2] Batch { batch: 1, total_batches: 1 }".into(),
+                r#"landed [(1, "Hello there friend"), (2, "Goodbye for now")]"#.into(),
+                "idle".into(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_batch_lands_and_goes_idle_before_its_resend() {
+        let src = ass_source(&["你好", "再见", "走吧"]);
+        let (_, events, _, _dir) = run_pipeline(
+            &src,
+            vec![
+                Ok(ok_batch(&[(1, "Hello my good friend")])), // partial: 2, 3 requeued
+                Ok(ok_batch(&[(2, "Goodbye then friend"), (3, "Off we go now")])),
+                Ok(r#"{"issues":[]}"#.into()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            board_events(&events),
+            vec![
+                "lines 3".to_string(),
+                "sending [1, 2, 3] Batch { batch: 1, total_batches: 1 }".into(),
+                r#"landed [(1, "Hello my good friend")]"#.into(),
+                "idle".into(),
+                "sending [2, 3] Batch { batch: 2, total_batches: 2 }".into(),
+                r#"landed [(2, "Goodbye then friend"), (3, "Off we go now")]"#.into(),
+                "idle".into(),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn partial_batch_retries_remainder() {
         let src = ass_source(&["你好", "再见", "走吧"]);
@@ -762,6 +897,14 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, RunEvent::State { state: FileStateKind::Cleanup, .. })));
+        assert_eq!(
+            board_events(&events)[4..],
+            [
+                "sending [1] Cleanup".to_string(),
+                r#"landed [(1, "Fully English now friend")]"#.into(),
+                "idle".into(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -783,6 +926,15 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, RunEvent::State { state: FileStateKind::Retranslating, .. })
         ));
+        // Only line 6 goes back, tagged with the verify attempt that asked.
+        assert_eq!(
+            board_events(&events)[4..],
+            [
+                "sending [6] Retranslate { attempt: 1, max_attempts: 3 }".to_string(),
+                r#"landed [(6, "Retranslated line six properly")]"#.into(),
+                "idle".into(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -883,13 +1035,18 @@ mod tests {
     #[tokio::test]
     async fn auth_error_is_fatal_no_halving() {
         let src = ass_source(&["你好", "再见"]);
-        let (result, _, driver, _dir) = run_pipeline(
+        let (result, events, driver, _dir) = run_pipeline(
             &src,
             vec![Err(crate::llm::error::LlmError::Http { status: 401, body: "no".into(), retry_after: None })],
         )
         .await;
         assert!(!result.success);
         assert_eq!(driver.call_count(), 1);
+        // No Idle after Fatal: the Error event settles the board.
+        assert_eq!(
+            board_events(&events).last().unwrap(),
+            "sending [1, 2] Batch { batch: 1, total_batches: 1 }"
+        );
     }
 
     #[tokio::test]

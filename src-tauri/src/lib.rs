@@ -62,6 +62,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .manage(translation::run::RunState::default())
+        .manage(translation::live::LiveBoard::default())
         .manage(glossary::run::GlossaryRunState::default())
         .manage(glossary::watch::GlossaryWatchState::default())
         .invoke_handler(tauri::generate_handler![
@@ -87,6 +88,8 @@ pub fn run() {
             commands::open_folder,
             commands::start_translation,
             commands::cancel_translation,
+            commands::episode_snapshot,
+            commands::open_episode_window,
             commands::load_glossary,
             commands::save_glossary,
             commands::start_glossary_build,
