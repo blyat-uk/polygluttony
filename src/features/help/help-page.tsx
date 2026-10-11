@@ -35,7 +35,7 @@ const STEPS = [
   {
     n: 1,
     title: "Connect an AI provider",
-    body: "Polygluttony needs an AI service to do the translating. Add one and paste in your API key.",
+    body: "Polygluttony needs an AI to do the translating. Pick a provider, paste your API key and press Connect — or use a model running on your computer.",
     to: "/connections",
     link: "Open Connections",
   },
@@ -234,7 +234,7 @@ const TROUBLE: {
 }[] = [
   {
     q: "Translate is greyed out",
-    a: "Either no AI provider is connected, or every file in the folder is already translated.",
+    a: "Either no translation connection is set up yet, or every file in the folder is already translated.",
     links: [
       { to: "/connections", label: "Connections" },
       { to: "/project", label: "Project" },
@@ -242,7 +242,7 @@ const TROUBLE: {
   },
   {
     q: "Look up names online is disabled",
-    a: "That feature needs a connection whose model can search the web. Pick a web-capable model.",
+    a: "It needs a model that can search the web. In Connections, turn on Web search for your translation model, or add a separate web search model — Anthropic, OpenAI and Google can search.",
     links: [{ to: "/connections", label: "Connections" }],
   },
   {

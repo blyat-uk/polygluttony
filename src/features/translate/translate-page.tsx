@@ -87,7 +87,7 @@ function FileStateChip({ state }: { state: FileStateKind }) {
 
 export function TranslatePage() {
   const workdir = useAppStore((s) => s.workdir);
-  const activeConnection = useAppStore((s) => s.activeConnection);
+  const translationLabel = useAppStore((s) => s.translationLabel);
   const hasUsableConnection = useAppStore((s) => s.hasUsableConnection);
   const qc = useQueryClient();
 
@@ -142,7 +142,7 @@ export function TranslatePage() {
       ? ` · using glossary (${view.glossary_terms} terms)`
       : "";
 
-  const connLabel = activeConnection ?? "no connection";
+  const connLabel = translationLabel ?? "no connection";
 
   // ── actions ──────────────────────────────────────────────────────────────────
 
@@ -479,7 +479,7 @@ export function TranslatePage() {
           </span>
         ) : !hasUsableConnection && !running ? (
           <span className="text-[11.5px] text-[color:var(--color-alert)]">
-            No usable connection — add one in Connections.
+            No translation connection — set one up in Connections.
           </span>
         ) : null}
 

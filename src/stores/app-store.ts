@@ -24,14 +24,15 @@ interface AppState {
   dialogueLineCount: number;
   hasUntranslated: boolean;
   glossaryTerms: number | null;
-  activeConnection: string | null;
+  /** Display label of the translation model (e.g. "Claude Sonnet 5.5"), null when none. */
+  translationLabel: string | null;
+  /** A usable translation connection exists — gates Translate. */
   hasUsableConnection: boolean;
   setWorkdir: (dir: string | null) => void;
   setLanguages: (source: string, target: string) => void;
   setProject: (p: ProjectState) => void;
   clearProject: () => void;
-  setActiveConnection: (name: string | null) => void;
-  setHasUsableConnection: (v: boolean) => void;
+  setTranslationStatus: (label: string | null, usable: boolean) => void;
   setGlossaryTerms: (n: number | null) => void;
 }
 
@@ -45,7 +46,7 @@ export const useAppStore = create<AppState>((set) => ({
   dialogueLineCount: 0,
   hasUntranslated: false,
   glossaryTerms: null,
-  activeConnection: null,
+  translationLabel: null,
   hasUsableConnection: false,
   setWorkdir: (workdir) => set({ workdir }),
   setLanguages: (sourceLang, targetLang) => set({ sourceLang, targetLang }),
@@ -59,7 +60,7 @@ export const useAppStore = create<AppState>((set) => ({
       hasUntranslated: false,
       glossaryTerms: null,
     }),
-  setActiveConnection: (activeConnection) => set({ activeConnection }),
-  setHasUsableConnection: (hasUsableConnection) => set({ hasUsableConnection }),
+  setTranslationStatus: (translationLabel, hasUsableConnection) =>
+    set({ translationLabel, hasUsableConnection }),
   setGlossaryTerms: (glossaryTerms) => set({ glossaryTerms }),
 }));
