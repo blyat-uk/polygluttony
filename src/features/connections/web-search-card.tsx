@@ -192,7 +192,15 @@ export function WebSearchCard({
   if (ws.mode === "translation") {
     return (
       <RoleCard variant="solid" labelledBy={titleId}>
-        {eyebrow(<StatusDot tone="aqua">On · same model</StatusDot>)}
+        {eyebrow(
+          isUsable(config.translation) ? (
+            <StatusDot tone="aqua">On · same model</StatusDot>
+          ) : (
+            <StatusDot tone="muted" hollow>
+              Waiting for translation
+            </StatusDot>
+          ),
+        )}
         <div className="mt-3 flex items-center gap-3">
           <span
             aria-hidden
