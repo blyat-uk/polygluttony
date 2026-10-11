@@ -16,7 +16,7 @@ export function StatusBar() {
   const worldType = useAppStore((s) => s.worldType);
   const fileCount = useAppStore((s) => s.fileCount);
   const lineCount = useAppStore((s) => s.dialogueLineCount);
-  const connection = useAppStore((s) => s.activeConnection);
+  const translationLabel = useAppStore((s) => s.translationLabel);
   const translating = useTranslationRun((s) => s.running);
   const navigate = useNavigate();
   const gBusy = useGlossaryRun((s) => s.busy);
@@ -72,7 +72,7 @@ export function StatusBar() {
       <span className="shrink-0">
         {sourceLang}→{targetLang}
       </span>
-      <StatusChip variant="accent">{connection ?? "No connection"}</StatusChip>
+      <StatusChip variant="accent">{translationLabel ?? "No model"}</StatusChip>
       <StateChip state={translating ? "translating" : gBusy ? "translating" : "idle"} label={gBusy && !translating ? "Busy" : undefined} />
       <span className="shrink-0 opacity-60">core {appInfo?.version ?? "…"}</span>
     </footer>

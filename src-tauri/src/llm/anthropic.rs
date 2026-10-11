@@ -4,10 +4,16 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
 
+use crate::config::providers::{self, ThinkingParam};
 use crate::config::Connection;
 use crate::llm::error::LlmError;
 use crate::llm::{base_of, client_for, get_json, parse_model_ids, post_json, timeout_of, LlmDriver, LlmRequest, LlmResponse, Usage};
 use crate::llm::sse;
+
+/// Shortest timeout a web-search call gets, whatever the connection's tuning.
+const WEB_SEARCH_TIMEOUT_SECS: u32 = 600;
+/// How many times one web-search call resumes a `pause_turn` before giving up.
+const MAX_PAUSE_CONTINUATIONS: usize = 3;
 
 pub struct AnthropicDriver {
     conn: Connection,
@@ -15,7 +21,16 @@ pub struct AnthropicDriver {
 }
 
 impl AnthropicDriver {
-    pub fn new(conn: Connection) -> Self {
+    pub fn new(mut conn: Connection) -> Self {
+        if conn.web_search {
+            // A web-search call is non-streaming: the server searches, reads
+            // the results and writes the whole answer before the first byte
+            // comes back, which can outlast the idle read timeout tuned for
+            // streamed batches (180s by default). This driver serves only that
+            // call, so floor `timeout` — it feeds both the client's idle read
+            // timeout and the per-request deadline.
+            conn.timeout = Some(conn.timeout.unwrap_or_default().max(WEB_SEARCH_TIMEOUT_SECS));
+        }
         let client = client_for(&conn);
         Self { conn, client }
     }
@@ -32,9 +47,10 @@ impl AnthropicDriver {
 
     /// Build the base request body shared by `complete` and `stream`.
     fn build_body(&self, system: &str, user: &str) -> Value {
+        let max_tokens = self.conn.max_tokens.unwrap_or(8192);
         let mut body = json!({
             "model": self.conn.model,
-            "max_tokens": self.conn.max_tokens.unwrap_or(8192),
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": user}],
         });
         // The system prompt (instructions + glossary) repeats verbatim across a
@@ -45,34 +61,145 @@ impl AnthropicDriver {
                 {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
             ]);
         }
-        if self.conn.thinking_enabled.unwrap_or(false) {
-            let mut thinking = json!({"type": "enabled"});
-            if let Some(b) = self.conn.thinking_budget {
-                thinking["budget_tokens"] = b.into();
+        // Claude 4.6+ rejects `budget_tokens`: it thinks adaptively at an
+        // effort level. Older models still take a token budget.
+        let c = &self.conn;
+        match providers::thinking_param(c.provider, &c.model, c.thinking, max_tokens) {
+            ThinkingParam::AnthropicAdaptive(effort) => {
+                body["thinking"] = json!({"type": "adaptive"});
+                body["output_config"] = json!({"effort": effort});
             }
-            body["thinking"] = thinking;
+            ThinkingParam::AnthropicBudget(budget) => {
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+            }
+            _ => {}
+        }
+        // Server-side search: results come back as content blocks in the same
+        // response. The dynamic-filtering tool version needs no separate
+        // code-execution tool.
+        if c.web_search {
+            body["tools"] = json!([{
+                "type": providers::anthropic_web_search_tool(&c.model),
+                "name": "web_search",
+                "max_uses": 5,
+            }]);
         }
         body
     }
+
+    /// A web-search call: non-streaming POSTs, resuming each `pause_turn` (the
+    /// server's own search loop hit its iteration cap) at most
+    /// [`MAX_PAUSE_CONTINUATIONS`] times. Content and usage add up across the
+    /// turn; the answer is the text after its last search (see [`answer_of`]).
+    async fn search_turn(&self, system: &str, user: &str) -> Result<LlmResponse, LlmError> {
+        let url = format!("{}/v1/messages", base_of(&self.conn));
+        let mut body = self.build_body(system, user);
+        let ask = body["messages"][0].clone();
+        let mut turn: Vec<Value> = Vec::new();
+        let mut usage = Usage::default();
+        for _ in 0..=MAX_PAUSE_CONTINUATIONS {
+            let data =
+                post_json(&self.client, &url, self.headers(), &body, timeout_of(&self.conn)).await?;
+            add_usage(&mut usage, &data["usage"]);
+            if data["stop_reason"] == "refusal" {
+                // A deliberate decline, not an empty reply: `Empty` would be
+                // retried, re-running (and re-paying for) every search.
+                return Err(LlmError::Declined(refusal_message(&data)));
+            }
+            turn.extend(data["content"].as_array().cloned().unwrap_or_default());
+            if data["stop_reason"] != "pause_turn" {
+                let text = answer_of(&turn);
+                if text.trim().is_empty() {
+                    return Err(LlmError::Empty);
+                }
+                return Ok(LlmResponse { text, usage });
+            }
+            // Resume: everything the turn produced so far goes back verbatim
+            // (thinking blocks included) as the trailing assistant message, and
+            // the API picks up from its last `server_tool_use`. No "Continue"
+            // user message.
+            body["messages"] = json!([ask, {"role": "assistant", "content": turn}]);
+        }
+        // Not `Transport`: the service would retry it, re-running (and
+        // re-billing) every search for a turn that is unlikely to settle.
+        Err(LlmError::Declined(format!(
+            "web search didn't finish after {MAX_PAUSE_CONTINUATIONS} continuations"
+        )))
+    }
+}
+
+/// Concatenated `text` blocks of a Messages response; thinking and server-tool
+/// blocks are skipped.
+fn text_of(data: &Value) -> String {
+    data.get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn block_type(block: &Value) -> &str {
+    block.get("type").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The answer of a search turn: the `text` blocks after its last server-tool
+/// block. Text before a search is narration ("I'll look up…") that would
+/// otherwise be glued onto the JSON answer. Server-tool blocks are the
+/// `web_search_tool_result` and, with the dynamic-filtering tool, the code
+/// execution it runs on the results (`server_tool_use`, `*_tool_result`).
+/// A turn that never searched answers with all of its text.
+fn answer_of(turn: &[Value]) -> String {
+    let after_tools = turn
+        .iter()
+        .rposition(|b| {
+            let t = block_type(b);
+            t == "server_tool_use" || t.ends_with("_tool_result")
+        })
+        .map_or(0, |last| last + 1);
+    turn[after_tools..]
+        .iter()
+        .filter(|b| block_type(b) == "text")
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+/// What a `refusal` stop says, with its category when the API names one.
+fn refusal_message(data: &Value) -> String {
+    match data["stop_details"]["category"].as_str() {
+        Some(category) => format!("Claude declined to answer this request ({category})"),
+        None => "Claude declined to answer this request".to_string(),
+    }
+}
+
+/// Add one response's `usage` to a running total; a meter stays `None` until
+/// some response reports it.
+fn add_usage(total: &mut Usage, u: &Value) {
+    let add = |sum: &mut Option<u64>, key: &str| {
+        if let Some(n) = u[key].as_u64() {
+            *sum = Some(sum.unwrap_or(0) + n);
+        }
+    };
+    add(&mut total.input_tokens, "input_tokens");
+    add(&mut total.output_tokens, "output_tokens");
+    add(&mut total.cache_creation_input_tokens, "cache_creation_input_tokens");
+    add(&mut total.cache_read_input_tokens, "cache_read_input_tokens");
 }
 
 #[async_trait]
 impl LlmDriver for AnthropicDriver {
     async fn complete(&self, system: &str, user: &str) -> Result<String, LlmError> {
+        if self.conn.web_search {
+            return self.search_turn(system, user).await.map(|r| r.text);
+        }
         let url = format!("{}/v1/messages", base_of(&self.conn));
         let body = self.build_body(system, user);
         let data = post_json(&self.client, &url, self.headers(), &body, timeout_of(&self.conn)).await?;
-        let text: String = data
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(Value::as_str))
-                    .collect::<String>()
-            })
-            .unwrap_or_default();
+        let text = text_of(&data);
         if text.trim().is_empty() {
             return Err(LlmError::Empty);
         }
@@ -80,6 +207,12 @@ impl LlmDriver for AnthropicDriver {
     }
 
     async fn stream(&self, req: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        // Web search goes non-streaming: a paused turn resumes by sending its
+        // content back exactly as returned, which the JSON reply hands over
+        // as-is.
+        if self.conn.web_search {
+            return self.search_turn(&req.system, &req.user).await;
+        }
         let mut body = self.build_body(&req.system, &req.user);
         body["stream"] = json!(true);
         let mut text = String::new();
@@ -145,19 +278,59 @@ impl LlmDriver for AnthropicDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Driver;
+    use crate::config::{sample, Provider, ThinkingLevel};
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn conn(base: &str) -> Connection {
         Connection {
-            driver: Driver::Anthropic, base_url: base.into(), api_key: "k".into(),
-            model: "claude-x".into(), max_tokens: Some(16), batch_dialogue_limit: None,
-            timeout: Some(10), connect_timeout: None, concurrency: None,
-            thinking_enabled: Some(false), thinking_budget: None,
-            thinking_glossary_budget: None, thinking_glossary_norm_budget: None,
-            web_search: None,
+            base_url: base.into(),
+            max_tokens: Some(16),
+            timeout: Some(10),
+            ..sample(Provider::Anthropic, "claude-x")
         }
+    }
+
+    fn body_for(model: &str, thinking: Option<ThinkingLevel>, max_tokens: u32) -> Value {
+        let c = Connection {
+            thinking,
+            max_tokens: Some(max_tokens),
+            ..sample(Provider::Anthropic, model)
+        };
+        AnthropicDriver::new(c).build_body("sys", "u")
+    }
+
+    fn search_body_for(model: &str, thinking: Option<ThinkingLevel>) -> Value {
+        let c = Connection {
+            thinking,
+            max_tokens: Some(32000),
+            web_search: true,
+            ..sample(Provider::Anthropic, model)
+        };
+        AnthropicDriver::new(c).build_body("sys", "u")
+    }
+
+    fn search_conn(base: &str) -> Connection {
+        Connection { web_search: true, ..conn(base) }
+    }
+
+    fn req() -> LlmRequest {
+        LlmRequest { system: "s".into(), user: "u".into() }
+    }
+
+    /// JSON bodies of every request the mock server received, in order.
+    async fn sent_bodies(server: &MockServer) -> Vec<Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json::<Value>().unwrap())
+            .collect()
+    }
+
+    fn json_reply(body: Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(body)
     }
 
     #[tokio::test]
@@ -319,27 +492,59 @@ mod tests {
         assert_eq!(resp.usage.cache_read_input_tokens, Some(1200));
     }
 
-    /// A stage clone's budget must land in the request's thinking block.
-    /// (wiremock returns 404 on an unmatched body, failing the test.)
+    /// Claude 4.6+ thinks adaptively at an effort level — `budget_tokens` is
+    /// rejected there. (wiremock returns 404 on an unmatched body.)
     #[tokio::test]
-    async fn stage_clone_budget_lands_in_request_body() {
+    async fn adaptive_claude_sends_adaptive_thinking_with_effort() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(body_partial_json(serde_json::json!({
-                "thinking": {"type": "enabled", "budget_tokens": 24000}
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [{"type":"text","text":"OK"}]
             })))
             .mount(&server)
             .await;
-        let mut c = conn(&server.uri());
-        c.thinking_enabled = Some(true);
-        c.thinking_budget = Some(6000);
-        c.thinking_glossary_norm_budget = Some(24000);
-        let d = AnthropicDriver::new(c.for_glossary_norm());
-        assert_eq!(d.complete("sys", "ping").await.unwrap(), "OK");
+        let c = Connection {
+            model: "claude-sonnet-5-5".into(),
+            thinking: Some(ThinkingLevel::High),
+            ..conn(&server.uri())
+        };
+        assert_eq!(AnthropicDriver::new(c).complete("sys", "ping").await.unwrap(), "OK");
+
+        let body = body_for("claude-opus-4-6", Some(ThinkingLevel::Low), 32000);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "low"}));
+    }
+
+    #[test]
+    fn legacy_claude_sends_a_budget_below_max_tokens() {
+        let body = body_for("claude-haiku-4-5", Some(ThinkingLevel::Medium), 32000);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "enabled", "budget_tokens": 8000}));
+        assert!(body.get("output_config").is_none());
+        // A budget that can't fit under max_tokens is dropped, not sent.
+        let tiny = body_for("claude-haiku-4-5", Some(ThinkingLevel::High), 1024);
+        assert!(tiny.get("thinking").is_none());
+    }
+
+    #[test]
+    fn no_thinking_fields_without_a_level_or_on_custom_endpoints() {
+        for body in [
+            body_for("claude-sonnet-5-5", None, 32000),
+            body_for("claude-haiku-4-5", Some(ThinkingLevel::Off), 32000),
+        ] {
+            assert!(body.get("thinking").is_none() && body.get("output_config").is_none());
+        }
+        // An Anthropic-compatible gateway: we can't know what its model takes.
+        let custom = Connection {
+            thinking: Some(ThinkingLevel::High),
+            ..sample(Provider::Custom, "claude-sonnet-5-5")
+        };
+        let body = AnthropicDriver::new(custom).build_body("s", "u");
+        assert!(body.get("thinking").is_none());
     }
 
     /// A stream that closes without `message_stop` must return Err.
@@ -373,5 +578,301 @@ mod tests {
             "unexpected message: {msg}",
         );
         assert!(err.is_retryable(), "incomplete stream should be retryable");
+    }
+
+    #[tokio::test]
+    async fn no_tools_without_web_search_on_either_path() {
+        let json_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({"content": [{"type":"text","text":"OK"}]})))
+            .mount(&json_server)
+            .await;
+        AnthropicDriver::new(conn(&json_server.uri())).complete("s", "u").await.unwrap();
+
+        let sse_server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&sse_server)
+            .await;
+        AnthropicDriver::new(conn(&sse_server.uri())).stream(&req()).await.unwrap();
+
+        let complete = &sent_bodies(&json_server).await[0];
+        let streamed = &sent_bodies(&sse_server).await[0];
+        assert!(complete.get("tools").is_none(), "complete sent tools: {complete}");
+        assert!(streamed.get("tools").is_none(), "stream sent tools: {streamed}");
+        // The plain path still streams.
+        assert_eq!(streamed["stream"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn web_search_tool_version_follows_the_model() {
+        for (model, kind) in [
+            ("claude-sonnet-5-5", "web_search_20260209"),
+            ("claude-haiku-4-5", "web_search_20250305"),
+        ] {
+            assert_eq!(
+                search_body_for(model, None)["tools"],
+                serde_json::json!([{"type": kind, "name": "web_search", "max_uses": 5}]),
+                "{model}"
+            );
+        }
+    }
+
+    /// Search turns go out as plain JSON requests on both entry points and
+    /// keep only the text blocks of the reply.
+    #[tokio::test]
+    async fn web_search_is_non_streaming_and_keeps_only_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                    {"type": "server_tool_use", "id": "srv_1", "name": "web_search",
+                     "input": {"query": "fan names"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srv_1",
+                     "content": [{"type": "web_search_result", "url": "https://x", "title": "X"}]},
+                    {"type": "text", "text": "Hello "},
+                    {"type": "text", "text": "world",
+                     "citations": [{"type": "web_search_result_location", "url": "https://x"}]}
+                ],
+                "usage": {"input_tokens": 40, "output_tokens": 9,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 300}
+            })))
+            .mount(&server)
+            .await;
+        let d = AnthropicDriver::new(search_conn(&server.uri()));
+        let resp = d.stream(&req()).await.unwrap();
+        assert_eq!(resp.text, "Hello world");
+        assert_eq!(resp.usage.input_tokens, Some(40));
+        assert_eq!(resp.usage.output_tokens, Some(9));
+        assert_eq!(resp.usage.cache_read_input_tokens, Some(300));
+        assert_eq!(d.complete("s", "u").await.unwrap(), "Hello world");
+
+        for body in sent_bodies(&server).await {
+            assert!(body.get("stream").is_none(), "web search must not stream: {body}");
+            assert_eq!(body["tools"][0]["name"], "web_search");
+        }
+    }
+
+    /// A paused turn is resumed by re-sending it with the reply's content as
+    /// the trailing assistant message — no "Continue" user turn.
+    #[tokio::test]
+    async fn pause_turn_resends_the_content_and_sums_usage() {
+        let server = MockServer::start().await;
+        let paused = serde_json::json!([
+            {"type": "server_tool_use", "id": "srv_1", "name": "web_search",
+             "input": {"query": "fan names"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srv_1",
+             "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}}
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "pause_turn",
+                "content": paused,
+                "usage": {"input_tokens": 10, "output_tokens": 5,
+                          "cache_creation_input_tokens": 300, "cache_read_input_tokens": 0}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "{\"terms\": {}}"}],
+                "usage": {"input_tokens": 20, "output_tokens": 7,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 300}
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = AnthropicDriver::new(search_conn(&server.uri())).stream(&req()).await.unwrap();
+        assert_eq!(resp.text, "{\"terms\": {}}");
+        assert_eq!(resp.usage.input_tokens, Some(30));
+        assert_eq!(resp.usage.output_tokens, Some(12));
+        assert_eq!(resp.usage.cache_creation_input_tokens, Some(300));
+        assert_eq!(resp.usage.cache_read_input_tokens, Some(300));
+
+        let bodies = sent_bodies(&server).await;
+        assert_eq!(bodies.len(), 2);
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "no extra user turn: {messages:?}");
+        assert_eq!(messages[0], serde_json::json!({"role": "user", "content": "u"}));
+        assert_eq!(messages[1], serde_json::json!({"role": "assistant", "content": paused}));
+        // The resumed request is otherwise the same request.
+        assert_eq!(bodies[1]["tools"], bodies[0]["tools"]);
+        assert_eq!(bodies[1]["system"], bodies[0]["system"]);
+    }
+
+    /// Narration before a search ("I'll look up…") isn't part of the answer.
+    #[tokio::test]
+    async fn search_answer_is_the_text_after_the_last_search() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "text", "text": "I'll search for the names fans use."},
+                    {"type": "server_tool_use", "id": "srv_1", "name": "web_search",
+                     "input": {"query": "fan names"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srv_1",
+                     "content": [{"type": "web_search_result", "url": "https://x", "title": "X"}]},
+                    {"type": "text", "text": "{\"terms\": {}}"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let resp = AnthropicDriver::new(search_conn(&server.uri())).stream(&req()).await.unwrap();
+        assert_eq!(resp.text, "{\"terms\": {}}");
+    }
+
+    /// The last search can sit in an earlier, paused response, and the
+    /// dynamic-filtering tool's code execution comes after it.
+    #[tokio::test]
+    async fn search_answer_skips_narration_across_a_pause_and_filtering() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "pause_turn",
+                "content": [
+                    {"type": "text", "text": "Searching now."},
+                    {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "q"}}
+                ]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []},
+                    {"type": "text", "text": "Let me narrow these down."},
+                    {"type": "server_tool_use", "id": "srv_2", "name": "code_execution", "input": {}},
+                    {"type": "code_execution_tool_result", "tool_use_id": "srv_2", "content": {}},
+                    {"type": "text", "text": "{\"terms\": "},
+                    {"type": "text", "text": "{}}"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let resp = AnthropicDriver::new(search_conn(&server.uri())).stream(&req()).await.unwrap();
+        assert_eq!(resp.text, "{\"terms\": {}}");
+    }
+
+    #[test]
+    fn a_turn_that_never_searched_answers_with_all_its_text() {
+        let turn = [
+            serde_json::json!({"type": "thinking", "thinking": "", "signature": "s"}),
+            serde_json::json!({"type": "text", "text": "Known "}),
+            serde_json::json!({"type": "text", "text": "already"}),
+        ];
+        assert_eq!(answer_of(&turn), "Known already");
+        // Searched, but nothing after it: no answer (an `Empty` turn).
+        let cut = [
+            serde_json::json!({"type": "text", "text": "I'll search."}),
+            serde_json::json!({"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []}),
+        ];
+        assert_eq!(answer_of(&cut), "");
+    }
+
+    /// A refusal is final: `Empty` would be retried and re-pay for searches.
+    #[tokio::test]
+    async fn a_refused_search_turn_is_declined() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "refusal",
+                "stop_details": {"type": "refusal", "category": "cyber", "explanation": "x"},
+                "content": [{"type": "text", "text": "Here is part"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let err = AnthropicDriver::new(search_conn(&server.uri())).stream(&req()).await.unwrap_err();
+        assert!(matches!(err, LlmError::Declined(_)), "{err:?}");
+        assert!(!err.is_retryable());
+        assert_eq!(err.to_string(), "Claude declined to answer this request (cyber)");
+
+        let bare = serde_json::json!({"stop_reason": "refusal", "stop_details": null, "content": []});
+        assert_eq!(refusal_message(&bare), "Claude declined to answer this request");
+    }
+
+    #[tokio::test]
+    async fn web_search_gives_up_after_three_continuations() {
+        let server = MockServer::start().await;
+        let block = serde_json::json!({"type": "server_tool_use", "id": "srv_1",
+                                       "name": "web_search", "input": {"query": "q"}});
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "pause_turn",
+                "content": [block],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let err = AnthropicDriver::new(search_conn(&server.uri()))
+            .stream(&req())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("didn't finish after 3 continuations"), "{err}");
+        // Retrying would re-run every search; the turn is unlikely to settle.
+        assert!(!err.is_retryable());
+
+        let bodies = sent_bodies(&server).await;
+        assert_eq!(bodies.len(), 4, "first request + 3 continuations");
+        // Each continuation carries everything the turn produced so far.
+        let last = bodies[3]["messages"].as_array().unwrap();
+        assert_eq!(last.len(), 2);
+        assert_eq!(last[1]["content"], serde_json::json!([block, block, block]));
+    }
+
+    #[test]
+    fn adaptive_thinking_and_web_search_share_one_body() {
+        let body = search_body_for("claude-sonnet-5-5", Some(ThinkingLevel::Medium));
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "medium"}));
+        assert_eq!(body["tools"][0]["type"], "web_search_20260209");
+        // The system prompt keeps its cache breakpoint.
+        assert_eq!(body["system"][0]["cache_control"], serde_json::json!({"type": "ephemeral"}));
+    }
+
+    /// A non-streaming search can sit silent longer than the tuned idle read
+    /// timeout; the web-search driver must not cut it off.
+    #[tokio::test]
+    async fn web_search_outlasts_the_tuned_read_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                json_reply(serde_json::json!({"content": [{"type":"text","text":"OK"}]}))
+                    .set_delay(std::time::Duration::from_millis(1500)),
+            )
+            .mount(&server)
+            .await;
+        let tuned = Connection { timeout: Some(1), ..conn(&server.uri()) };
+        // The same delay kills a plain request on this tuning...
+        assert!(AnthropicDriver::new(tuned.clone()).complete("s", "u").await.is_err());
+        // ...but not a web-search one.
+        let d = AnthropicDriver::new(Connection { web_search: true, ..tuned });
+        assert_eq!(d.conn.timeout, Some(WEB_SEARCH_TIMEOUT_SECS));
+        assert_eq!(d.stream(&req()).await.unwrap().text, "OK");
+        // A longer tuned timeout is kept.
+        let long = Connection { timeout: Some(900), ..search_conn(&server.uri()) };
+        assert_eq!(AnthropicDriver::new(long).conn.timeout, Some(900));
     }
 }

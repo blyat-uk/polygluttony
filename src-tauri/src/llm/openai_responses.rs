@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 
+use crate::config::providers::{self, ThinkingParam};
 use crate::config::Connection;
 use crate::llm::error::LlmError;
 use crate::llm::{base_of, client_for, get_json, parse_model_ids, post_json, timeout_of, LlmDriver, LlmRequest, LlmResponse, Usage};
@@ -32,16 +33,24 @@ impl OpenAiResponsesDriver {
 
     /// Build the base request body shared by `complete` and `stream`.
     fn build_body(&self, system: &str, user: &str) -> Value {
+        let c = &self.conn;
+        let max_tokens = c.max_tokens.unwrap_or(8192);
         let mut body = json!({
-            "model": self.conn.model,
-            "max_output_tokens": self.conn.max_tokens.unwrap_or(8192),
+            "model": c.model,
+            "max_output_tokens": max_tokens,
             "input": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         });
-        if self.conn.web_search.unwrap_or(false) {
+        // Runtime flag: only the resolved web-search connection carries it.
+        if c.web_search {
             body["tools"] = json!([{"type": "web_search"}]);
+        }
+        if let ThinkingParam::OpenAiEffort(effort) =
+            providers::thinking_param(c.provider, &c.model, c.thinking, max_tokens)
+        {
+            body["reasoning"] = json!({"effort": effort});
         }
         body
     }
@@ -128,23 +137,21 @@ impl LlmDriver for OpenAiResponsesDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Driver;
+    use crate::config::{sample, Provider, ThinkingLevel};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn conn(base: &str) -> Connection {
         Connection {
-            driver: Driver::OpenaiResponses, base_url: base.into(), api_key: "k".into(),
-            model: "gpt-5.2".into(), max_tokens: Some(16), batch_dialogue_limit: None,
-            timeout: Some(10), connect_timeout: None, concurrency: None,
-            thinking_enabled: None, thinking_budget: None,
-            thinking_glossary_budget: None, thinking_glossary_norm_budget: None,
-            web_search: Some(false),
+            base_url: base.into(),
+            max_tokens: Some(16),
+            timeout: Some(10),
+            ..sample(Provider::Openai, "gpt-5.2")
         }
     }
 
-    /// `web_search: true` must declare the GA `web_search` tool — not the
-    /// legacy `web_search_preview`, which is frozen out of newer controls.
+    /// The runtime `web_search` flag must declare the GA `web_search` tool —
+    /// not the legacy `web_search_preview`, which is frozen out of newer controls.
     #[tokio::test]
     async fn web_search_sends_the_ga_tool_type() {
         let server = MockServer::start().await;
@@ -160,9 +167,27 @@ mod tests {
             .mount(&server)
             .await;
         let mut c = conn(&server.uri());
-        c.web_search = Some(true);
+        c.web_search = true;
         let d = OpenAiResponsesDriver::new(c);
         assert_eq!(d.complete("s", "u").await.unwrap(), "hi");
+    }
+
+    #[test]
+    fn no_tools_without_the_runtime_flag() {
+        let body = OpenAiResponsesDriver::new(conn("http://x")).build_body("s", "u");
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn reasoning_models_get_the_thinking_level_as_effort() {
+        let body_for = |model: &str, thinking| {
+            let c = Connection { thinking, ..sample(Provider::Openai, model) };
+            OpenAiResponsesDriver::new(c).build_body("s", "u")
+        };
+        let body = body_for("gpt-5.5", Some(ThinkingLevel::Low));
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "low"}));
+        assert!(body_for("gpt-5.5", None).get("reasoning").is_none(), "model default");
+        assert!(body_for("gpt-4.1", Some(ThinkingLevel::High)).get("reasoning").is_none());
     }
 
     #[tokio::test]

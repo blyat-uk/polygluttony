@@ -21,6 +21,12 @@ pub enum LlmError {
     /// 2xx response with no usable text content.
     #[error("empty response from LLM")]
     Empty,
+    /// 2xx response the provider deliberately ended without an answer — a
+    /// safety block, or a server-side tool loop that never finished. Shown
+    /// as-is (no "failed to parse" framing) and never retried: re-sending
+    /// gets the same verdict, and would re-pay for any web searches.
+    #[error("{0}")]
+    Declined(String),
 }
 
 impl LlmError {
@@ -32,7 +38,7 @@ impl LlmError {
             }
             LlmError::Transport(_) => true,
             LlmError::Empty => true,
-            LlmError::Parse(_) => false,
+            LlmError::Parse(_) | LlmError::Declined(_) => false,
         }
     }
 
@@ -82,6 +88,7 @@ mod tests {
     #[test]
     fn parse_errors_are_not_retryable() {
         assert!(!LlmError::Parse("bad json".into()).is_retryable());
+        assert!(!LlmError::Declined("blocked".into()).is_retryable());
     }
 
     #[test]

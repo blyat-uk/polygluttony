@@ -1,5 +1,6 @@
-//! OpenAI-compatible chat-completions driver (OpenAI, Gemini OpenAI-compat,
-//! Ollama, OpenRouter, …). Mirrors `llm/openai.py:OpenAiDriver`.
+//! OpenAI-compatible chat-completions driver (Ollama, LM Studio, OpenRouter
+//! and other custom endpoints). Sends no thinking parameters: their models'
+//! controls are unknown. Mirrors `llm/openai.py:OpenAiDriver`.
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -118,18 +119,16 @@ impl LlmDriver for OpenAiDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Driver;
+    use crate::config::{sample, Provider};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn conn(base: &str) -> Connection {
         Connection {
-            driver: Driver::Openai, base_url: base.into(), api_key: "k".into(),
-            model: "gpt-x".into(), max_tokens: Some(16), batch_dialogue_limit: None,
-            timeout: Some(10), connect_timeout: None, concurrency: None,
-            thinking_enabled: None, thinking_budget: None,
-            thinking_glossary_budget: None, thinking_glossary_norm_budget: None,
-            web_search: None,
+            base_url: base.into(),
+            max_tokens: Some(16),
+            timeout: Some(10),
+            ..sample(Provider::Custom, "gpt-x")
         }
     }
 

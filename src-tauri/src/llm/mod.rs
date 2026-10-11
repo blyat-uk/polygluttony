@@ -1,7 +1,7 @@
 //! LLM client layer.
 //!
 //! Ports the Python `llm/` package: a driver abstraction over the Anthropic,
-//! OpenAI Chat Completions, and OpenAI Responses APIs, built on `reqwest`.
+//! OpenAI Chat Completions, OpenAI Responses and Gemini APIs, built on `reqwest`.
 //!
 //! Step 1 implements the one-shot [`LlmDriver::complete`] path plus a
 //! `/models` listing — enough to power connection testing, model autocomplete,
@@ -11,6 +11,7 @@
 pub mod anthropic;
 pub mod detect;
 pub mod error;
+pub mod gemini;
 pub mod openai;
 pub mod openai_responses;
 pub mod sse;
@@ -82,6 +83,7 @@ pub fn create_driver(conn: Connection) -> Box<dyn LlmDriver> {
         Driver::Anthropic => Box::new(anthropic::AnthropicDriver::new(conn)),
         Driver::Openai => Box::new(openai::OpenAiDriver::new(conn)),
         Driver::OpenaiResponses => Box::new(openai_responses::OpenAiResponsesDriver::new(conn)),
+        Driver::Gemini => Box::new(gemini::GeminiDriver::new(conn)),
     }
 }
 

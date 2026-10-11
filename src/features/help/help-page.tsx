@@ -34,8 +34,8 @@ function Section({ title, sub, children }: { title: string; sub?: string; childr
 const STEPS = [
   {
     n: 1,
-    title: "Connect an AI provider",
-    body: "Polygluttony needs an AI service to do the translating. Add one and paste in your API key.",
+    title: "Connect an AI model",
+    body: "Polygluttony needs an AI model to build your glossary and translate. Pick a provider, paste your API key and press Connect — or use a model running on your computer. One model does every step; you can give steps their own models later.",
     to: "/connections",
     link: "Open Connections",
   },
@@ -234,7 +234,7 @@ const TROUBLE: {
 }[] = [
   {
     q: "Translate is greyed out",
-    a: "Either no AI provider is connected, or every file in the folder is already translated.",
+    a: "Either no AI model is connected yet (or it still needs its API key), or every file in the folder is already translated.",
     links: [
       { to: "/connections", label: "Connections" },
       { to: "/project", label: "Project" },
@@ -242,7 +242,7 @@ const TROUBLE: {
   },
   {
     q: "Look up names online is disabled",
-    a: "That feature needs a connection whose model can search the web. Pick a web-capable model.",
+    a: "It needs a model that can search the web. In Connections, turn on Web search for your model, or add one that can — Anthropic, OpenAI and Google can search.",
     links: [{ to: "/connections", label: "Connections" }],
   },
   {

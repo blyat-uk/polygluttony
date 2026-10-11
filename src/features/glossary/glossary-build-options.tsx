@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { Globe } from "@phosphor-icons/react";
 import { ipc } from "@/lib/ipc";
+import { webSearchStatusKey } from "@/features/connections/use-connections";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Textarea } from "@/components/ui/textarea";
 import { HelpText } from "@/components/help-text";
@@ -8,9 +10,9 @@ import { HelpText } from "@/components/help-text";
 /** The normalize + personalize + context controls shared by the Build screen
  *  (CreateView) and the Update screen (UpdateView).
  *
- *  Owns the personalization-connection query rather than taking it as a prop:
- *  both callers need identical gating, and the shared react-query key means
- *  mounting it from either screen costs one fetch. */
+ *  Owns the web-search-model query rather than taking it as a prop: both
+ *  callers need identical gating, and the shared react-query key (refreshed by
+ *  every Connections change) means mounting it from either screen costs one fetch. */
 export function GlossaryBuildOptions({
   normalize,
   onNormalizeChange,
@@ -30,9 +32,10 @@ export function GlossaryBuildOptions({
   normalizeHelp: string;
   disabled?: boolean;
 }) {
-  const { data: personalizeConn } = useQuery({
-    queryKey: ["personalization-status"],
-    queryFn: ipc.personalizationStatus,
+  // Label of the model that will search (e.g. "Claude Sonnet 5.5"), or null when none resolves.
+  const { data: searchModel } = useQuery({
+    queryKey: webSearchStatusKey,
+    queryFn: ipc.webSearchStatus,
   });
 
   return (
@@ -51,12 +54,12 @@ export function GlossaryBuildOptions({
       </div>
 
       <label
-        className={`flex items-start gap-2.5 mb-1 ${!personalizeConn ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
+        className={`flex items-start gap-2.5 mb-1 ${!searchModel ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
       >
         <Checkbox
           checked={personalize}
           onCheckedChange={(v) => onPersonalizeChange(v === true)}
-          disabled={disabled || !personalizeConn}
+          disabled={disabled || !searchModel}
           className="mt-0.5"
         />
         <span className="text-sm text-foreground select-none">
@@ -64,22 +67,26 @@ export function GlossaryBuildOptions({
         </span>
       </label>
       <div className="ml-6 mb-3">
-        {!personalizeConn ? (
+        {!searchModel ? (
           <p className="mt-1 flex items-start gap-1 text-[11px] leading-snug text-muted-foreground">
             <Globe className="mt-px size-3 shrink-0 text-muted-foreground" />
             <span>
-              Needs a web-capable personalization connection — set one in Connections.
+              Needs a model that can search the web — set up Web search in{" "}
+              <Link to="/connections" className="text-primary hover:underline">
+                Connections
+              </Link>
+              .
             </span>
           </p>
         ) : (
           <HelpText>
-            Searches the web for this show&apos;s commonly-used names, so your glossary matches
-            what fans expect.
+            {searchModel} searches the web for this show&apos;s commonly-used names, so your
+            glossary matches what fans expect.
           </HelpText>
         )}
       </div>
 
-      {personalize && personalizeConn ? (
+      {personalize && searchModel ? (
         <div className="ml-6 mb-2">
           <Textarea
             value={context}

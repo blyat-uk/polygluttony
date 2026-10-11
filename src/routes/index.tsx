@@ -1,17 +1,21 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { ipc } from "@/lib/ipc";
-import { useAppStore } from "@/stores/app-store";
 import { WelcomePage } from "@/features/welcome/welcome-page";
+import {
+  connectionsQuery,
+  providersQuery,
+  syncConnectionStore,
+} from "@/features/connections/use-connections";
 
 export const Route = createFileRoute("/")({
-  beforeLoad: async () => {
-    // Seed connection state before first paint so it's correct everywhere (status
-    // bar + rail badge) without first visiting Connections: the active connection
-    // name and whether any connection is usable.
-    const view = await ipc.listConnections();
-    const store = useAppStore.getState();
-    store.setActiveConnection(view.active);
-    store.setHasUsableConnection(view.connections.some((c) => c.has_key));
+  beforeLoad: async ({ context }) => {
+    // Seed the connections (Translate's model) before first paint so the status bar label
+    // and the rail badge / Translate gating are right everywhere without visiting Connections.
+    // The results land in the query cache the Connections page reads.
+    const [cfg, providers] = await Promise.all([
+      context.queryClient.ensureQueryData(connectionsQuery),
+      context.queryClient.ensureQueryData(providersQuery),
+    ]);
+    syncConnectionStore(cfg, providers);
   },
   component: WelcomePage,
 });

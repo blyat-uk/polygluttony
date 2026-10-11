@@ -2,10 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "@/types/generated/AppInfo";
 import type { BuildMode } from "@/types/generated/BuildMode";
-import type { Connection } from "@/types/generated/Connection";
-import type { ConnectionsView } from "@/types/generated/ConnectionsView";
-import type { Preset } from "@/types/generated/Preset";
+import type { ConnectionsConfig } from "@/types/generated/ConnectionsConfig";
+import type { ModelCapabilities } from "@/types/generated/ModelCapabilities";
+import type { Provider } from "@/types/generated/Provider";
+import type { ProviderInfo } from "@/types/generated/ProviderInfo";
 import type { TestResult } from "@/types/generated/TestResult";
+import type { Model } from "@/types/generated/Model";
+import type { Step } from "@/types/generated/Step";
+import type { StepSettings } from "@/types/generated/StepSettings";
 import type { FirstRunStatus } from "@/types/generated/FirstRunStatus";
 import type { Language } from "@/types/generated/Language";
 import type { ProjectView } from "@/types/generated/ProjectView";
@@ -29,36 +33,41 @@ import type { PromptMeta } from "@/types/generated/PromptMeta";
 export const ipc = {
   /** App/core metadata. Doubles as a startup health check for the IPC bridge. */
   appInfo: () => invoke<AppInfo>("app_info"),
-  /** O21 — check whether any usable connection exists (first-run gate). */
+  /** O21 — whether a usable translation connection exists (first-run gate). */
   firstRunStatus: () => invoke<FirstRunStatus>("first_run_status"),
-  /** Return the provider preset table for the Connections UI. */
-  listPresets: () => invoke<Preset[]>("list_presets"),
-  /** O1 — list all connections with active/personalization state (no keys). */
-  listConnections: () => invoke<ConnectionsView>("list_connections"),
-  /** Read a single connection by name (includes api_key). */
-  readConnection: (name: string) => invoke<Connection>("read_connection", { name }),
-  /** O3 — upsert a connection. */
-  saveConnection: (name: string, connection: Connection) =>
-    invoke<void>("save_connection", { name, connection }),
-  /** O4 — remove a connection (fails if it is the active one). */
-  deleteConnection: (name: string) => invoke<void>("delete_connection", { name }),
-  /** Rename a connection, preserving active/personalization references. */
-  renameConnection: (oldName: string, newName: string) =>
-    invoke<void>("rename_connection", { old: oldName, new: newName }),
-  /** O2 — set the active connection. */
-  setActiveConnection: (name: string) => invoke<void>("set_active_connection", { name }),
-  /** Set the personalization (web-lookup) connection. */
-  setPersonalizationConnection: (name: string) =>
-    invoke<void>("set_personalization_connection", { name }),
-  /** Clear the personalization (web-lookup) connection. */
-  clearPersonalizationConnection: () =>
-    invoke<void>("clear_personalization_connection"),
-  /** O5 — test a connection. `detect: true` probes the endpoint's API format (Custom preset). */
-  testConnection: (connection: Connection, detect: boolean) =>
-    invoke<TestResult>("test_connection", { connection, detect }),
-  /** Fetch live model list. Same `detect` flag as testConnection for Custom. */
-  listModels: (connection: Connection, detect: boolean) =>
-    invoke<string[]>("list_models", { connection, detect }),
+  /** The Connections page's whole state: the model library, the steps, remembered keys. */
+  getConnections: () => invoke<ConnectionsConfig>("get_connections"),
+  /** Provider catalog (labels, key links, curated models, tuning defaults). */
+  listProviders: () => invoke<ProviderInfo[]>("list_providers"),
+  /** What a provider + model supports: thinking levels, web search. */
+  modelCapabilities: (provider: Provider, model: string) =>
+    invoke<ModelCapabilities>("model_capabilities", { provider, model }),
+  /** Add a library model (empty `id`) or update one. The first model does every step;
+   *  `assign` also hands that step this model. Returns the normalised page state. */
+  saveModel: (model: Model, assign?: Step) =>
+    invoke<ConnectionsConfig>("save_model", assign === undefined ? { model } : { model, assign }),
+  /** Remove a library model. Steps on it move to the first remaining model (web search: the
+   *  first that can search, else off); removing the last one goes back to first-run. */
+  removeModel: (id: string) => invoke<ConnectionsConfig>("remove_model", { id }),
+  /** One step's model and settings. `null` only for "web-search" (off). */
+  setStep: (step: Step, settings: StepSettings | null) =>
+    invoke<ConnectionsConfig>("set_step", { step, settings }),
+  /** One-model view: the same settings for extract, normalize, translate and verify — and
+   *  for web search while it runs on that same model. */
+  setSharedSteps: (settings: StepSettings) =>
+    invoke<ConnectionsConfig>("set_shared_steps", { settings }),
+  /** Switch the page to the per-step view; nothing else changes. */
+  showEveryStep: () => invoke<ConnectionsConfig>("show_every_step"),
+  /** Back to one model: every step takes `modelId` and its settings, and models no step
+   *  uses any more leave the library. */
+  useOneModel: (modelId: string) => invoke<ConnectionsConfig>("use_one_model", { modelId }),
+  /** O5 — send one tiny test request. Custom endpoints get their API format detected.
+   *  `webSearch` also exercises the provider's web-search tool. */
+  testConnection: (model: Model, webSearch?: boolean) =>
+    invoke<TestResult>("test_connection", webSearch === undefined ? { model } : { model, webSearch }),
+  /** Live model ids from the provider. Rejects when it can't be reached or the request
+   *  fails; `[]` means it answered with no models. */
+  listModels: (model: Model) => invoke<string[]>("list_models", { model }),
   /** O6/O7/O8 — open a folder: discover files, counts, detect world/language, load prefs. */
   openFolder: (path: string) =>
     invoke<ProjectView>("open_folder", { path, now: Math.floor(Date.now() / 1000) }),
@@ -131,8 +140,8 @@ export const ipc = {
   openGlossaryEditor: (folder: string) => invoke<void>("open_glossary_editor", { folder }),
   watchGlossary: (folder: string) => invoke<void>("watch_glossary", { folder }),
   unwatchGlossary: () => invoke<void>("unwatch_glossary"),
-  /** Web-capable personalization connection name, or null (checkbox gating). */
-  personalizationStatus: () => invoke<string | null>("personalization_status"),
+  /** Label of the model that does web search (e.g. "Claude Sonnet 5.5"), or null. */
+  webSearchStatus: () => invoke<string | null>("web_search_status"),
   /** Prompts — list all prompt templates with modified flags + placeholder specs. */
   listPrompts: () => invoke<PromptMeta[]>("list_prompts"),
   /** Prompts — current effective text (override or embedded default). */
