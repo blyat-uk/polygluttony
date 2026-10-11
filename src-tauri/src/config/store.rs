@@ -39,10 +39,14 @@ pub fn connection_is_usable(conn: &Connection) -> bool {
 }
 
 /// Fill unset tuning from the provider's defaults — what the UI shows for an
-/// untouched Tuning section — so a run uses the values the user sees.
+/// untouched Tuning section — so a run uses the values the user sees. The
+/// response cap is then held to what the model can write (GPT-4o can't take
+/// the 32000 cloud default); only the run's copy is clamped, never the config.
 fn with_tuning_defaults(mut conn: Connection) -> Connection {
     let t = providers::provider_info(conn.provider).tuning;
-    conn.max_tokens.get_or_insert(t.max_tokens);
+    let max_tokens = conn.max_tokens.unwrap_or(t.max_tokens);
+    let cap = providers::max_output_tokens(conn.provider, &conn.model);
+    conn.max_tokens = Some(cap.map_or(max_tokens, |cap| max_tokens.min(cap)));
     conn.batch_dialogue_limit.get_or_insert(t.batch_dialogue_limit);
     conn.timeout.get_or_insert(t.timeout);
     conn.concurrency.get_or_insert(t.concurrency);
@@ -622,6 +626,32 @@ mod tests {
         assert_eq!(run.max_tokens, Some(8192));
         assert_eq!(run.concurrency, Some(4));
         assert!(!run.web_search);
+    }
+
+    #[test]
+    fn a_run_holds_max_tokens_to_the_models_output_cap() {
+        // The 32000 cloud default is more than GPT-4o can write.
+        let cfg = with_translation(sample(Provider::Openai, "gpt-4o"));
+        assert_eq!(usable_translation(&cfg).unwrap().max_tokens, Some(16384));
+        assert_eq!(cfg.translation.as_ref().unwrap().max_tokens, None, "the config is untouched");
+
+        // An explicit value is clamped too, and one under the cap is kept.
+        let mut claude = sample(Provider::Anthropic, "claude-3-5-sonnet-20241022");
+        claude.max_tokens = Some(20000);
+        assert_eq!(usable_translation(&with_translation(claude.clone())).unwrap().max_tokens, Some(8192));
+        claude.max_tokens = Some(4000);
+        assert_eq!(usable_translation(&with_translation(claude)).unwrap().max_tokens, Some(4000));
+
+        // The search connection gets the same treatment.
+        let cfg = AppConfig {
+            web_search: WebSearch::Separate { connection: sample(Provider::Openai, "gpt-4o-mini") },
+            ..default_config()
+        };
+        assert_eq!(resolve_web_search(&cfg).unwrap().max_tokens, Some(16384));
+
+        // Models without a known cap keep the provider default.
+        let cfg = with_translation(sample(Provider::Openai, "gpt-5.5"));
+        assert_eq!(usable_translation(&cfg).unwrap().max_tokens, Some(32000));
     }
 
     #[test]

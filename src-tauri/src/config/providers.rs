@@ -360,6 +360,18 @@ pub fn thinking_param(
     }
 }
 
+/// The most output tokens this model can write, for the few families whose cap
+/// sits below the tuning defaults (32000 for cloud providers) — asking for more
+/// is a 400, not a longer answer. `None` = no known cap below the defaults.
+pub fn max_output_tokens(p: Provider, model: &str) -> Option<u32> {
+    let m = model.trim().to_ascii_lowercase();
+    match p {
+        Provider::Openai if m.starts_with("gpt-4o") => Some(16384),
+        Provider::Anthropic if m.contains("claude-3-5-") => Some(8192),
+        _ => None,
+    }
+}
+
 /// The Anthropic web-search tool `type` for this model: the dynamic-filtering
 /// version on Opus/Sonnet 4.6+, the basic one everywhere else. The tool entry
 /// is `{"type": <this>, "name": "web_search", "max_uses": 5}`.
@@ -605,6 +617,23 @@ mod tests {
         assert_eq!(thinking_param(Provider::Anthropic, "claude-sonnet-5-5", None, 32000), ThinkingParam::None);
         assert_eq!(thinking_param(Provider::Custom, "claude-sonnet-5-5", Some(High), 32000), ThinkingParam::None);
         assert_eq!(thinking_param(Provider::Ollama, "qwen3", Some(High), 32000), ThinkingParam::None);
+    }
+
+    #[test]
+    fn max_output_tokens_caps_only_the_small_limit_families() {
+        for m in ["gpt-4o", "gpt-4o-mini", "GPT-4o-2024-08-06"] {
+            assert_eq!(max_output_tokens(Provider::Openai, m), Some(16384), "{m}");
+        }
+        for m in ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-latest"] {
+            assert_eq!(max_output_tokens(Provider::Anthropic, m), Some(8192), "{m}");
+        }
+        for (p, m) in [(Provider::Openai, "gpt-4.1"), (Provider::Openai, "gpt-5.5"),
+                       (Provider::Anthropic, "claude-3-7-sonnet-20250219"),
+                       (Provider::Anthropic, "claude-sonnet-5-5"),
+                       // A gateway's models are its own business.
+                       (Provider::Custom, "gpt-4o"), (Provider::Ollama, "claude-3-5-sonnet")] {
+            assert_eq!(max_output_tokens(p, m), None, "{p:?} {m}");
+        }
     }
 
     #[test]
