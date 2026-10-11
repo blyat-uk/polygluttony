@@ -81,8 +81,12 @@ function translationNode(cfg: ConnectionsConfig, providers: ProviderInfo[]): Tra
 
 function webSearchNode(cfg: ConnectionsConfig, providers: ProviderInfo[]): WebSearchNode {
   const ws = cfg.web_search;
-  if (ws.mode === "translation") return cfg.translation ? { state: "same" } : { state: "off" };
+  if (ws.mode === "translation") {
+    if (!cfg.translation) return { state: "off" };
+    return isUsable(cfg.translation) ? { state: "same" } : { state: "needs-translation" };
+  }
   if (ws.mode === "off") return { state: "off" };
+  if (!isUsable(ws.connection)) return { state: "needs-key" };
   const info = findProvider(providers, ws.connection.provider);
   return {
     state: "separate",

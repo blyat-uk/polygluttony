@@ -8,9 +8,13 @@ export type TranslationNode =
   | { state: "needs-key" }
   | { state: "none" };
 
+/** `needs-translation`: rides on a translation connection that isn't usable yet;
+ *  `needs-key`: a separate model without a key. Neither can search right now. */
 export type WebSearchNode =
   | { state: "same" }
   | { state: "separate"; label: string }
+  | { state: "needs-translation" }
+  | { state: "needs-key" }
   | { state: "off" };
 
 type Tone = "gold" | "amber" | "aqua" | "off";
@@ -116,13 +120,23 @@ export function FlowStrip({
         <Node n={2} tone="aqua">
           Web search · {webSearch.label}
         </Node>
+      ) : webSearch.state === "needs-translation" ? (
+        <Node n={2} tone="off">
+          Web search · needs translation
+        </Node>
+      ) : webSearch.state === "needs-key" ? (
+        <Node n={2} tone="off">
+          Web search · needs a key
+        </Node>
       ) : (
         <Node n={2} tone="off">
           Web search · off
         </Node>
       )}
       <Arrow />
-      <Output active={webSearch.state !== "off"}>glossary names</Output>
+      <Output active={webSearch.state === "same" || webSearch.state === "separate"}>
+        glossary names
+      </Output>
     </figure>
   );
 }
