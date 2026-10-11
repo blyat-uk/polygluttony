@@ -93,9 +93,53 @@ fn can_search(conn: &Connection) -> bool {
 
 /// Cloud keys are account-wide, so remember them for the next connection to
 /// the same provider (prefilled in the form, reused by a separate search model).
-fn remember_key(cfg: &mut AppConfig, conn: &Connection) {
+/// Returns the key this one replaced, if any.
+fn remember_key(cfg: &mut AppConfig, conn: &Connection) -> Option<String> {
     if conn.provider.is_cloud() && !conn.api_key.is_empty() {
-        cfg.provider_keys.insert(conn.provider.id().to_string(), conn.api_key.clone());
+        cfg.provider_keys.insert(conn.provider.id().to_string(), conn.api_key.clone())
+    } else {
+        None
+    }
+}
+
+/// After `conn` replaced the remembered key `replaced`, the other role on the
+/// same provider follows when it was still on that old key: it was reusing the
+/// account key, and a rotated (revoked) key would otherwise leave it failing.
+/// A deliberately different key on the other role stays as it is.
+fn follow_new_key(other: Option<&mut Connection>, conn: &Connection, replaced: Option<String>) {
+    let Some(replaced) = replaced.filter(|old| *old != conn.api_key) else { return };
+    if let Some(other) = other.filter(|o| o.provider == conn.provider && o.api_key == replaced) {
+        other.api_key = conn.api_key.clone();
+    }
+}
+
+fn separate(web_search: &WebSearch) -> Option<&Connection> {
+    match web_search {
+        WebSearch::Separate { connection } => Some(connection),
+        WebSearch::Off | WebSearch::Translation => None,
+    }
+}
+
+fn separate_mut(web_search: &mut WebSearch) -> Option<&mut Connection> {
+    match web_search {
+        WebSearch::Separate { connection } => Some(connection),
+        WebSearch::Off | WebSearch::Translation => None,
+    }
+}
+
+/// Removing a connection is how a user takes its key off this computer, so its
+/// remembered key goes too — unless the other role still talks to the same
+/// provider (same account key). Call it once `removed` is out of `cfg`.
+/// (Switching a role to another provider keeps the old key remembered: that's
+/// what refills the form when the user switches back.)
+fn forget_key(cfg: &mut AppConfig, removed: &Connection) {
+    let still_used = cfg
+        .translation
+        .iter()
+        .chain(separate(&cfg.web_search))
+        .any(|c| c.provider == removed.provider);
+    if !still_used {
+        cfg.provider_keys.remove(removed.provider.id());
     }
 }
 
@@ -104,7 +148,8 @@ pub fn set_translation(cfg: &mut AppConfig, conn: Connection) {
     let mut conn = providers::canonicalize(conn);
     conn.thinking = normalize_thinking(conn.provider, &conn.model, conn.thinking);
     conn.web_search = false;
-    remember_key(cfg, &conn);
+    let replaced = remember_key(cfg, &conn);
+    follow_new_key(separate_mut(&mut cfg.web_search), &conn, replaced);
     let searches = can_search(&conn);
     match cfg.web_search {
         // First setup: web search starts on when the model can do it.
@@ -117,16 +162,21 @@ pub fn set_translation(cfg: &mut AppConfig, conn: Connection) {
     cfg.translation = Some(conn);
 }
 
-/// Remove the translation connection; a web search riding on it goes too.
+/// Remove the translation connection; a web search riding on it goes too, and
+/// so does its remembered key (see `forget_key`).
 pub fn clear_translation(cfg: &mut AppConfig) {
-    cfg.translation = None;
+    let removed = cfg.translation.take();
     if cfg.web_search == WebSearch::Translation {
         cfg.web_search = WebSearch::Off;
+    }
+    if let Some(removed) = removed {
+        forget_key(cfg, &removed);
     }
 }
 
 /// Set the web-search role. `Translation` needs a translation model that can
-/// search; a separate model must be able to search itself.
+/// search; a separate model must be able to search itself. Leaving a separate
+/// model for Off or Translation removes it, remembered key included.
 pub fn set_web_search(cfg: &mut AppConfig, web_search: WebSearch) -> AppResult<()> {
     let web_search = match web_search {
         WebSearch::Off => WebSearch::Off,
@@ -147,11 +197,18 @@ pub fn set_web_search(cfg: &mut AppConfig, web_search: WebSearch) -> AppResult<(
             // It makes one call per glossary build: no Thinking control here.
             conn.thinking = None;
             conn.web_search = false;
-            remember_key(cfg, &conn);
+            let replaced = remember_key(cfg, &conn);
+            follow_new_key(cfg.translation.as_mut(), &conn, replaced);
             WebSearch::Separate { connection: conn }
         }
     };
-    cfg.web_search = web_search;
+    let previous = std::mem::replace(&mut cfg.web_search, web_search);
+    if let WebSearch::Separate { connection: removed } = previous {
+        // Replacing it with another separate model is a switch, not a removal.
+        if separate(&cfg.web_search).is_none() {
+            forget_key(cfg, &removed);
+        }
+    }
     Ok(())
 }
 
@@ -675,6 +732,107 @@ mod tests {
         let mut cfg = AppConfig { web_search: sep.clone(), ..with_translation(sample(Provider::Ollama, "q")) };
         clear_translation(&mut cfg);
         assert_eq!(cfg.web_search, sep);
+    }
+
+    fn keyed(provider: Provider, model: &str, key: &str) -> Connection {
+        Connection { api_key: key.into(), ..sample(provider, model) }
+    }
+
+    fn remembered(cfg: &AppConfig, provider: &str) -> Option<String> {
+        cfg.provider_keys.get(provider).cloned()
+    }
+
+    fn separate_key(cfg: &AppConfig) -> &str {
+        let WebSearch::Separate { connection } = &cfg.web_search else { panic!("not separate") };
+        &connection.api_key
+    }
+
+    #[test]
+    fn removing_the_translation_forgets_its_key() {
+        let mut cfg = default_config();
+        set_translation(&mut cfg, keyed(Provider::Openai, "gpt-5.5", "sk-oai"));
+        // Switching providers keeps the old key: switching back refills it.
+        set_translation(&mut cfg, keyed(Provider::Anthropic, "claude-sonnet-5-5", "sk-ant"));
+        assert_eq!(remembered(&cfg, "openai").as_deref(), Some("sk-oai"));
+
+        clear_translation(&mut cfg);
+        assert_eq!(remembered(&cfg, "anthropic"), None, "removed with its connection");
+        assert_eq!(remembered(&cfg, "openai").as_deref(), Some("sk-oai"), "merely switched away from");
+    }
+
+    #[test]
+    fn removing_the_translation_keeps_a_key_the_search_model_still_uses() {
+        let mut cfg = default_config();
+        set_translation(&mut cfg, keyed(Provider::Anthropic, "claude-sonnet-5-5", "sk-ant"));
+        let haiku = keyed(Provider::Anthropic, "claude-haiku-5-5", "sk-ant");
+        set_web_search(&mut cfg, WebSearch::Separate { connection: haiku }).unwrap();
+        clear_translation(&mut cfg);
+        assert_eq!(remembered(&cfg, "anthropic").as_deref(), Some("sk-ant"));
+    }
+
+    #[test]
+    fn removing_the_separate_search_model_forgets_its_key() {
+        let mut cfg = with_translation(sample(Provider::Ollama, "qwen3"));
+        let gpt = keyed(Provider::Openai, "gpt-5.5", "sk-search");
+        set_web_search(&mut cfg, WebSearch::Separate { connection: gpt.clone() }).unwrap();
+        set_web_search(&mut cfg, WebSearch::Off).unwrap();
+        assert_eq!(remembered(&cfg, "openai"), None);
+
+        // Moving on to the translation model keeps a key the translation uses.
+        let mut cfg = default_config();
+        set_translation(&mut cfg, keyed(Provider::Openai, "gpt-5.4-mini", "sk-search"));
+        set_web_search(&mut cfg, WebSearch::Separate { connection: gpt.clone() }).unwrap();
+        set_web_search(&mut cfg, WebSearch::Translation).unwrap();
+        assert_eq!(remembered(&cfg, "openai").as_deref(), Some("sk-search"));
+
+        // Replacing it with another separate model is a switch: the key stays.
+        let mut cfg = with_translation(sample(Provider::Ollama, "qwen3"));
+        set_web_search(&mut cfg, WebSearch::Separate { connection: gpt }).unwrap();
+        let gemini = keyed(Provider::Google, "gemini-2.5-flash", "AIza-1");
+        set_web_search(&mut cfg, WebSearch::Separate { connection: gemini }).unwrap();
+        assert_eq!(remembered(&cfg, "openai").as_deref(), Some("sk-search"));
+        assert_eq!(remembered(&cfg, "google").as_deref(), Some("AIza-1"));
+    }
+
+    #[test]
+    fn a_new_key_follows_to_the_other_role_still_on_the_old_one() {
+        let mut cfg = default_config();
+        set_translation(&mut cfg, keyed(Provider::Anthropic, "claude-sonnet-5-5", "sk-old"));
+        let haiku = keyed(Provider::Anthropic, "claude-haiku-5-5", "sk-old");
+        set_web_search(&mut cfg, WebSearch::Separate { connection: haiku.clone() }).unwrap();
+
+        // A rotated key on the translation carries over to the search model...
+        set_translation(&mut cfg, keyed(Provider::Anthropic, "claude-sonnet-5-5", "sk-new"));
+        assert_eq!(separate_key(&cfg), "sk-new");
+        assert_eq!(remembered(&cfg, "anthropic").as_deref(), Some("sk-new"));
+
+        // ...and one saved on the search model carries over to the translation.
+        let rotated = keyed(Provider::Anthropic, "claude-haiku-5-5", "sk-newer");
+        set_web_search(&mut cfg, WebSearch::Separate { connection: rotated }).unwrap();
+        assert_eq!(cfg.translation.as_ref().unwrap().api_key, "sk-newer");
+    }
+
+    #[test]
+    fn a_different_key_on_the_other_role_stays() {
+        // As a v1 migration leaves it: two keys for one provider, the
+        // translation's remembered.
+        let mut cfg = AppConfig {
+            web_search: WebSearch::Separate {
+                connection: keyed(Provider::Openai, "gpt-5.4-mini", "sk-own"),
+            },
+            ..with_translation(keyed(Provider::Openai, "gpt-5.5", "sk-team"))
+        };
+        cfg.provider_keys.insert("openai".into(), "sk-team".into());
+        set_translation(&mut cfg, keyed(Provider::Openai, "gpt-5.5", "sk-team-2"));
+        assert_eq!(separate_key(&cfg), "sk-own", "it wasn't on the replaced key");
+
+        // Another provider's connection never follows.
+        let mut cfg = default_config();
+        set_translation(&mut cfg, keyed(Provider::Anthropic, "claude-sonnet-5-5", "sk-1"));
+        let gpt = keyed(Provider::Openai, "gpt-5.5", "sk-1");
+        set_web_search(&mut cfg, WebSearch::Separate { connection: gpt }).unwrap();
+        set_translation(&mut cfg, keyed(Provider::Anthropic, "claude-sonnet-5-5", "sk-2"));
+        assert_eq!(separate_key(&cfg), "sk-1");
     }
 
     #[test]
