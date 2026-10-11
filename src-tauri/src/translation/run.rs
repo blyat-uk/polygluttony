@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::projects::Tone;
 use crate::config::store as config_store;
+use crate::config::Step;
 use crate::error::{AppError, AppResult};
 use crate::events::{self, FileResult, RunEvent};
 use crate::glossary::io::load_folder_glossary;
@@ -69,7 +70,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     }
 
     let cfg = config_store::load(&app)?;
-    let conn = config_store::usable_translation(&cfg).ok_or(AppError::NoActiveConnection)?;
+    let conn = config_store::step_connection(&cfg, Step::Translate)?;
 
     if args.files.is_empty() {
         return Err(AppError::Other("no files selected".into()));

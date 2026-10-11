@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::store as config_store;
-use crate::config::Connection;
+use crate::config::{Connection, Step};
 use crate::error::{AppError, AppResult};
 use crate::events::{self, GlossaryEvent, RunEvent};
 use crate::glossary::build::{build_glossary, BuildJob, BuildMode};
@@ -143,7 +143,15 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         )));
     }
     let cfg = config_store::load(&app)?;
-    let conn = config_store::usable_translation(&cfg).ok_or(AppError::NoActiveConnection)?;
+    // Extract always runs (it also reads the reference files and sets the
+    // batch size); Normalize only when asked for, so a Normalize model without
+    // a key doesn't block a build that skips it.
+    let extract = config_store::step_connection(&cfg, Step::Extract)?;
+    let normalize = if args.normalize {
+        Some(config_store::step_connection(&cfg, Step::Normalize)?)
+    } else {
+        None
+    };
 
     let prompt_pack =
         crate::prompts::GlossaryPrompts::resolve(&crate::prompts::overrides_dir(&app)?)?;
@@ -171,8 +179,9 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     let (tx, rx) = mpsc::channel::<GlossaryEvent>(512);
     spawn_forwarder(app.clone(), rx);
 
-    // Extraction and normalization both run on the translation connection.
-    let svc = service_for(&conn, cancel.clone(), tx.clone());
+    // Each step gets its own service: its own model, and its own concurrency.
+    let svc = service_for(&extract, cancel.clone(), tx.clone());
+    let norm_svc = normalize.map(|conn| service_for(&conn, cancel.clone(), tx.clone()));
     // Personalization service only when requested AND a web-search model
     // resolves (cap 1 — single call). MUST share the build's cancel token so
     // cancel can interrupt a long web-search call.
@@ -195,7 +204,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         personalize: args.personalize,
         personalize_context: args.personalize_context,
         prompts: prompt_pack,
-        batch_limit: conn.batch_dialogue_limit,
+        batch_limit: extract.batch_dialogue_limit,
         cancel: cancel.clone(),
     };
     let app_for_release = app.clone();
@@ -206,8 +215,10 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         // so their internal log-adapter senders close before a new op can
         // claim the channel.
         let _guard = SlotGuard::new(app_for_release);
-        build_glossary(job, &svc, &svc, personalize_svc.as_ref(), tx).await;
+        // Without Normalize the build never calls `norm_svc`; extract's stands in.
+        build_glossary(job, &svc, norm_svc.as_ref().unwrap_or(&svc), personalize_svc.as_ref(), tx).await;
         drop(svc);
+        drop(norm_svc);
         drop(personalize_svc);
         // tx consumed by build_glossary → forwarder drains & exits; then
         // _guard drops here, releasing the slot.

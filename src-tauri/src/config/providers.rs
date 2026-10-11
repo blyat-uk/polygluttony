@@ -11,9 +11,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::config::{
-    AppConfig, Connection, Driver, Provider, ThinkingLevel, WebSearch, CONFIG_VERSION,
-};
+use crate::config::{AppConfig, Driver, Model, Provider, ThinkingLevel, CONFIG_VERSION};
 
 /// A curated model suggestion. The live `/models` list supplements these.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -410,35 +408,36 @@ pub fn model_label(p: Provider, model: &str) -> String {
         .map_or_else(|| id.to_string(), |m| m.label)
 }
 
-/// A connection the way the engine expects it: whitespace trimmed off the
-/// typed fields (a pasted key with a trailing newline would otherwise be
-/// rejected), and cloud providers pinned to their own driver and base URL —
-/// the UI doesn't let users edit those, and the capability table assumes them
-/// (OpenAI web search, for one, only exists on the Responses API).
-pub fn canonicalize(mut conn: Connection) -> Connection {
-    conn.base_url = conn.base_url.trim().to_string();
-    conn.api_key = conn.api_key.trim().to_string();
-    conn.model = conn.model.trim().to_string();
-    if conn.provider.is_cloud() {
-        let info = provider_info(conn.provider);
+/// A model the way the engine expects it: whitespace trimmed off the typed
+/// fields (a pasted key with a trailing newline would otherwise be rejected),
+/// and cloud providers pinned to their own driver and base URL — the UI
+/// doesn't let users edit those, and the capability table assumes them (OpenAI
+/// web search, for one, only exists on the Responses API).
+pub fn canonicalize(mut model: Model) -> Model {
+    model.base_url = model.base_url.trim().to_string();
+    model.api_key = model.api_key.trim().to_string();
+    model.model = model.model.trim().to_string();
+    if model.provider.is_cloud() {
+        let info = provider_info(model.provider);
         if let Some(driver) = info.driver {
-            conn.driver = driver;
+            model.driver = driver;
         }
-        conn.base_url = info.base_url;
+        model.base_url = info.base_url;
     }
-    conn
+    model
 }
 
-/// The config of a fresh install: no connections yet, so the Connections page
-/// opens on the provider picker.
+/// The config of a fresh install: an empty model library, so the Connections
+/// page opens on the provider picker.
 pub fn default_config() -> AppConfig {
     AppConfig {
         version: CONFIG_VERSION,
         default_source: "zh".into(),
         default_target: "en".into(),
         default_workdir: None,
-        translation: None,
-        web_search: WebSearch::Off,
+        models: Vec::new(),
+        steps: None,
+        per_step: false,
         provider_keys: BTreeMap::new(),
     }
 }
@@ -446,7 +445,7 @@ pub fn default_config() -> AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::sample;
+    use crate::config::sample_model;
     use ThinkingLevel::{High, Low, Medium, Off};
 
     #[test]
@@ -677,7 +676,7 @@ mod tests {
 
     #[test]
     fn canonicalize_pins_cloud_providers_and_trims() {
-        let mut c = sample(Provider::Openai, " gpt-5.5 ");
+        let mut c = sample_model(Provider::Openai, " gpt-5.5 ");
         c.driver = Driver::Openai;
         c.base_url = "https://api.openai.com/v1/".into();
         c.api_key = "sk-abc\n".into();
@@ -688,7 +687,7 @@ mod tests {
         assert_eq!(c.model, "gpt-5.5");
 
         // Local and custom keep what the user chose.
-        let mut local = sample(Provider::Ollama, "qwen3");
+        let mut local = sample_model(Provider::Ollama, "qwen3");
         local.driver = Driver::Anthropic;
         local.base_url = " http://10.0.0.2:11434 ".into();
         let local = canonicalize(local);
@@ -697,12 +696,13 @@ mod tests {
     }
 
     #[test]
-    fn default_config_is_v2_with_no_connections() {
+    fn default_config_is_v2_with_an_empty_library() {
         let cfg = default_config();
         assert_eq!(cfg.version, CONFIG_VERSION);
         assert_eq!((cfg.default_source.as_str(), cfg.default_target.as_str()), ("zh", "en"));
-        assert_eq!(cfg.translation, None);
-        assert_eq!(cfg.web_search, WebSearch::Off);
+        assert!(cfg.models.is_empty());
+        assert_eq!(cfg.steps, None);
+        assert!(!cfg.per_step);
         assert!(cfg.provider_keys.is_empty());
         assert_eq!(cfg.default_workdir, None);
     }

@@ -1,11 +1,13 @@
-//! Connections commands (O1–O5, O21): the translation and web-search roles,
-//! the provider catalog, and connection testing / model listing.
+//! Connections commands (O1–O5, O21): the model library and the steps that
+//! use it, the provider catalog, and connection testing / model listing.
+//! Each mutation is a pure `store` helper (where the rules live and are
+//! tested) behind a thin adapter: load, apply, persist, return the new state.
 
 use tauri::AppHandle;
 
 use crate::config::providers::{self, ModelCapabilities, ProviderInfo};
 use crate::config::store;
-use crate::config::{AppConfig, Connection, Driver, Provider, WebSearch};
+use crate::config::{AppConfig, Connection, Driver, Model, Provider, Step, StepSettings};
 use crate::error::{AppError, AppResult};
 use crate::llm::create_driver;
 use crate::llm::detect::detect_format;
@@ -15,8 +17,9 @@ use crate::models::{ConnectionsConfig, FirstRunStatus, TestProblem, TestResult};
 /// Pure: the page's slice of the config.
 pub(crate) fn connections_config(cfg: &AppConfig) -> ConnectionsConfig {
     ConnectionsConfig {
-        translation: cfg.translation.clone(),
-        web_search: cfg.web_search.clone(),
+        models: cfg.models.clone(),
+        steps: cfg.steps.clone(),
+        per_step: cfg.per_step,
         provider_keys: cfg.provider_keys.clone(),
     }
 }
@@ -47,27 +50,44 @@ pub fn model_capabilities(provider: Provider, model: String) -> ModelCapabilitie
     providers::capabilities(provider, &model)
 }
 
-/// Save the translation connection. Thinking is normalised to what the model
-/// offers and web search follows the model (see `store::set_translation`).
+/// Add a library model (empty `id`) or update one; `assign` (JS may omit it)
+/// also hands that step this model. See `store::save_model`.
 #[tauri::command]
-pub fn save_translation(app: AppHandle, connection: Connection) -> AppResult<ConnectionsConfig> {
-    update(&app, |cfg| {
-        store::set_translation(cfg, connection);
-        Ok(())
-    })
+pub fn save_model(app: AppHandle, model: Model, assign: Option<Step>) -> AppResult<ConnectionsConfig> {
+    update(&app, |cfg| store::save_model(cfg, model, assign).map(drop))
+}
+
+/// Remove a library model; its steps move on (see `store::remove_model`).
+#[tauri::command]
+pub fn remove_model(app: AppHandle, id: String) -> AppResult<ConnectionsConfig> {
+    update(&app, |cfg| store::remove_model(cfg, &id))
+}
+
+/// One step's model and settings; `null` turns web search off.
+#[tauri::command]
+pub fn set_step(
+    app: AppHandle,
+    step: Step,
+    settings: Option<StepSettings>,
+) -> AppResult<ConnectionsConfig> {
+    update(&app, |cfg| store::set_step(cfg, step, settings))
+}
+
+/// The one-model view's Thinking / Tuning (see `store::set_shared_steps`).
+#[tauri::command]
+pub fn set_shared_steps(app: AppHandle, settings: StepSettings) -> AppResult<ConnectionsConfig> {
+    update(&app, |cfg| store::set_shared_steps(cfg, settings))
 }
 
 #[tauri::command]
-pub fn remove_translation(app: AppHandle) -> AppResult<ConnectionsConfig> {
-    update(&app, |cfg| {
-        store::clear_translation(cfg);
-        Ok(())
-    })
+pub fn show_every_step(app: AppHandle) -> AppResult<ConnectionsConfig> {
+    update(&app, store::show_every_step)
 }
 
+/// Back to one model, JS `modelId` (see `store::use_one_model`).
 #[tauri::command]
-pub fn set_web_search(app: AppHandle, web_search: WebSearch) -> AppResult<ConnectionsConfig> {
-    update(&app, |cfg| store::set_web_search(cfg, web_search))
+pub fn use_one_model(app: AppHandle, model_id: String) -> AppResult<ConnectionsConfig> {
+    update(&app, |cfg| store::use_one_model(cfg, &model_id))
 }
 
 #[tauri::command]
@@ -101,17 +121,32 @@ async fn resolve_driver(conn: &Connection) -> Result<(Driver, Option<Driver>), L
     }
 }
 
+/// What Connect's test and the model list talk to: the model alone, with no
+/// step behind it — no Thinking, no step's Tuning. `tuned` fills in the
+/// provider's default timeouts (the test's first call may wait for a local
+/// model to load); untuned keeps the drivers' own fallbacks, as the model
+/// list always had.
+fn bare_connection(model: &Model, tuned: bool) -> Connection {
+    let untouched = StepSettings::new(model.id.clone());
+    if tuned {
+        store::run_connection(model, &untouched)
+    } else {
+        Connection::from_step(model, &untouched)
+    }
+}
+
 /// Connect's test: one tiny real request. `web_search` (JS `webSearch`, may be
 /// omitted) also attaches the provider's search tool, so a model or account
 /// that rejects it fails here instead of at glossary time.
 #[tauri::command]
-pub async fn test_connection(connection: Connection, web_search: Option<bool>) -> AppResult<TestResult> {
-    Ok(run_test(providers::canonicalize(connection), web_search.unwrap_or(false)).await)
+pub async fn test_connection(model: Model, web_search: Option<bool>) -> AppResult<TestResult> {
+    Ok(run_test(&providers::canonicalize(model), web_search.unwrap_or(false)).await)
 }
 
-/// The test itself, on an already-canonical connection (split out so tests can
-/// aim it at a mock server; canonicalizing pins cloud providers' base URLs).
-async fn run_test(connection: Connection, web_search: bool) -> TestResult {
+/// The test itself, on an already-canonical model (split out so tests can aim
+/// it at a mock server; canonicalizing pins cloud providers' base URLs).
+async fn run_test(model: &Model, web_search: bool) -> TestResult {
+    let connection = bare_connection(model, true);
     let (driver, detected) = match resolve_driver(&connection).await {
         Ok(resolved) => resolved,
         // Undetermined format (both routes 404 / host unreachable): a graceful
@@ -157,8 +192,8 @@ async fn run_test(connection: Connection, web_search: bool) -> TestResult {
 /// with no models. The page reads the first as "can't reach" and the second as
 /// "running, but no models installed"; the curated list stays either way.
 #[tauri::command]
-pub async fn list_models(connection: Connection) -> AppResult<Vec<String>> {
-    let mut conn = providers::canonicalize(connection);
+pub async fn list_models(model: Model) -> AppResult<Vec<String>> {
+    let mut conn = bare_connection(&providers::canonicalize(model), false);
     let (driver, _) =
         resolve_driver(&conn).await.map_err(|_| AppError::Other(undetected_message(&conn)))?;
     conn.driver = driver;
@@ -278,7 +313,7 @@ fn driver_label(d: Driver) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::providers::default_config;
-    use crate::config::sample;
+    use crate::config::{sample, sample_model};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -288,13 +323,33 @@ mod tests {
     }
 
     #[test]
-    fn connections_config_mirrors_the_roles_and_keys() {
+    fn connections_config_mirrors_the_library_steps_and_keys() {
         let mut cfg = default_config();
-        store::set_translation(&mut cfg, sample(Provider::Anthropic, "claude-sonnet-5-5"));
+        store::save_model(&mut cfg, sample_model(Provider::Anthropic, "claude-sonnet-5-5"), None).unwrap();
+        store::show_every_step(&mut cfg).unwrap();
         let view = connections_config(&cfg);
-        assert_eq!(view.translation, cfg.translation);
-        assert_eq!(view.web_search, WebSearch::Translation);
+        assert_eq!(view.models, cfg.models);
+        assert_eq!(view.steps, cfg.steps);
+        assert!(view.per_step);
         assert_eq!(view.provider_keys.get("anthropic").map(String::as_str), Some("k"));
+        // The wire shape the page reads.
+        let wire = serde_json::to_value(&view).unwrap();
+        assert_eq!(wire["steps"]["web_search"]["model"], "m1");
+        assert_eq!(wire["models"][0]["id"], "m1");
+    }
+
+    #[test]
+    fn the_test_and_the_model_list_use_the_model_alone() {
+        let mut ollama = sample_model(Provider::Ollama, "qwen3");
+        ollama.connect_timeout = Some(3);
+        // The test: provider-default tuning, no Thinking.
+        let tested = bare_connection(&ollama, true);
+        assert_eq!((tested.timeout, tested.thinking, tested.connect_timeout), (Some(600), None, Some(3)));
+        assert_eq!(bare_connection(&sample_model(Provider::Anthropic, "claude-sonnet-5-5"), true).timeout, Some(180));
+        // The list: nothing filled in, so the drivers' own fallbacks apply.
+        let listed = bare_connection(&ollama, false);
+        assert_eq!((listed.timeout, listed.max_tokens, listed.connect_timeout), (None, None, Some(3)));
+        assert!(!tested.web_search && !listed.web_search);
     }
 
     #[test]
@@ -328,10 +383,10 @@ mod tests {
         requests.iter().map(|r| r.body_json().unwrap()).collect()
     }
 
-    /// A Claude connection on the mock server (`run_test` skips canonicalize,
+    /// A Claude model on the mock server (`run_test` skips canonicalize,
     /// which would pin it back to api.anthropic.com).
-    fn claude_on(server: &MockServer) -> Connection {
-        Connection { base_url: server.uri(), ..sample(Provider::Anthropic, "claude-sonnet-5-5") }
+    fn claude_on(server: &MockServer) -> Model {
+        Model { base_url: server.uri(), ..sample_model(Provider::Anthropic, "claude-sonnet-5-5") }
     }
 
     #[tokio::test]
@@ -347,9 +402,9 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let searched = run_test(claude_on(&server), true).await;
+        let searched = run_test(&claude_on(&server), true).await;
         assert!(searched.ok, "{}", searched.message);
-        let plain = run_test(claude_on(&server), false).await;
+        let plain = run_test(&claude_on(&server), false).await;
         assert!(plain.ok, "{}", plain.message);
 
         let bodies = sent_bodies(&server).await;
@@ -368,14 +423,14 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let r = run_test(claude_on(&server), true).await;
+        let r = run_test(&claude_on(&server), true).await;
         assert!(!r.ok);
         assert_eq!((r.problem, r.can_save_anyway), (Some(TestProblem::Other), false));
         assert!(r.message.contains("web search is not enabled"), "{}", r.message);
     }
 
-    fn ollama_on(base_url: String) -> Connection {
-        Connection { base_url, ..sample(Provider::Ollama, "qwen3") }
+    fn ollama_on(base_url: String) -> Model {
+        Model { base_url, ..sample_model(Provider::Ollama, "qwen3") }
     }
 
     /// A port nothing listens on.
@@ -416,7 +471,7 @@ mod tests {
         assert_eq!(err.to_string(), format!("Can't reach Ollama at 127.0.0.1:{port} — is it running?"));
 
         // A Custom URL is detected first; nothing answering is an error too.
-        let mut custom = sample(Provider::Custom, "m");
+        let mut custom = sample_model(Provider::Custom, "m");
         custom.base_url = format!("http://127.0.0.1:{port}/v1");
         let err = list_models(custom).await.unwrap_err().to_string();
         assert!(err.starts_with("No OpenAI- or Anthropic-compatible API answered at 127.0.0.1:"), "{err}");

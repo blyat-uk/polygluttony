@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 use crate::config::store as config_store;
+use crate::config::Step;
 use crate::error::{AppError, AppResult};
 use crate::glossary::build::BuildMode;
 use crate::glossary::diff::GlossaryDiff;
@@ -85,7 +86,7 @@ pub async fn normalize_glossary(app: AppHandle, folder: String) -> AppResult<Nor
         return Err(AppError::Other("glossary is empty".into()));
     }
     let cfg = config_store::load(&app)?;
-    let conn = config_store::usable_translation(&cfg).ok_or(AppError::NoActiveConnection)?;
+    let conn = config_store::step_connection(&cfg, Step::Normalize)?;
     let templates =
         crate::prompts::GlossaryPrompts::resolve_normalize(&crate::prompts::overrides_dir(&app)?)?;
     let cancel = run::claim_slot(&app, GlossaryOpKind::Normalize).await?;
@@ -115,7 +116,8 @@ pub async fn import_reference_files(
     }
     let dir = PathBuf::from(&folder);
     let cfg = config_store::load(&app)?;
-    let conn = config_store::usable_translation(&cfg).ok_or(AppError::NoActiveConnection)?;
+    // Reading reference files is the Extract step's job.
+    let conn = config_store::step_connection(&cfg, Step::Extract)?;
     let reference_template = crate::prompts::resolve(
         crate::prompts::PromptId::ReferenceExtract,
         &crate::prompts::overrides_dir(&app)?,
@@ -224,8 +226,9 @@ pub fn unwatch_glossary(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-/// Label of the model that answers web searches ("Claude Sonnet 5.5"), else
-/// None — powers the "Look up established names online" checkbox gating.
+/// Label of the model that answers web searches ("Claude Sonnet 5.5") — the
+/// Web search step's, when it is on, usable and can search — else None.
+/// Powers the "Look up established names online" checkbox gating.
 #[tauri::command]
 pub fn web_search_status(app: AppHandle) -> AppResult<Option<String>> {
     Ok(config_store::web_search_label(&config_store::load(&app)?))

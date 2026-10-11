@@ -26,6 +26,11 @@ pub enum AppError {
     #[error("no usable connection — configure one in Connections")]
     NoActiveConnection,
 
+    /// A step's model can't make requests: it has no API key. Names the step
+    /// as the Connections page does, so the user knows which row to fix.
+    #[error("{step} uses {model}, which needs an API key. Add it on the Connections page.")]
+    StepNeedsKey { step: &'static str, model: String },
+
     #[error("no active translation run")]
     NoActiveRun,
 }

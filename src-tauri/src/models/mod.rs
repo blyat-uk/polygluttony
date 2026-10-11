@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::config::projects::FolderPrefs;
-use crate::config::{Connection, Driver, WebSearch};
+use crate::config::{Driver, Model, Steps};
 use crate::glossary::world_detector::WorldType;
 
 pub mod language_pair;
@@ -24,8 +24,9 @@ pub struct AppInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../src/types/generated/")]
 pub struct ConnectionsConfig {
-    pub translation: Option<Connection>,
-    pub web_search: WebSearch,
+    pub models: Vec<Model>,
+    pub steps: Option<Steps>,
+    pub per_step: bool,
     pub provider_keys: BTreeMap<String, String>,
 }
 
