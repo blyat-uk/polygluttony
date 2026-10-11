@@ -1,12 +1,11 @@
 import { Fragment, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { CaretDown, CaretRight, Play, Stop } from "@phosphor-icons/react";
+import { toast } from "sonner";
+import { CaretDown, CaretRight, Eye, Play, Stop } from "@phosphor-icons/react";
 import { stateToCells, StatusGlyph, IssuePanel } from "./file-cells"
-import { BatchCell } from "./batch-cell"
 import { ReactorBar } from "./reactor-bar"
-import { RunIntegrityRing } from "./run-integrity-ring"
 import { FileStateChip } from "./file-state-chip"
-import { batchCellState, pickHero, runIntegrity } from "./telemetry";
+import { runProgress } from "./telemetry";
 import { LogToggleButton, LogPanel } from "@/components/log-drawer";
 import type { Tone } from "@/types/generated/Tone";
 import { ipc } from "@/lib/ipc";
@@ -29,13 +28,13 @@ const SELECT_CLS =
 /** Lines-per-minute heuristic for the estimate banner. */
 const LINES_PER_MINUTE = 600;
 
-/** Approx line range label for batch i, given the file's total lines + batch count. */
-function batchRange(i: number, row: { total: number; totalBatches: number }): string {
-  if (!row.totalBatches || !row.total) return ""
-  const per = Math.ceil(row.total / row.totalBatches)
-  const start = i * per + 1
-  const end = Math.min((i + 1) * per, row.total)
-  return `lines ${start}–${end}`
+/** Opens the episode's own window, or focuses it if it's already open. */
+function watchEpisode(file: string) {
+  ipc.openEpisodeWindow(file).catch((err: unknown) => {
+    toast.error(`Couldn't open ${file}`, {
+      description: err instanceof Error ? err.message : String(err),
+    });
+  });
 }
 
 // ── main component ────────────────────────────────────────────────────────────
@@ -50,12 +49,6 @@ export function TranslatePage() {
 
   const running = useTranslationRun((s) => s.running);
   const storeFiles = useTranslationRun((s) => s.files);
-  // The hero card spotlights one file's live batches. It auto-follows the first
-  // in-flight file, but the user can pin a different file by clicking its row.
-  const [selectedHero, setSelectedHero] = useState<string | null>(null);
-  const heroName = running ? (selectedHero ?? pickHero(storeFiles)) : null;
-  const hero = heroName ? storeFiles[heroName] : null;
-  const integ = runIntegrity(storeFiles);
   const logs = useTranslationRun((s) => s.logs);
   const results = useTranslationRun((s) => s.results);
 
@@ -99,13 +92,19 @@ export function TranslatePage() {
 
   const connLabel = translationLabel ?? "no model";
 
+  // ── run progress ─────────────────────────────────────────────────────────────
+
+  const progress = runProgress(
+    storeFiles,
+    new Map(view.files.map((f) => [f.name, f.dialogue_count])),
+  );
+
   // ── actions ──────────────────────────────────────────────────────────────────
 
   const canStart = !running && selected.length > 0 && hasUsableConnection;
 
   const handleStart = () => {
     setExpanded(new Set());
-    setSelectedHero(null);
     useTranslationRun.getState().start(selected);
     ipc.startTranslation({
       folder: workdir,
@@ -247,32 +246,12 @@ export function TranslatePage() {
         )}
 
         <HelpText>
-          Polygluttony translates each file, then checks its own work. While a run is active, click any
-          file to watch its batches above. Files that need a look turn amber — click one to see the exact issues.
+          Double-click an episode during or after a run to watch it in its own window. Episodes that need a
+          look turn amber; click one to see the exact issues.
         </HelpText>
 
         {/* Completion summary */}
         {summaryEl}
-
-        {/* Hero batch card (active file during a run) */}
-        {hero && heroName ? (
-          <div className="relative overflow-hidden rounded-xl border border-[color:color-mix(in_oklch,var(--color-gold)_22%,transparent)] bg-[linear-gradient(180deg,rgba(225,166,54,.05),rgba(225,166,54,.015))] p-4">
-            <div className="mb-3 flex items-baseline justify-between">
-              <span className="font-mono text-[14px] text-[color:var(--color-ink-emphasis)]">{heroName}</span>
-              <span className="text-[11px] text-muted-foreground tabular-nums">
-                {hero.total > 0 ? <><b className="font-semibold text-[color:var(--color-gold-hi)]">{hero.translated.toLocaleString()}</b>/{hero.total.toLocaleString()} translated</> : "starting…"}
-              </span>
-            </div>
-            <div className="grid grid-cols-[1fr_158px] items-stretch gap-5">
-              <div className="flex flex-col gap-2.5">
-                {Array.from({ length: Math.max(hero.totalBatches, 1) }, (_, i) => (
-                  <BatchCell key={i} index={i} range={batchRange(i, hero)} state={batchCellState(hero, i)} since={hero.inFlightSince} />
-                ))}
-              </div>
-              <RunIntegrityRing done={integ.done} total={integ.total} retranslated={integ.retranslated} />
-            </div>
-          </div>
-        ) : null}
 
         {/* File table */}
         <div className="rounded-md border border-border overflow-hidden">
@@ -307,28 +286,43 @@ export function TranslatePage() {
                   const expandable = state === "warning" && issues.length > 0;
                   const isExpanded = expandable && expanded.has(file.name);
                   const cells = stateToCells(state, row?.reachedVerify ?? false);
-                  const isHero = running && heroName === file.name;
-                  // While running, a click pins this file as the hero; otherwise
-                  // a click expands a warning file's issue list.
-                  const onActivate = running
-                    ? () => setSelectedHero(file.name)
-                    : expandable
-                      ? () => toggleExpand(file.name)
-                      : undefined;
+                  // Files of the current or last run have a live board behind
+                  // them, so they can open in their own window.
+                  const watchable = row !== undefined;
 
                   return (
                     <Fragment key={file.name}>
                       <tr
-                        className={`border-b border-border last:border-0 hover:bg-[color:var(--color-bg-hover)]${onActivate ? " cursor-pointer" : ""}${isHero ? " bg-[color:color-mix(in_oklch,var(--color-gold)_8%,transparent)]" : ""}`}
-                        onClick={onActivate}
-                        role={onActivate ? "button" : undefined}
-                        tabIndex={onActivate ? 0 : undefined}
-                        onKeyDown={
-                          onActivate
+                        className={`group border-b border-border last:border-0 hover:bg-[color:var(--color-bg-hover)]${expandable || watchable ? " cursor-pointer" : ""}`}
+                        onClick={
+                          expandable
                             ? (e) => {
+                                // The second click of a double-click would fold it back.
+                                if (e.detail > 1) return;
+                                toggleExpand(file.name);
+                              }
+                            : undefined
+                        }
+                        onDoubleClick={watchable ? () => watchEpisode(file.name) : undefined}
+                        // Keep a double-click from selecting the word under the cursor.
+                        onMouseDown={
+                          watchable
+                            ? (e) => {
+                                if (e.detail > 1) e.preventDefault();
+                              }
+                            : undefined
+                        }
+                        role={expandable ? "button" : undefined}
+                        tabIndex={expandable ? 0 : undefined}
+                        aria-expanded={expandable ? isExpanded : undefined}
+                        onKeyDown={
+                          expandable
+                            ? (e) => {
+                                // Keys on the eye button are the button's own.
+                                if (e.target !== e.currentTarget) return;
                                 if (e.key === "Enter" || e.key === " ") {
                                   e.preventDefault();
-                                  onActivate();
+                                  toggleExpand(file.name);
                                 }
                               }
                             : undefined
@@ -359,22 +353,41 @@ export function TranslatePage() {
                           <StatusGlyph kind={cells.verified} tone="verify" />
                         </td>
                         <td className="px-4 py-2.5 text-[12px] text-muted-foreground tabular-nums">
-                          {showProgress && row ? (
-                            <span>
-                              {row.translated}/{row.total} · batch {row.batch}/{row.totalBatches}
-                              {row.retries > 0 ? (
-                                <span className="ml-2 text-[color:var(--color-alert)]">
-                                  ↺ {row.retries}
+                          <div className="flex items-center gap-2">
+                            <div className="min-w-0 flex-1">
+                              {showProgress && row ? (
+                                <span>
+                                  {row.translated}/{row.total} · batch {row.batch}/{row.totalBatches}
+                                  {row.retries > 0 ? (
+                                    <span className="ml-2 text-[color:var(--color-alert)]">
+                                      ↺ {row.retries}
+                                    </span>
+                                  ) : null}
                                 </span>
-                              ) : null}
-                            </span>
-                          ) : row?.error ? (
-                            <span className="text-[color:var(--color-danger)] truncate block max-w-xs">
-                              {row.error}
-                            </span>
-                          ) : (
-                            <span>—</span>
-                          )}
+                              ) : row?.error ? (
+                                <span className="text-[color:var(--color-danger)] truncate block max-w-xs">
+                                  {row.error}
+                                </span>
+                              ) : (
+                                <span>—</span>
+                              )}
+                            </div>
+                            {watchable ? (
+                              <button
+                                type="button"
+                                aria-label={`Watch ${file.name} live`}
+                                title="Watch live"
+                                className="-my-1 grid size-6 shrink-0 place-items-center rounded-full text-muted-foreground opacity-0 outline-none transition hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  watchEpisode(file.name);
+                                }}
+                                onDoubleClick={(e) => e.stopPropagation()}
+                              >
+                                <Eye className="size-4" />
+                              </button>
+                            ) : null}
+                          </div>
                         </td>
                       </tr>
                       {isExpanded ? (
@@ -404,13 +417,19 @@ export function TranslatePage() {
         </SectionHelp>
 
         {/* Overall pipeline progress (while running) */}
-        {running && integ.total > 0 ? (
+        {running && progress.total > 0 ? (
           <div className="space-y-1.5">
             <div className="flex justify-between text-[11px] text-muted-foreground tabular-nums">
-              <span>Pipeline · {integ.done} of {integ.total} batches complete</span>
-              <span>{Math.round((integ.done / integ.total) * 100)}%</span>
+              <span>
+                Pipeline · {progress.done.toLocaleString()} of {progress.total.toLocaleString()} lines ·{" "}
+                {progress.finished.toLocaleString()} of {progress.files.toLocaleString()}{" "}
+                episode{progress.files !== 1 ? "s" : ""} finished
+              </span>
+              <span>{Math.round((progress.done / progress.total) * 100)}%</span>
             </div>
-            <ReactorBar done={integ.done} total={integ.total} />
+            {/* ReactorBar draws a divider per unit of `total`; thousands of lines
+                would bury the fill, so it gets the fraction as one segment. */}
+            <ReactorBar done={progress.done / progress.total} total={1} />
           </div>
         ) : null}
 
