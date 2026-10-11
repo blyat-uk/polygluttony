@@ -1,6 +1,8 @@
 //! Config persistence. Pure `AppConfig` helpers (unit-tested) + a thin Tauri
 //! store adapter (`load`/`save`) that seeds defaults on first run.
 
+use std::collections::BTreeMap;
+
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_store::StoreExt;
 
@@ -106,13 +108,77 @@ pub fn set_default_languages(cfg: &mut AppConfig, source: &str, target: &str) {
     cfg.default_target = target.to_string();
 }
 
+/// Parse the stored config, keeping whatever parses and defaulting the rest, so a
+/// config written by another build (or edited by hand) never blocks startup.
+/// Each field stands alone; an invalid connection entry drops only itself, and
+/// references to connections that didn't load are repaired. Fallbacks are logged.
+pub fn config_from_stored(value: serde_json::Value) -> AppConfig {
+    let defaults = default_config();
+    let Some(stored) = value.as_object() else {
+        tracing::warn!("config is not an object; using the defaults");
+        return defaults;
+    };
+
+    let mut connections: BTreeMap<String, Connection> = match stored.get("connections") {
+        Some(serde_json::Value::Object(entries)) => entries
+            .iter()
+            .filter_map(|(name, entry)| match serde_json::from_value(entry.clone()) {
+                Ok(conn) => Some((name.clone(), conn)),
+                Err(e) => {
+                    tracing::warn!("dropping invalid connection `{name}` from config: {e}");
+                    None
+                }
+            })
+            .collect(),
+        Some(_) => {
+            tracing::warn!("config field `connections` is invalid; using the defaults");
+            BTreeMap::new()
+        }
+        None => BTreeMap::new(),
+    };
+    if connections.is_empty() {
+        connections = defaults.connections;
+    }
+
+    // The stored active connection if it loaded, else the default's, else any.
+    let active_connection = [field(stored, "active_connection"), Some(defaults.active_connection)]
+        .into_iter()
+        .flatten()
+        .find(|name| connections.contains_key(name))
+        .or_else(|| connections.keys().next().cloned())
+        .unwrap_or_default();
+
+    let personalization_model = field::<Option<String>>(stored, "personalization_model")
+        .flatten()
+        .filter(|name| connections.contains_key(name));
+
+    AppConfig {
+        default_source: field(stored, "default_source").unwrap_or(defaults.default_source),
+        default_target: field(stored, "default_target").unwrap_or(defaults.default_target),
+        active_connection,
+        personalization_model,
+        default_workdir: field::<Option<String>>(stored, "default_workdir").flatten(),
+        connections,
+    }
+}
+
+/// One stored config field: `None` when it is absent or doesn't parse (logged).
+fn field<T: serde::de::DeserializeOwned>(
+    stored: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<T> {
+    serde_json::from_value(stored.get(key)?.clone())
+        .map_err(|e| tracing::warn!("config field `{key}` is invalid ({e}); using the default"))
+        .ok()
+}
+
 // ---- Tauri store adapter (thin; not unit-tested) ---------------------------
 
 /// Load the config from the store, seeding + persisting defaults on first run.
 pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppResult<AppConfig> {
     let store = app.store(STORE_FILE).map_err(|e| AppError::Other(e.to_string()))?;
     match store.get(STORE_KEY) {
-        Some(value) => serde_json::from_value(value).map_err(AppError::from),
+        Some(value) => Ok(config_from_stored(value)),
         None => {
             let cfg = default_config();
             store.set(STORE_KEY, serde_json::to_value(&cfg)?);
@@ -204,6 +270,105 @@ mod tests {
         assert_eq!(cfg.personalization_model, None);
         clear_personalization(&mut cfg); // idempotent
         assert_eq!(cfg.personalization_model, None);
+    }
+
+    fn seeded_names() -> Vec<String> {
+        default_config().connections.into_keys().collect()
+    }
+
+    fn names(cfg: &AppConfig) -> Vec<String> {
+        cfg.connections.keys().cloned().collect()
+    }
+
+    #[test]
+    fn partial_config_fills_missing_fields_from_defaults() {
+        // The shape a custom build left behind: no connections, no active.
+        let stored = serde_json::json!({
+            "default_source": "ja", "default_target": "ru", "default_workdir": null
+        });
+        let cfg = config_from_stored(stored);
+        assert_eq!(cfg.default_source, "ja");
+        assert_eq!(cfg.default_target, "ru");
+        assert_eq!(names(&cfg), seeded_names());
+        assert_eq!(cfg.active_connection, "anthropic");
+    }
+
+    #[test]
+    fn missing_active_connection_points_at_a_stored_connection() {
+        let stored = serde_json::json!({
+            "default_source": "zh", "default_target": "en",
+            "connections": { "mine": serde_json::to_value(sample()).unwrap() }
+        });
+        assert_eq!(config_from_stored(stored).active_connection, "mine");
+    }
+
+    #[test]
+    fn stored_fields_are_kept_as_is() {
+        let mut full = default_config();
+        full.default_source = "ko".into();
+        full.default_workdir = Some("/work".into());
+        full.personalization_model = None;
+        full.connections.remove("openai");
+        let cfg = config_from_stored(serde_json::to_value(&full).unwrap());
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), serde_json::to_value(&full).unwrap());
+    }
+
+    #[test]
+    fn invalid_fields_fall_back_to_defaults_and_valid_ones_are_kept() {
+        let stored = serde_json::json!({
+            "default_source": 5, "default_target": "ru", "default_workdir": ["x"],
+            "personalization_model": 7, "active_connection": true, "connections": "oops"
+        });
+        let cfg = config_from_stored(stored);
+        assert_eq!(cfg.default_source, "zh");
+        assert_eq!(cfg.default_target, "ru");
+        assert_eq!(cfg.default_workdir, None);
+        assert_eq!(cfg.personalization_model, None);
+        assert_eq!(names(&cfg), seeded_names());
+        assert_eq!(cfg.active_connection, "anthropic");
+    }
+
+    #[test]
+    fn invalid_connection_entries_are_dropped_and_valid_ones_kept() {
+        let stored = serde_json::json!({
+            "default_source": "zh", "default_target": "en", "active_connection": "good",
+            "connections": {
+                "good": serde_json::to_value(sample()).unwrap(),
+                "bad": { "driver": "carrier-pigeon" }
+            }
+        });
+        let cfg = config_from_stored(stored);
+        assert_eq!(names(&cfg), ["good"]);
+        assert_eq!(cfg.active_connection, "good");
+    }
+
+    #[test]
+    fn no_valid_connection_seeds_the_defaults() {
+        let stored = serde_json::json!({
+            "default_source": "zh", "default_target": "en", "active_connection": "bad",
+            "connections": { "bad": { "driver": "carrier-pigeon" } }
+        });
+        let cfg = config_from_stored(stored);
+        assert_eq!(names(&cfg), seeded_names());
+        assert_eq!(cfg.active_connection, "anthropic");
+    }
+
+    #[test]
+    fn dangling_references_are_repaired() {
+        let stored = serde_json::json!({
+            "default_source": "zh", "default_target": "en",
+            "active_connection": "gone", "personalization_model": "gone",
+            "connections": { "mine": serde_json::to_value(sample()).unwrap() }
+        });
+        let cfg = config_from_stored(stored);
+        assert_eq!(cfg.active_connection, "mine");
+        assert_eq!(cfg.personalization_model, None);
+    }
+
+    #[test]
+    fn non_object_config_loads_the_defaults() {
+        let cfg = config_from_stored(serde_json::json!(42));
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), serde_json::to_value(default_config()).unwrap());
     }
 
     #[test]
