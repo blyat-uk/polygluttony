@@ -345,8 +345,6 @@ pub fn thinking_param(
 /// The Anthropic web-search tool `type` for this model: the dynamic-filtering
 /// version on Opus/Sonnet 4.6+, the basic one everywhere else. The tool entry
 /// is `{"type": <this>, "name": "web_search", "max_uses": 5}`.
-// Consumed by the Anthropic driver's web-search path, which lands separately.
-#[allow(dead_code)]
 pub fn anthropic_web_search_tool(model: &str) -> &'static str {
     match claude_generation(&model.trim().to_ascii_lowercase()) {
         Some(("opus" | "sonnet", major, minor)) if (major, minor) >= (4, 6) => {
