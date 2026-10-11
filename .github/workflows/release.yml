@@ -141,7 +141,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
-          name: Polygluttony ${{ env.TAG }}
+          name: ${{ env.TAG }}
           # Stays a draft until the publish job: a release that went public
           # on the first platform's upload would be "latest" with one download.
           draft: true
