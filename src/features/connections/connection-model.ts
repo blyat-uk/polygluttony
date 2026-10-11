@@ -60,12 +60,14 @@ function isLoopbackUrl(url: string): boolean {
   }
 }
 
-/** Mirrors `store::connection_is_usable`: a key, or a model on this computer. */
+/** Mirrors `store::connection_is_usable`: a key, a local provider, a Custom
+ *  endpoint (its key is optional), or a localhost URL. */
 export function isUsable(conn: Connection): boolean {
   return (
     conn.api_key.trim() !== "" ||
     conn.provider === "ollama" ||
     conn.provider === "lmstudio" ||
+    conn.provider === "custom" ||
     isLoopbackUrl(conn.base_url)
   );
 }
