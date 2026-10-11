@@ -356,6 +356,22 @@ pub fn anthropic_web_search_tool(model: &str) -> &'static str {
     }
 }
 
+/// Best guess at the provider behind a stored base URL (v1 had no provider).
+pub fn infer_provider(base_url: &str) -> Provider {
+    let url = base_url.trim().to_ascii_lowercase();
+    let after_scheme = url.split_once("://").map_or(url.as_str(), |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once(':').map_or(authority, |(host, _)| host);
+    match host {
+        "api.anthropic.com" => Provider::Anthropic,
+        "api.openai.com" => Provider::Openai,
+        "generativelanguage.googleapis.com" => Provider::Google,
+        _ if authority.ends_with(":11434") => Provider::Ollama,
+        _ if authority.ends_with(":1234") => Provider::Lmstudio,
+        _ => Provider::Custom,
+    }
+}
+
 /// The curated label for a model ("Claude Sonnet 5.5"), or the raw id.
 pub fn model_label(p: Provider, model: &str) -> String {
     let id = model.trim();
@@ -569,6 +585,25 @@ mod tests {
                   "claude-3-7-sonnet-20250219"] {
             assert_eq!(anthropic_web_search_tool(m), "web_search_20250305", "{m}");
         }
+    }
+
+    #[test]
+    fn infer_provider_from_base_url() {
+        assert_eq!(infer_provider("https://api.anthropic.com"), Provider::Anthropic);
+        assert_eq!(infer_provider("https://API.anthropic.com/"), Provider::Anthropic);
+        assert_eq!(infer_provider("https://api.openai.com/v1"), Provider::Openai);
+        assert_eq!(
+            infer_provider("https://generativelanguage.googleapis.com/v1beta/openai/"),
+            Provider::Google
+        );
+        assert_eq!(infer_provider("http://localhost:11434/v1"), Provider::Ollama);
+        assert_eq!(infer_provider("http://192.168.1.5:11434"), Provider::Ollama);
+        assert_eq!(infer_provider("http://localhost:1234/v1"), Provider::Lmstudio);
+        // Port matching is exact, not a prefix.
+        assert_eq!(infer_provider("http://localhost:12345/v1"), Provider::Custom);
+        assert_eq!(infer_provider("https://openrouter.ai/api/v1"), Provider::Custom);
+        assert_eq!(infer_provider("https://api.z.ai/api/anthropic"), Provider::Custom);
+        assert_eq!(infer_provider(""), Provider::Custom);
     }
 
     #[test]

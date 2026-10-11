@@ -1,18 +1,24 @@
 //! Config persistence. Pure `AppConfig` helpers (unit-tested), the tolerant
-//! loader, and a thin Tauri store adapter (`load`/`save`).
+//! loader that also migrates v1 configs in place, and a thin Tauri store
+//! adapter (`load`/`save`).
 
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::Path;
 
 use serde_json::{Map, Value};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::config::providers::{self, capabilities, default_config, model_label, normalize_thinking};
-use crate::config::{AppConfig, Connection, WebSearch, CONFIG_VERSION};
+use crate::config::{AppConfig, Connection, Driver, ThinkingLevel, WebSearch, CONFIG_VERSION};
 use crate::error::{AppError, AppResult};
 
 const STORE_FILE: &str = "config.json";
 const STORE_KEY: &str = "app";
+/// One-time copy of a v1 config, kept next to `config.json` (the store plugin
+/// resolves both against the app data dir) before the v2 config replaces it.
+const V1_BACKUP_FILE: &str = "config.v1.backup.json";
 
 // ---- usability & role resolution -------------------------------------------
 
@@ -153,12 +159,18 @@ pub fn set_default_languages(cfg: &mut AppConfig, source: &str, target: &str) {
 
 // ---- loading: tolerant parsing + v1 migration -------------------------------
 
+/// A stored config without `version` was written by v1.
+pub fn is_v1(value: &Value) -> bool {
+    value.as_object().is_some_and(|o| !o.contains_key("version"))
+}
+
 /// Parse the stored config, keeping whatever parses and defaulting the rest, so a
 /// config written by another build (or edited by hand) never blocks startup.
-/// Fallbacks are logged.
+/// v1 values are migrated to v2; fallbacks are logged.
 pub fn config_from_stored(value: Value) -> AppConfig {
     match value.as_object() {
-        Some(stored) => config_from_v2(stored),
+        Some(stored) if stored.contains_key("version") => config_from_v2(stored),
+        Some(stored) => migrate_v1(stored),
         None => {
             tracing::warn!("config is not an object; using the defaults");
             default_config()
@@ -284,20 +296,201 @@ fn config_from_v2(stored: &Map<String, Value>) -> AppConfig {
     cfg
 }
 
-// ---- Tauri store adapter (thin; not unit-tested) ---------------------------
+/// A v1 connection entry — only the fields migration reads.
+struct LegacyConnection {
+    driver: Driver,
+    base_url: String,
+    api_key: String,
+    model: String,
+    max_tokens: Option<u32>,
+    batch_dialogue_limit: Option<u32>,
+    timeout: Option<u32>,
+    connect_timeout: Option<u32>,
+    concurrency: Option<u32>,
+    thinking_enabled: bool,
+    web_search: bool,
+}
 
-/// Load the config from the store, seeding + persisting defaults on first run.
-pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppResult<AppConfig> {
-    let store = app.store(STORE_FILE).map_err(|e| AppError::Other(e.to_string()))?;
-    match store.get(STORE_KEY) {
-        Some(value) => Ok(config_from_stored(value)),
-        None => {
-            let cfg = default_config();
-            store.set(STORE_KEY, serde_json::to_value(&cfg)?);
-            store.save().map_err(|e| AppError::Other(e.to_string()))?;
-            Ok(cfg)
+/// Parse a v1 entry tolerantly: `driver`, `base_url` and `model` must parse
+/// (v1 required them too); every other field falls back on its own.
+fn legacy_from_value(value: &Value, what: &str) -> Option<LegacyConnection> {
+    let Some(map) = value.as_object() else {
+        tracing::warn!("dropping {what} from the v1 config: not an object");
+        return None;
+    };
+    let (Some(driver), Some(base_url), Some(model)) =
+        (field(map, "driver", what), field(map, "base_url", what), field(map, "model", what))
+    else {
+        tracing::warn!("dropping {what} from the v1 config: no valid driver, base_url or model");
+        return None;
+    };
+    Some(LegacyConnection {
+        driver,
+        base_url,
+        api_key: field(map, "api_key", what).unwrap_or_default(),
+        model,
+        max_tokens: optional(map, "max_tokens", what),
+        batch_dialogue_limit: optional(map, "batch_dialogue_limit", what),
+        timeout: optional(map, "timeout", what),
+        connect_timeout: optional(map, "connect_timeout", what),
+        concurrency: optional(map, "concurrency", what),
+        thinking_enabled: optional(map, "thinking_enabled", what).unwrap_or(false),
+        web_search: optional(map, "web_search", what).unwrap_or(false),
+    })
+}
+
+/// A v1 entry as a v2 connection. The provider is inferred from the URL, and
+/// cloud providers move onto their own driver and endpoint (Google from its
+/// OpenAI-compat endpoint to the native Gemini API). The old on/off thinking
+/// switch becomes Medium, then whatever the model actually offers.
+fn convert(legacy: &LegacyConnection) -> Connection {
+    let mut conn = providers::canonicalize(Connection {
+        provider: providers::infer_provider(&legacy.base_url),
+        driver: legacy.driver,
+        base_url: legacy.base_url.clone(),
+        api_key: legacy.api_key.clone(),
+        model: legacy.model.clone(),
+        thinking: legacy.thinking_enabled.then_some(ThinkingLevel::Medium),
+        max_tokens: legacy.max_tokens,
+        batch_dialogue_limit: legacy.batch_dialogue_limit,
+        timeout: legacy.timeout,
+        connect_timeout: legacy.connect_timeout,
+        concurrency: legacy.concurrency,
+        web_search: false,
+    });
+    conn.thinking = normalize_thinking(conn.provider, &conn.model, conn.thinking);
+    conn
+}
+
+/// v1 shipped a seeded Ollama entry that is usable by its URL alone, so local
+/// usability says nothing about what the user set up. Only a remote entry with
+/// its own key does.
+fn set_up_by_user(conn: &Connection) -> bool {
+    !conn.api_key.is_empty() && !conn.provider.is_local() && !is_localhost(&conn.base_url)
+}
+
+/// v1 → v2: pick the translation connection and the web-search role out of the
+/// named list, and harvest cloud keys.
+fn migrate_v1(stored: &Map<String, Value>) -> AppConfig {
+    tracing::info!("migrating the v1 config to v{CONFIG_VERSION}");
+    let legacy: BTreeMap<String, LegacyConnection> = match stored.get("connections") {
+        Some(Value::Object(entries)) => entries
+            .iter()
+            .filter_map(|(name, v)| {
+                legacy_from_value(v, &format!("connection `{name}`")).map(|l| (name.clone(), l))
+            })
+            .collect(),
+        None | Some(Value::Null) => BTreeMap::new(),
+        Some(_) => {
+            tracing::warn!("v1 config field `connections` is invalid; migrating without it");
+            BTreeMap::new()
+        }
+    };
+    let converted: BTreeMap<&str, Connection> =
+        legacy.iter().map(|(name, l)| (name.as_str(), convert(l))).collect();
+
+    // v1 translated with the active connection; when that couldn't run, fall
+    // back to the first entry (by name) the user evidently set up.
+    let translation_name: Option<String> = field::<String>(stored, "active_connection", "config")
+        .filter(|name| converted.get(name.as_str()).is_some_and(connection_is_usable))
+        .or_else(|| {
+            converted.iter().find(|(_, c)| set_up_by_user(c)).map(|(name, _)| name.to_string())
+        });
+    let translation = translation_name.as_deref().map(|name| converted[name].clone());
+
+    // Only an openai-responses entry with its web-search switch on ever
+    // searched in v1.
+    let personalization = optional::<String>(stored, "personalization_model", "config");
+    let web_search = match personalization.as_deref() {
+        Some(p) if legacy.get(p).is_some_and(|l| l.driver == Driver::OpenaiResponses && l.web_search) => {
+            if translation_name.as_deref() == Some(p) {
+                WebSearch::Translation
+            } else if connection_is_usable(&converted[p]) && can_search(&converted[p]) {
+                let mut connection = converted[p].clone();
+                connection.thinking = None;
+                WebSearch::Separate { connection }
+            } else {
+                WebSearch::Off
+            }
+        }
+        _ => WebSearch::Off,
+    };
+
+    // Every cloud key is worth remembering; the translation's wins a conflict.
+    let mut provider_keys = BTreeMap::new();
+    for conn in converted.values().chain(translation.iter()) {
+        if conn.provider.is_cloud() && !conn.api_key.is_empty() {
+            provider_keys.insert(conn.provider.id().to_string(), conn.api_key.clone());
         }
     }
+
+    let defaults = default_config();
+    let mut cfg = AppConfig {
+        version: CONFIG_VERSION,
+        default_source: field(stored, "default_source", "config").unwrap_or(defaults.default_source),
+        default_target: field(stored, "default_target", "config").unwrap_or(defaults.default_target),
+        default_workdir: optional(stored, "default_workdir", "config"),
+        translation,
+        web_search,
+        provider_keys,
+    };
+    normalize_roles(&mut cfg);
+    cfg
+}
+
+/// Write the v1 value in the store's own file shape (restoring is renaming the
+/// file back to `config.json`) — unless a backup already exists: the first v1
+/// config seen is the one worth keeping.
+fn backup_v1_once(path: &Path, value: &Value) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut doc = Map::new();
+    doc.insert(STORE_KEY.to_string(), value.clone());
+    let written = serde_json::to_vec_pretty(&doc)
+        .map_err(std::io::Error::from)
+        .and_then(|json| file.write_all(&json));
+    if written.is_err() {
+        // A truncated backup would block every later attempt.
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+// ---- Tauri store adapter (thin; not unit-tested) ---------------------------
+
+/// Load the config from the store. First run seeds and persists the defaults;
+/// a v1 config is backed up once and replaced on disk by its v2 migration.
+pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppResult<AppConfig> {
+    let store = app.store(STORE_FILE).map_err(|e| AppError::Other(e.to_string()))?;
+    let Some(value) = store.get(STORE_KEY) else {
+        let cfg = default_config();
+        store.set(STORE_KEY, serde_json::to_value(&cfg)?);
+        store.save().map_err(|e| AppError::Other(e.to_string()))?;
+        return Ok(cfg);
+    };
+    if !is_v1(&value) {
+        return Ok(config_from_stored(value));
+    }
+    let cfg = config_from_stored(value.clone());
+    let backup = tauri_plugin_store::resolve_store_path(app, V1_BACKUP_FILE)
+        .map_err(|e| e.to_string())
+        .and_then(|path| backup_v1_once(&path, &value).map_err(|e| e.to_string()));
+    match backup {
+        Ok(()) => {
+            store.set(STORE_KEY, serde_json::to_value(&cfg)?);
+            store.save().map_err(|e| AppError::Other(e.to_string()))?;
+        }
+        // Without a backup the v1 value stays on disk and the migration reruns
+        // on the next load.
+        Err(e) => tracing::warn!("couldn't back up the v1 config ({e}); not replacing it yet"),
+    }
+    Ok(cfg)
 }
 
 /// Persist the whole config.
@@ -311,9 +504,9 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, cfg: &AppConfig) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{sample, Driver, Provider};
+    use crate::config::{sample, Provider};
     use serde_json::json;
-    use crate::config::ThinkingLevel::{High, Medium};
+    use ThinkingLevel::{High, Medium, Off};
 
     fn with_translation(conn: Connection) -> AppConfig {
         AppConfig { translation: Some(conn), ..default_config() }
@@ -513,6 +706,222 @@ mod tests {
         assert_eq!(cfg.default_target, "en");
     }
 
+    // ---- v1 migration ----
+
+    fn v1_entry(driver: &str, base_url: &str, api_key: &str, model: &str) -> Value {
+        json!({
+            "driver": driver, "base_url": base_url, "api_key": api_key, "model": model,
+            "max_tokens": 16000, "batch_dialogue_limit": 100, "timeout": 120,
+            "connect_timeout": 10, "concurrency": 5, "thinking_enabled": null,
+            "thinking_budget": null, "thinking_glossary_budget": null,
+            "thinking_glossary_norm_budget": null, "web_search": null
+        })
+    }
+
+    /// Exactly what v1's `default_config()` seeded on first run.
+    fn v1_seeded() -> Value {
+        json!({
+            "default_source": "zh", "default_target": "en", "active_connection": "anthropic",
+            "personalization_model": "openai", "default_workdir": null,
+            "connections": {
+                "anthropic": v1_entry("anthropic", "https://api.anthropic.com", "", "claude-opus-4-5"),
+                "google": v1_entry("openai", "https://generativelanguage.googleapis.com/v1beta/openai/", "", "gemini-2.5-pro"),
+                "openai": v1_entry("openai-responses", "https://api.openai.com/v1", "", "gpt-5.2"),
+                "ollama": v1_entry("openai", "http://localhost:11434/v1", "ollama", "llama3.1")
+            }
+        })
+    }
+
+    #[test]
+    fn is_v1_means_no_version_field() {
+        assert!(is_v1(&v1_seeded()));
+        assert!(!is_v1(&serde_json::to_value(default_config()).unwrap()));
+        assert!(!is_v1(&json!(42)));
+    }
+
+    #[test]
+    fn seeded_v1_lands_on_the_provider_picker() {
+        let cfg = config_from_stored(v1_seeded());
+        assert_eq!(cfg.version, CONFIG_VERSION);
+        // The seeded Ollama entry is usable by URL, but the user never set it up.
+        assert_eq!(cfg.translation, None);
+        assert_eq!(cfg.web_search, WebSearch::Off);
+        assert!(cfg.provider_keys.is_empty());
+        assert_eq!((cfg.default_source.as_str(), cfg.default_target.as_str()), ("zh", "en"));
+    }
+
+    #[test]
+    fn active_anthropic_with_separate_openai_search_migrates_to_both_roles() {
+        let mut v1 = v1_seeded();
+        v1["connections"]["anthropic"]["api_key"] = json!("sk-ant-1");
+        v1["connections"]["openai"]["api_key"] = json!("sk-oai-1");
+        v1["connections"]["openai"]["web_search"] = json!(true);
+        v1["connections"]["openai"]["thinking_enabled"] = json!(true);
+        let cfg = config_from_stored(v1);
+
+        let t = cfg.translation.as_ref().unwrap();
+        assert_eq!(t.provider, Provider::Anthropic);
+        assert_eq!(t.driver, Driver::Anthropic);
+        assert_eq!(t.model, "claude-opus-4-5");
+        assert_eq!(t.api_key, "sk-ant-1");
+        assert_eq!(t.max_tokens, Some(16000), "tuning copied");
+        let WebSearch::Separate { connection } = &cfg.web_search else { panic!("{:?}", cfg.web_search) };
+        assert_eq!(connection.provider, Provider::Openai);
+        assert_eq!(connection.driver, Driver::OpenaiResponses);
+        assert_eq!(connection.api_key, "sk-oai-1");
+        assert_eq!(connection.thinking, None, "a separate search model has no thinking");
+    }
+
+    #[test]
+    fn personalization_on_the_translation_entry_becomes_translation() {
+        let mut v1 = v1_seeded();
+        v1["active_connection"] = json!("openai");
+        v1["connections"]["openai"]["api_key"] = json!("sk-oai-1");
+        v1["connections"]["openai"]["web_search"] = json!(true);
+        let cfg = config_from_stored(v1);
+        assert_eq!(cfg.translation.as_ref().unwrap().provider, Provider::Openai);
+        assert_eq!(cfg.web_search, WebSearch::Translation);
+    }
+
+    #[test]
+    fn personalization_without_web_search_migrates_to_off() {
+        let mut v1 = v1_seeded();
+        v1["connections"]["anthropic"]["api_key"] = json!("sk-ant-1");
+        v1["connections"]["openai"]["api_key"] = json!("sk-oai-1"); // web_search null
+        assert_eq!(config_from_stored(v1.clone()).web_search, WebSearch::Off);
+        // Wrong driver: v1 never searched on chat completions.
+        v1["connections"]["openai"]["web_search"] = json!(true);
+        v1["connections"]["openai"]["driver"] = json!("openai");
+        assert_eq!(config_from_stored(v1.clone()).web_search, WebSearch::Off);
+        // Unusable (no key).
+        v1["connections"]["openai"]["driver"] = json!("openai-responses");
+        v1["connections"]["openai"]["api_key"] = json!("");
+        assert_eq!(config_from_stored(v1).web_search, WebSearch::Off);
+    }
+
+    #[test]
+    fn google_moves_to_the_native_gemini_api() {
+        let mut v1 = v1_seeded();
+        v1["active_connection"] = json!("google");
+        v1["connections"]["google"]["api_key"] = json!("AIza-1");
+        let cfg = config_from_stored(v1);
+        let t = cfg.translation.as_ref().unwrap();
+        assert_eq!(t.provider, Provider::Google);
+        assert_eq!(t.driver, Driver::Gemini);
+        assert_eq!(t.base_url, "https://generativelanguage.googleapis.com/v1beta");
+        assert_eq!(t.model, "gemini-2.5-pro");
+    }
+
+    #[test]
+    fn local_and_custom_entries_keep_their_driver_and_url() {
+        let mut v1 = v1_seeded();
+        v1["connections"]["mine"] = v1_entry("anthropic", "https://api.z.ai/api/anthropic", "z-key", "glm-4.6");
+        v1["active_connection"] = json!("mine");
+        let t = config_from_stored(v1.clone()).translation.unwrap();
+        assert_eq!((t.provider, t.driver), (Provider::Custom, Driver::Anthropic));
+        assert_eq!(t.base_url, "https://api.z.ai/api/anthropic");
+
+        v1["active_connection"] = json!("ollama");
+        let t = config_from_stored(v1).translation.unwrap();
+        assert_eq!((t.provider, t.driver), (Provider::Ollama, Driver::Openai));
+        assert_eq!(t.base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn unusable_active_falls_back_to_the_first_keyed_entry_by_name() {
+        let mut v1 = v1_seeded(); // active = anthropic, no key
+        v1["connections"]["zeta"] = v1_entry("openai", "https://openrouter.ai/api/v1", "or-key", "x/y");
+        v1["connections"]["google"]["api_key"] = json!("AIza-1");
+        let t = config_from_stored(v1).translation.unwrap();
+        assert_eq!(t.provider, Provider::Google, "google < zeta, and ollama doesn't count");
+    }
+
+    #[test]
+    fn keys_are_harvested_and_the_translations_key_wins() {
+        let mut v1 = v1_seeded();
+        v1["connections"]["anthropic"]["api_key"] = json!("sk-ant-active");
+        v1["connections"]["claude-alt"] = v1_entry("anthropic", "https://api.anthropic.com", "sk-ant-other", "claude-haiku-4-5");
+        v1["connections"]["google"]["api_key"] = json!("AIza-1");
+        v1["connections"]["mine"] = v1_entry("openai", "https://openrouter.ai/api/v1", "or-key", "x/y");
+        let cfg = config_from_stored(v1);
+        let keys: Vec<(&str, &str)> =
+            cfg.provider_keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        // "claude-alt" sorts after "anthropic" but the translation still wins;
+        // custom and local keys aren't remembered.
+        assert_eq!(keys, [("anthropic", "sk-ant-active"), ("google", "AIza-1")]);
+    }
+
+    #[test]
+    fn thinking_enabled_becomes_medium_then_what_the_model_offers() {
+        let migrate = |driver: &str, base: &str, model: &str, enabled: bool| {
+            let mut entry = v1_entry(driver, base, "key", model);
+            entry["thinking_enabled"] = json!(enabled);
+            entry["thinking_budget"] = json!(6000);
+            let v1 = json!({ "active_connection": "c", "connections": { "c": entry } });
+            config_from_stored(v1).translation.unwrap().thinking
+        };
+        let ant = "https://api.anthropic.com";
+        assert_eq!(migrate("anthropic", ant, "claude-haiku-4-5", true), Some(Medium));
+        assert_eq!(migrate("anthropic", ant, "claude-haiku-4-5", false), Some(Off));
+        assert_eq!(migrate("anthropic", ant, "claude-sonnet-4-6", true), Some(Medium));
+        // Adaptive Claude has no Off; it lands on its default.
+        assert_eq!(migrate("anthropic", ant, "claude-sonnet-4-6", false), Some(Medium));
+        // Gemini 3 has no Medium: the model's own default.
+        let google = "https://generativelanguage.googleapis.com/v1beta/openai/";
+        assert_eq!(migrate("openai", google, "gemini-3-flash-preview", true), None);
+        assert_eq!(migrate("openai", google, "gemini-2.5-pro", true), Some(Medium));
+        // Stale flags on models without a Thinking control vanish.
+        assert_eq!(migrate("openai", "http://localhost:11434/v1", "qwen3", true), None);
+    }
+
+    #[test]
+    fn invalid_v1_entries_are_dropped_and_bad_fields_default_alone() {
+        let mut ok = v1_entry("anthropic", "https://api.anthropic.com", "sk-ant-1", "claude-opus-4-5");
+        ok["max_tokens"] = json!("lots");
+        let v1 = json!({
+            "active_connection": "bad",
+            "connections": {
+                "bad": { "driver": "carrier-pigeon", "base_url": "u", "model": "m", "api_key": "k" },
+                "no-model": { "driver": "openai", "base_url": "https://x", "api_key": "k" },
+                "not-an-object": 7,
+                "ok": ok
+            }
+        });
+        let t = config_from_stored(v1).translation.unwrap();
+        assert_eq!(t.api_key, "sk-ant-1");
+        assert_eq!(t.max_tokens, None, "only the bad field fell back");
+        assert_eq!(t.timeout, Some(120));
+    }
+
+    #[test]
+    fn v1_scalars_are_copied_and_old_keys_dropped() {
+        let mut v1 = v1_seeded();
+        v1["default_source"] = json!("ja");
+        v1["default_target"] = json!("ru");
+        v1["default_workdir"] = json!("/work");
+        v1["connections"] = json!("oops");
+        let cfg = config_from_stored(v1);
+        assert_eq!(cfg.default_source, "ja");
+        assert_eq!(cfg.default_target, "ru");
+        assert_eq!(cfg.default_workdir.as_deref(), Some("/work"));
+        assert_eq!(cfg.translation, None);
+        let stored = serde_json::to_value(&cfg).unwrap();
+        let keys: Vec<&str> = stored.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["default_source", "default_target", "default_workdir", "provider_keys", "translation",
+             "version", "web_search"]
+        );
+    }
+
+    #[test]
+    fn partial_v1_config_fills_missing_fields_from_defaults() {
+        let cfg = config_from_stored(json!({ "default_target": "ru" }));
+        assert_eq!(cfg.default_source, "zh");
+        assert_eq!(cfg.default_target, "ru");
+        assert_eq!(cfg.translation, None);
+    }
+
     // ---- v2 parsing ----
 
     fn full_v2() -> AppConfig {
@@ -601,5 +1010,21 @@ mod tests {
     #[test]
     fn non_object_config_loads_the_defaults() {
         assert_eq!(config_from_stored(json!(42)), default_config());
+    }
+
+    // ---- v1 backup ----
+
+    #[test]
+    fn v1_backup_is_written_once_in_the_store_file_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join(V1_BACKUP_FILE);
+        backup_v1_once(&path, &v1_seeded()).unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written, json!({ "app": v1_seeded() }));
+
+        // A second v1 value never replaces the first backup.
+        backup_v1_once(&path, &json!({ "default_source": "ja" })).unwrap();
+        let again: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(again, written);
     }
 }
