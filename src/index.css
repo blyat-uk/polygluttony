@@ -178,3 +178,7 @@
 @keyframes sig-sweep { 0%{transform:translateX(-100%);opacity:.9;} 100%{transform:translateX(100%);opacity:0;} }
 @keyframes sig-flow { 0%{background-position:0 0;} 100%{background-position:34px 0;} }
 @keyframes gloss-pop { 0%{opacity:0;transform:translateY(8px) scale(.6);} 100%{opacity:1;transform:none;} }
+
+/* Episode window: a landed translation fades in warm gold, then settles to its
+   own ink (no end colour, so it returns to whatever the cell sets). */
+@keyframes ep-land { from { opacity:0; color:var(--color-gold-hi); } 30% { opacity:1; } }
