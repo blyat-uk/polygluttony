@@ -1,19 +1,11 @@
 import type { ReactNode } from "react";
 import { CaretRight } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
-import { RoleBadge } from "./role-card";
 
-export type TranslationNode =
-  | { state: "connected"; label: string }
-  | { state: "needs-key" }
-  | { state: "none" };
-
-/** `needs-translation`: rides on a translation connection that isn't usable yet;
- *  `needs-key`: a separate model without a key. Neither can search right now. */
+/** Where web search runs. `needs-key`: its model has no API key yet, so it can't search. */
 export type WebSearchNode =
   | { state: "same" }
   | { state: "separate"; label: string }
-  | { state: "needs-translation" }
   | { state: "needs-key" }
   | { state: "off" };
 
@@ -27,116 +19,113 @@ const NODE: Record<Tone, string> = {
   off: "border-dashed border-input text-[color:var(--color-ink-dim)]",
 };
 
-/** A role node: number, dot (hollow when not working), and words. Truncates long model ids. */
-function Node({ n, tone, children }: { n: 1 | 2; tone: Tone; children: ReactNode }) {
+/** A step node: dot (hollow when it can't run) and words. Truncates long model ids. */
+function Node({ tone, note, children }: { tone: Tone; note?: string; children: ReactNode }) {
   const live = tone === "gold" || tone === "aqua";
   return (
     <span
       className={cn(
-        "inline-flex max-w-full min-w-0 items-center gap-1.5 justify-self-start rounded-[10px] border bg-card py-1 pr-2.5 pl-1.5",
+        "inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-[10px] border bg-card py-1 pr-2.5 pl-2",
         NODE[tone],
       )}
     >
-      <RoleBadge n={n} className="size-4 text-[9px]" />
       <span
         aria-hidden
-        className={cn(
-          "size-1.5 shrink-0 rounded-full",
-          live ? "bg-current" : "border border-current",
-        )}
+        className={cn("size-1.5 shrink-0 rounded-full", live ? "bg-current" : "border border-current")}
       />
-      <span className="truncate">{children}</span>
+      <span className="truncate">
+        {children}
+        {note ? <span className="sr-only"> ({note})</span> : null}
+      </span>
     </span>
   );
 }
 
-function Arrow({ className }: { className?: string }) {
+/** "→" between two steps inside a node; read out as "then". */
+function Then() {
   return (
-    <span
-      aria-hidden
-      className={cn("flex items-center text-[color:var(--color-ink-dim)]", className)}
-    >
-      <span className="h-px w-4 bg-current" />
-      <CaretRight weight="fill" className="-ml-1 size-2.5" />
-    </span>
+    <>
+      <span aria-hidden className="text-[color:var(--color-ink-dim)]">
+        {" "}→{" "}
+      </span>
+      <span className="sr-only"> then </span>
+    </>
   );
 }
 
-function Output({ active, children }: { active: boolean; children: ReactNode }) {
+/** An arrow and what it leads to, kept together so a wrapped line starts with the arrow. */
+function Hop({ children }: { children: ReactNode }) {
   return (
-    <span
-      className={cn(
-        "whitespace-nowrap",
-        active ? "text-muted-foreground" : "text-[color:var(--color-ink-dim)]",
-      )}
-    >
+    <span className="inline-flex max-w-full min-w-0 items-center gap-2">
+      <span aria-hidden className="flex shrink-0 items-center text-[color:var(--color-ink-dim)]">
+        <span className="h-px w-3.5 bg-current" />
+        <CaretRight weight="fill" className="-ml-1 size-2.5" />
+      </span>
       {children}
     </span>
   );
 }
 
+const PHASE = "flex max-w-full min-w-0 flex-wrap items-center justify-center gap-x-2 gap-y-2";
+
+const WEB_SEARCH: Record<WebSearchNode["state"], { tone: Tone; text: string }> = {
+  same: { tone: "aqua", text: "same model" },
+  separate: { tone: "aqua", text: "" },
+  "needs-key": { tone: "amber", text: "needs a key" },
+  off: { tone: "off", text: "off" },
+};
+
 /**
- * What each role feeds, as a live readout:
- * `.ass subtitles ─▶ ① Translation ─▶ translated lines / ② Web search ─▶ glossary names`.
+ * The one-model view's live readout, in workflow order:
+ * `.ass subtitles ─▶ Glossary · extract → normalize ─▶ Web search · <state> ─▶
+ *  Translate → verify ─▶ translated lines`. Wraps between hops on narrow widths.
  */
-export function FlowStrip({
-  translation,
-  webSearch,
-}: {
-  translation: TranslationNode;
-  webSearch: WebSearchNode;
-}) {
+export function FlowStrip({ usable, webSearch }: { usable: boolean; webSearch: WebSearchNode }) {
+  const model: Tone = usable ? "gold" : "amber";
+  const keyNote = usable ? undefined : "needs an API key";
+  const ws = WEB_SEARCH[webSearch.state];
   return (
     <figure
-      aria-label="What each connection does"
-      className="grid grid-cols-[auto_auto_minmax(0,max-content)_auto_auto] items-center justify-center gap-x-2.5 gap-y-1.5 rounded-[14px] border border-border bg-[color:var(--color-obsidian)] px-4 py-3 text-[11.5px]"
+      aria-label="What your model does, step by step"
+      className="flex flex-wrap items-center justify-center gap-x-2 gap-y-2 rounded-[14px] border border-border bg-[color:var(--color-obsidian)] px-4 py-3 text-[11.5px]"
     >
-      <span className="row-span-2 font-mono text-[11px] whitespace-nowrap text-muted-foreground">
-        .ass subtitles
+      {/* Two phases: when the strip has to wrap, it breaks between them first. */}
+      <span className={PHASE}>
+        <span className="font-mono text-[11px] whitespace-nowrap text-muted-foreground">
+          .ass subtitles
+        </span>
+        <Hop>
+          <Node tone={model} note={keyNote}>
+            Glossary · extract
+            <Then />
+            normalize
+          </Node>
+        </Hop>
+        <Hop>
+          <Node tone={ws.tone}>
+            Web search · {webSearch.state === "separate" ? webSearch.label : ws.text}
+          </Node>
+        </Hop>
       </span>
-      <Arrow className="row-span-2" />
-
-      {translation.state === "connected" ? (
-        <Node n={1} tone="gold">
-          Translation · {translation.label}
-        </Node>
-      ) : translation.state === "needs-key" ? (
-        <Node n={1} tone="amber">
-          Translation · needs a key
-        </Node>
-      ) : (
-        <Node n={1} tone="amber">
-          Translation · not set up
-        </Node>
-      )}
-      <Arrow />
-      <Output active={translation.state === "connected"}>translated lines</Output>
-
-      {webSearch.state === "same" ? (
-        <Node n={2} tone="aqua">
-          Web search · same model
-        </Node>
-      ) : webSearch.state === "separate" ? (
-        <Node n={2} tone="aqua">
-          Web search · {webSearch.label}
-        </Node>
-      ) : webSearch.state === "needs-translation" ? (
-        <Node n={2} tone="off">
-          Web search · needs translation
-        </Node>
-      ) : webSearch.state === "needs-key" ? (
-        <Node n={2} tone="off">
-          Web search · needs a key
-        </Node>
-      ) : (
-        <Node n={2} tone="off">
-          Web search · off
-        </Node>
-      )}
-      <Arrow />
-      <Output active={webSearch.state === "same" || webSearch.state === "separate"}>
-        glossary names
-      </Output>
+      <span className={PHASE}>
+        <Hop>
+          <Node tone={model} note={keyNote}>
+            Translate
+            <Then />
+            verify
+          </Node>
+        </Hop>
+        <Hop>
+          <span
+            className={cn(
+              "whitespace-nowrap",
+              usable ? "text-muted-foreground" : "text-[color:var(--color-ink-dim)]",
+            )}
+          >
+            translated lines
+          </span>
+        </Hop>
+      </span>
     </figure>
   );
 }
