@@ -33,13 +33,15 @@ export function ConnectionsPage() {
   // Wait for the model's capabilities too, so Thinking / Web search don't pop in after paint.
   const capsSettled = !main || caps.data !== undefined || caps.isError;
   // Where focus lands when the page swaps setup for the card (or back), so it isn't dropped.
-  const [focus, setFocus] = useState<"edit" | "setup" | null>(null);
+  const [focus, setFocus] = useState<"edit" | "setup" | "steps" | null>(null);
   // Back from the per-step view: the control that did it is gone, so focus the card's Edit.
   const perStep = config.data?.per_step;
   const [prevPerStep, setPrevPerStep] = useState(perStep);
   if (perStep !== prevPerStep) {
     setPrevPerStep(perStep);
     if (prevPerStep === true && perStep === false) setFocus("edit");
+    // Into it: the footer link that did it is gone too, so focus the pipeline.
+    if (prevPerStep === false && perStep === true) setFocus("steps");
   }
 
   const error = config.error ?? providers.error;
@@ -60,7 +62,11 @@ export function ConnectionsPage() {
                 onConnected={() => setFocus("edit")}
               />
             ) : config.data.per_step ? (
-              <PerStepView config={config.data} providers={providers.data} />
+              <PerStepView
+                config={config.data}
+                providers={providers.data}
+                autoFocus={focus === "steps"}
+              />
             ) : (
               <>
                 <FlowStrip

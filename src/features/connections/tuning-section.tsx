@@ -176,7 +176,16 @@ export function TuningSection({
             })}
           </div>
           <div className="mt-1 flex items-center gap-2">
-            <Button size="sm" disabled={!dirty || saving} onClick={() => void save()}>
+            {/* aria-disabled, not disabled: a disabled button drops focus to the page the
+                moment a save succeeds. */}
+            <Button
+              size="sm"
+              aria-disabled={!dirty || saving || undefined}
+              className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
+              onClick={() => {
+                if (dirty && !saving) void save();
+              }}
+            >
               {saving ? <Spinner className="size-3.5" /> : null}
               Save tuning
             </Button>

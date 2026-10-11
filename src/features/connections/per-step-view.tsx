@@ -48,9 +48,12 @@ const ASK: Record<Step, string> = {
 export function PerStepView({
   config,
   providers,
+  autoFocus = false,
 }: {
   config: ConnectionsConfig;
   providers: ProviderInfo[];
+  /** Focus the pipeline once it shows (the one-model card's switch that opened this is gone). */
+  autoFocus?: boolean;
 }) {
   const qc = useQueryClient();
   const m = useConnectionMutations();
@@ -61,11 +64,16 @@ export function PerStepView({
   const [focusAfter, setFocusAfter] = useState<FocusTarget | null>(null);
   const returnTo = useRef<HTMLElement | null>(null);
   const addRef = useRef<HTMLButtonElement>(null);
+  const pipelineRef = useRef<HTMLDivElement>(null);
 
   // Show the pipeline once every model's capabilities are in, so Thinking tags don't pop in
   // after paint. From then on it stays: a newly added model fills its tag in place.
   const [ready, setReady] = useState(caps.settled);
   if (caps.settled && !ready) setReady(true);
+
+  useEffect(() => {
+    if (autoFocus && ready) pipelineRef.current?.focus();
+  }, [autoFocus, ready]);
 
   // After the form closes (and the chips re-render), put focus back where it came from.
   useEffect(() => {
@@ -181,18 +189,26 @@ export function PerStepView({
       ) : null}
 
       {ready ? (
-        <PipelineCard
-          config={config}
-          providers={providers}
-          caps={caps}
-          saving={m.setStep.isPending}
-          saveFailed={m.setStep.isError}
-          onPickModel={pickModel}
-          onThinking={setThinking}
-          onTuning={setTuning}
-          onAddModel={(step, trigger) => openForm({ kind: "add", assign: step }, trigger)}
-          onEditModel={(id, trigger) => openForm({ kind: "edit", id }, trigger)}
-        />
+        <div
+          ref={pipelineRef}
+          tabIndex={-1}
+          role="group"
+          aria-label="Steps"
+          className="outline-none"
+        >
+          <PipelineCard
+            config={config}
+            providers={providers}
+            caps={caps}
+            saving={m.setStep.isPending}
+            saveFailed={m.setStep.isError}
+            onPickModel={pickModel}
+            onThinking={setThinking}
+            onTuning={setTuning}
+            onAddModel={(step, trigger) => openForm({ kind: "add", assign: step }, trigger)}
+            onEditModel={(id, trigger) => openForm({ kind: "edit", id }, trigger)}
+          />
+        </div>
       ) : (
         <div className="flex items-center gap-2 py-6 text-[12px] text-muted-foreground">
           <Spinner className="size-3.5" /> Loading your steps…
