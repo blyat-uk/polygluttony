@@ -199,7 +199,11 @@ export function ConnectionForm({
       setPhase("testing");
       let result: TestResult;
       try {
-        result = await ipc.testConnection(conn);
+        // The separate search model is only worth saving if its web-search tool works too.
+        result =
+          role === "web-search"
+            ? await ipc.testConnection(conn, true)
+            : await ipc.testConnection(conn);
       } catch (e) {
         result = commandFailure(conn, e);
       }

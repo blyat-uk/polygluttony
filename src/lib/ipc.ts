@@ -49,9 +49,13 @@ export const ipc = {
   /** Set who searches the web: off, the translation model, or a separate connection. */
   setWebSearch: (webSearch: WebSearch) =>
     invoke<ConnectionsConfig>("set_web_search", { webSearch }),
-  /** O5 — send one tiny test request. Custom endpoints get their API format detected. */
-  testConnection: (connection: Connection) =>
-    invoke<TestResult>("test_connection", { connection }),
+  /** O5 — send one tiny test request. Custom endpoints get their API format detected.
+   *  `webSearch` also exercises the provider's web-search tool (the separate search model). */
+  testConnection: (connection: Connection, webSearch?: boolean) =>
+    invoke<TestResult>(
+      "test_connection",
+      webSearch === undefined ? { connection } : { connection, webSearch },
+    ),
   /** Live model ids from the provider. Rejects when it can't be reached or the request
    *  fails; `[]` means it answered with no models. */
   listModels: (connection: Connection) => invoke<string[]>("list_models", { connection }),
