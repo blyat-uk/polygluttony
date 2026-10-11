@@ -89,20 +89,26 @@ impl AnthropicDriver {
 
     /// A web-search call: non-streaming POSTs, resuming each `pause_turn` (the
     /// server's own search loop hit its iteration cap) at most
-    /// [`MAX_PAUSE_CONTINUATIONS`] times. Text and usage add up across the turn.
+    /// [`MAX_PAUSE_CONTINUATIONS`] times. Content and usage add up across the
+    /// turn; the answer is the text after its last search (see [`answer_of`]).
     async fn search_turn(&self, system: &str, user: &str) -> Result<LlmResponse, LlmError> {
         let url = format!("{}/v1/messages", base_of(&self.conn));
         let mut body = self.build_body(system, user);
         let ask = body["messages"][0].clone();
         let mut turn: Vec<Value> = Vec::new();
-        let mut text = String::new();
         let mut usage = Usage::default();
         for _ in 0..=MAX_PAUSE_CONTINUATIONS {
             let data =
                 post_json(&self.client, &url, self.headers(), &body, timeout_of(&self.conn)).await?;
             add_usage(&mut usage, &data["usage"]);
-            text.push_str(&text_of(&data));
+            if data["stop_reason"] == "refusal" {
+                // A deliberate decline, not an empty reply: `Empty` would be
+                // retried, re-running (and re-paying for) every search.
+                return Err(LlmError::Declined(refusal_message(&data)));
+            }
+            turn.extend(data["content"].as_array().cloned().unwrap_or_default());
             if data["stop_reason"] != "pause_turn" {
+                let text = answer_of(&turn);
                 if text.trim().is_empty() {
                     return Err(LlmError::Empty);
                 }
@@ -112,7 +118,6 @@ impl AnthropicDriver {
             // (thinking blocks included) as the trailing assistant message, and
             // the API picks up from its last `server_tool_use`. No "Continue"
             // user message.
-            turn.extend(data["content"].as_array().cloned().unwrap_or_default());
             body["messages"] = json!([ask, {"role": "assistant", "content": turn}]);
         }
         // Not `Transport`: the service would retry it, re-running (and
@@ -136,6 +141,39 @@ fn text_of(data: &Value) -> String {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn block_type(block: &Value) -> &str {
+    block.get("type").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The answer of a search turn: the `text` blocks after its last server-tool
+/// block. Text before a search is narration ("I'll look up…") that would
+/// otherwise be glued onto the JSON answer. Server-tool blocks are the
+/// `web_search_tool_result` and, with the dynamic-filtering tool, the code
+/// execution it runs on the results (`server_tool_use`, `*_tool_result`).
+/// A turn that never searched answers with all of its text.
+fn answer_of(turn: &[Value]) -> String {
+    let after_tools = turn
+        .iter()
+        .rposition(|b| {
+            let t = block_type(b);
+            t == "server_tool_use" || t.ends_with("_tool_result")
+        })
+        .map_or(0, |last| last + 1);
+    turn[after_tools..]
+        .iter()
+        .filter(|b| block_type(b) == "text")
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+/// What a `refusal` stop says, with its category when the API names one.
+fn refusal_message(data: &Value) -> String {
+    match data["stop_details"]["category"].as_str() {
+        Some(category) => format!("Claude declined to answer this request ({category})"),
+        None => "Claude declined to answer this request".to_string(),
+    }
 }
 
 /// Add one response's `usage` to a running total; a meter stays `None` until
@@ -673,6 +711,104 @@ mod tests {
         // The resumed request is otherwise the same request.
         assert_eq!(bodies[1]["tools"], bodies[0]["tools"]);
         assert_eq!(bodies[1]["system"], bodies[0]["system"]);
+    }
+
+    /// Narration before a search ("I'll look up…") isn't part of the answer.
+    #[tokio::test]
+    async fn search_answer_is_the_text_after_the_last_search() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "text", "text": "I'll search for the names fans use."},
+                    {"type": "server_tool_use", "id": "srv_1", "name": "web_search",
+                     "input": {"query": "fan names"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srv_1",
+                     "content": [{"type": "web_search_result", "url": "https://x", "title": "X"}]},
+                    {"type": "text", "text": "{\"terms\": {}}"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let resp = AnthropicDriver::new(search_conn(&server.uri())).stream(&req()).await.unwrap();
+        assert_eq!(resp.text, "{\"terms\": {}}");
+    }
+
+    /// The last search can sit in an earlier, paused response, and the
+    /// dynamic-filtering tool's code execution comes after it.
+    #[tokio::test]
+    async fn search_answer_skips_narration_across_a_pause_and_filtering() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "pause_turn",
+                "content": [
+                    {"type": "text", "text": "Searching now."},
+                    {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "q"}}
+                ]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []},
+                    {"type": "text", "text": "Let me narrow these down."},
+                    {"type": "server_tool_use", "id": "srv_2", "name": "code_execution", "input": {}},
+                    {"type": "code_execution_tool_result", "tool_use_id": "srv_2", "content": {}},
+                    {"type": "text", "text": "{\"terms\": "},
+                    {"type": "text", "text": "{}}"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let resp = AnthropicDriver::new(search_conn(&server.uri())).stream(&req()).await.unwrap();
+        assert_eq!(resp.text, "{\"terms\": {}}");
+    }
+
+    #[test]
+    fn a_turn_that_never_searched_answers_with_all_its_text() {
+        let turn = [
+            serde_json::json!({"type": "thinking", "thinking": "", "signature": "s"}),
+            serde_json::json!({"type": "text", "text": "Known "}),
+            serde_json::json!({"type": "text", "text": "already"}),
+        ];
+        assert_eq!(answer_of(&turn), "Known already");
+        // Searched, but nothing after it: no answer (an `Empty` turn).
+        let cut = [
+            serde_json::json!({"type": "text", "text": "I'll search."}),
+            serde_json::json!({"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []}),
+        ];
+        assert_eq!(answer_of(&cut), "");
+    }
+
+    /// A refusal is final: `Empty` would be retried and re-pay for searches.
+    #[tokio::test]
+    async fn a_refused_search_turn_is_declined() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(serde_json::json!({
+                "stop_reason": "refusal",
+                "stop_details": {"type": "refusal", "category": "cyber", "explanation": "x"},
+                "content": [{"type": "text", "text": "Here is part"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let err = AnthropicDriver::new(search_conn(&server.uri())).stream(&req()).await.unwrap_err();
+        assert!(matches!(err, LlmError::Declined(_)), "{err:?}");
+        assert!(!err.is_retryable());
+        assert_eq!(err.to_string(), "Claude declined to answer this request (cyber)");
+
+        let bare = serde_json::json!({"stop_reason": "refusal", "stop_details": null, "content": []});
+        assert_eq!(refusal_message(&bare), "Claude declined to answer this request");
     }
 
     #[tokio::test]
