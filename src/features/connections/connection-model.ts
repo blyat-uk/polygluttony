@@ -113,14 +113,14 @@ export function newConnection(
   };
 }
 
-/** Keep `level` if the model offers it; otherwise fall back to the model's default.
- *  `null` (model default, nothing sent) is always kept. */
+/** Mirrors `providers::normalize_thinking`: keep `level` if the model offers it, otherwise
+ *  the model's default — so a model with a default always has a level selected
+ *  (`null` = nothing sent, the model decides). */
 export function normaliseThinking(
   level: ThinkingLevel | null,
   caps: ModelCapabilities,
 ): ThinkingLevel | null {
-  if (caps.thinking_levels.length === 0 || level === null) return null;
-  return caps.thinking_levels.includes(level) ? level : caps.default_thinking;
+  return level !== null && caps.thinking_levels.includes(level) ? level : caps.default_thinking;
 }
 
 /** `sk-ant-…3f9a` — enough to recognise a key without showing it. */

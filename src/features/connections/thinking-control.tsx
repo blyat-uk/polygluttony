@@ -10,17 +10,21 @@ const LABEL: Record<ThinkingLevel, string> = {
 
 /**
  * Segmented Thinking control with exactly the levels the model offers.
- * Clicking the selected level clears it (null = the model's own default).
+ * Clicking the selected level clears it (null = the model decides) only when `clearable`:
+ * a model with a default level always has one selected (the backend restores the default).
  */
 export function ThinkingControl({
   levels,
   value,
   onChange,
+  clearable,
   labelledBy,
 }: {
   levels: ThinkingLevel[];
   value: ThinkingLevel | null;
   onChange: (level: ThinkingLevel | null) => void;
+  /** `ModelCapabilities.default_thinking === null`. */
+  clearable: boolean;
   labelledBy: string;
 }) {
   return (
@@ -29,7 +33,10 @@ export function ThinkingControl({
       size="sm"
       spacing={0}
       value={value ?? ""}
-      onValueChange={(v) => onChange(v === "" ? null : (v as ThinkingLevel))}
+      onValueChange={(v) => {
+        if (v !== "") onChange(v as ThinkingLevel);
+        else if (clearable) onChange(null);
+      }}
       aria-labelledby={labelledBy}
       className="shrink-0 rounded-[14px] border border-input bg-[color:var(--color-obsidian)] p-0.5"
     >

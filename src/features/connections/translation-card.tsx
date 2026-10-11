@@ -258,6 +258,7 @@ function TranslationSummary({
             labelledBy={thinkingId}
             levels={levels}
             value={conn.thinking}
+            clearable={caps?.default_thinking === null}
             onChange={(thinking) => m.updateTranslation.mutate({ ...conn, thinking })}
           />
         </OptionRow>
