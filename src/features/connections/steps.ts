@@ -87,7 +87,8 @@ export function stepsUsing(cfg: ConnectionsConfig, modelId: string): Step[] {
 /** "Extract and Translate", "Extract, Normalize and Verify". */
 export function stepNames(steps: Step[]): string {
   const names = steps.map((s) => STEP_INFO[s].name);
-  return names.length <= 1 ? (names[0] ?? "") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+  if (names.length <= 1) return names[0] ?? "";
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }
 
 /** Fresh settings for `modelId`: the model's own Thinking default and provider tuning. */
