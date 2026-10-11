@@ -708,8 +708,10 @@ mod tests {
         assert!(!saved.web_search, "the runtime flag is never stored");
         assert_eq!(cfg.provider_keys.get("google").map(String::as_str), Some("AIza-key"));
 
-        // Adaptive Claude always has a level selected.
+        // Adaptive Claude always has a level selected: the model's API default.
         set_translation(&mut cfg, sample(Provider::Anthropic, "claude-opus-5-5"));
+        assert_eq!(cfg.translation.as_ref().unwrap().thinking, Some(Medium));
+        set_translation(&mut cfg, sample(Provider::Anthropic, "claude-sonnet-5-5"));
         assert_eq!(cfg.translation.as_ref().unwrap().thinking, Some(High));
 
         // Local and custom keys aren't account keys.

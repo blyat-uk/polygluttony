@@ -205,10 +205,13 @@ pub fn provider_info(p: Provider) -> ProviderInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Family {
     /// Claude 4.6+ (`thinking: adaptive` + effort; budgets are rejected).
-    ClaudeAdaptive,
+    /// `default` is the effort the API itself uses when none is sent.
+    ClaudeAdaptive { default: ThinkingLevel },
     /// Older Claude (`budget_tokens`).
     ClaudeLegacy,
-    OpenAiReasoning,
+    /// `search` is false for the models the Responses `web_search` tool
+    /// rejects (o1, o3-mini).
+    OpenAiReasoning { search: bool },
     OpenAiOther,
     Gemini3,
     Gemini25,
@@ -242,13 +245,23 @@ fn family(p: Provider, model: &str) -> Family {
     let m = model.trim().to_ascii_lowercase();
     match p {
         Provider::Anthropic => match claude_generation(&m) {
-            Some((_, major, minor)) if (major, minor) >= (4, 6) => Family::ClaudeAdaptive,
+            Some((family, major, minor)) if (major, minor) >= (4, 6) => {
+                // Mirrors each model's own API default (Medium on Opus 5.5 and
+                // Haiku 5.5, High everywhere else), so an untouched or migrated
+                // connection behaves as it did when nothing was sent.
+                let default = match (family, major, minor) {
+                    ("opus" | "haiku", 5, 5) => ThinkingLevel::Medium,
+                    _ => ThinkingLevel::High,
+                };
+                Family::ClaudeAdaptive { default }
+            }
             _ if m.contains("claude-") => Family::ClaudeLegacy,
             _ => Family::Plain,
         },
         Provider::Openai => {
             if ["gpt-5", "o1", "o3", "o4"].iter().any(|prefix| m.starts_with(prefix)) {
-                Family::OpenAiReasoning
+                let search = !(m.starts_with("o1") || m.starts_with("o3-mini"));
+                Family::OpenAiReasoning { search }
             } else {
                 Family::OpenAiOther
             }
@@ -274,11 +287,9 @@ impl Family {
     fn capabilities(self) -> ModelCapabilities {
         use ThinkingLevel::{High, Low, Medium, Off};
         let (thinking_levels, default_thinking, web_search) = match self {
-            // High is what the recommended Sonnet does when nothing is sent, so
-            // an untouched or migrated connection keeps the quality it had.
-            Family::ClaudeAdaptive => (vec![Low, Medium, High], Some(High), true),
+            Family::ClaudeAdaptive { default } => (vec![Low, Medium, High], Some(default), true),
             Family::ClaudeLegacy => (vec![Off, Low, Medium, High], Some(Off), true),
-            Family::OpenAiReasoning => (vec![Low, Medium, High], None, true),
+            Family::OpenAiReasoning { search } => (vec![Low, Medium, High], None, search),
             Family::Gemini3 => (vec![Low, High], None, true),
             Family::Gemini25 => (vec![Low, Medium, High], None, true),
             Family::OpenAiOther | Family::GeminiOther => (vec![], None, true),
@@ -324,7 +335,7 @@ pub fn thinking_param(
     };
     let effort = match level { Low => "low", Medium => "medium", _ => "high" };
     match fam {
-        Family::ClaudeAdaptive => ThinkingParam::AnthropicAdaptive(effort),
+        Family::ClaudeAdaptive { .. } => ThinkingParam::AnthropicAdaptive(effort),
         Family::ClaudeLegacy => {
             // The API floor is 1024 and the budget must be below max_tokens.
             let divisor = match level { Low => 8, Medium => 4, _ => 2 };
@@ -335,7 +346,7 @@ pub fn thinking_param(
                 ThinkingParam::AnthropicBudget(budget)
             }
         }
-        Family::OpenAiReasoning => ThinkingParam::OpenAiEffort(effort),
+        Family::OpenAiReasoning { .. } => ThinkingParam::OpenAiEffort(effort),
         Family::Gemini3 => ThinkingParam::GeminiLevel(effort),
         Family::Gemini25 => {
             // 2.5 counts thinking against maxOutputTokens: leave the answer
@@ -475,11 +486,17 @@ mod tests {
     #[test]
     fn anthropic_capabilities_split_adaptive_from_legacy_claude() {
         let adaptive = caps(&[Low, Medium, High], Some(High), true);
-        for m in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-opus-4-6",
-                  "claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-5",
-                  "claude-opus-5", "claude-fable-5-1", "claude-mythos-5", "Claude-Sonnet-5-5",
-                  "claude-opus-4-6@20260101", "claude-sonnet-4-6-20260115"] {
+        for m in ["claude-sonnet-5-5", "claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-7",
+                  "claude-opus-4-8", "claude-sonnet-5", "claude-opus-5", "claude-fable-5-1",
+                  "claude-mythos-5", "Claude-Sonnet-5-5", "claude-opus-4-6@20260101",
+                  "claude-sonnet-4-6-20260115"] {
             assert_eq!(capabilities(Provider::Anthropic, m), adaptive, "{m}");
+        }
+        // The default follows the API's own: Medium on Opus 5.5 and Haiku 5.5.
+        let medium_default = caps(&[Low, Medium, High], Some(Medium), true);
+        for m in ["claude-opus-5-5", "claude-haiku-5-5", "Claude-Opus-5-5",
+                  "claude-opus-5-5-20260301", "claude-haiku-5-5@20260301"] {
+            assert_eq!(capabilities(Provider::Anthropic, m), medium_default, "{m}");
         }
         let legacy = caps(&[Off, Low, Medium, High], Some(Off), true);
         for m in ["claude-haiku-4-5", "claude-sonnet-4-5-20250929", "claude-opus-4-1",
@@ -493,8 +510,13 @@ mod tests {
     #[test]
     fn openai_and_google_capabilities() {
         let reasoning = caps(&[Low, Medium, High], None, true);
-        for m in ["gpt-5.5", "gpt-5.4-mini", "gpt-5", "o1", "o3-mini", "o4-mini"] {
+        for m in ["gpt-5.5", "gpt-5.4-mini", "gpt-5", "o3", "o3-pro", "o4-mini"] {
             assert_eq!(capabilities(Provider::Openai, m), reasoning, "{m}");
+        }
+        // The Responses web_search tool rejects these; thinking is unchanged.
+        let no_search = caps(&[Low, Medium, High], None, false);
+        for m in ["o1", "o1-mini", "o1-pro", "o3-mini", "o3-mini-2025-01-31"] {
+            assert_eq!(capabilities(Provider::Openai, m), no_search, "{m}");
         }
         assert_eq!(capabilities(Provider::Openai, "gpt-4.1"), caps(&[], None, true));
 
@@ -523,6 +545,8 @@ mod tests {
         // Adaptive Claude has no Off: fall back to its default, as for None.
         assert_eq!(n(Provider::Anthropic, "claude-sonnet-5-5", Some(Off)), Some(High));
         assert_eq!(n(Provider::Anthropic, "claude-sonnet-5-5", None), Some(High));
+        assert_eq!(n(Provider::Anthropic, "claude-opus-5-5", None), Some(Medium));
+        assert_eq!(n(Provider::Anthropic, "claude-opus-5-5", Some(High)), Some(High));
         assert_eq!(n(Provider::Anthropic, "claude-haiku-4-5", None), Some(Off));
         // Gemini 3 has no Medium; its default is the model's own (nothing sent).
         assert_eq!(n(Provider::Google, "gemini-3-flash-preview", Some(Medium)), None);
