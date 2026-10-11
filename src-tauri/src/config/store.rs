@@ -528,6 +528,30 @@ fn backup_v1_once(path: &Path, value: &Value) -> std::io::Result<()> {
     written
 }
 
+/// Whether `save` may replace the stored value. `load` leaves a v1 config on
+/// disk when its backup fails, so until a backup exists, saving (any connection
+/// change, the default languages) would destroy the only copy of the old
+/// settings. `backup` is where the backup belongs, or why that couldn't be
+/// worked out.
+fn check_v1_backed_up(stored: Option<&Value>, backup: Result<&Path, &str>) -> AppResult<()> {
+    if !stored.is_some_and(is_v1) {
+        return Ok(());
+    }
+    match backup {
+        Ok(path) if path.exists() => Ok(()),
+        Ok(path) => Err(AppError::Other(format!(
+            "Your settings from the previous version couldn't be backed up to {}, so they \
+             haven't been replaced. Check that the folder can be written to, then restart \
+             Polygluttony.",
+            path.display()
+        ))),
+        Err(e) => Err(AppError::Other(format!(
+            "Your settings from the previous version couldn't be backed up ({e}), so they \
+             haven't been replaced."
+        ))),
+    }
+}
+
 // ---- Tauri store adapter (thin; not unit-tested) ---------------------------
 
 /// Load the config from the store. First run seeds and persists the defaults;
@@ -552,16 +576,19 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppResult<AppConfig> {
             store.set(STORE_KEY, serde_json::to_value(&cfg)?);
             store.save().map_err(|e| AppError::Other(e.to_string()))?;
         }
-        // Without a backup the v1 value stays on disk and the migration reruns
-        // on the next load.
+        // Without a backup the v1 value stays on disk, the migration reruns on
+        // the next load, and `save` refuses to replace it meanwhile.
         Err(e) => tracing::warn!("couldn't back up the v1 config ({e}); not replacing it yet"),
     }
     Ok(cfg)
 }
 
-/// Persist the whole config.
+/// Persist the whole config — refused while a v1 config without a backup is
+/// still on disk (see `check_v1_backed_up`).
 pub fn save<R: Runtime>(app: &AppHandle<R>, cfg: &AppConfig) -> AppResult<()> {
     let store = app.store(STORE_FILE).map_err(|e| AppError::Other(e.to_string()))?;
+    let backup = tauri_plugin_store::resolve_store_path(app, V1_BACKUP_FILE).map_err(|e| e.to_string());
+    check_v1_backed_up(store.get(STORE_KEY).as_ref(), backup.as_deref().map_err(String::as_str))?;
     store.set(STORE_KEY, serde_json::to_value(cfg)?);
     store.save().map_err(|e| AppError::Other(e.to_string()))?;
     Ok(())
@@ -1226,5 +1253,29 @@ mod tests {
         backup_v1_once(&path, &json!({ "default_source": "ja" })).unwrap();
         let again: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(again, written);
+    }
+
+    #[test]
+    fn saving_over_a_v1_config_needs_its_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(V1_BACKUP_FILE);
+        let v1 = v1_seeded();
+
+        // The backup failed: the v1 value is still the only copy.
+        let err = check_v1_backed_up(Some(&v1), Ok(&path)).unwrap_err().to_string();
+        assert!(err.contains("couldn't be backed up"), "{err}");
+        assert!(err.contains(&path.display().to_string()), "names where: {err}");
+        let err = check_v1_backed_up(Some(&v1), Err("no app data dir")).unwrap_err().to_string();
+        assert!(err.contains("no app data dir"), "{err}");
+
+        // Once the backup exists, the v1 value may go.
+        backup_v1_once(&path, &v1).unwrap();
+        assert!(check_v1_backed_up(Some(&v1), Ok(&path)).is_ok());
+
+        // A v2 value, or nothing stored yet, never needs one.
+        let missing = dir.path().join("nope.json");
+        let v2 = serde_json::to_value(default_config()).unwrap();
+        assert!(check_v1_backed_up(Some(&v2), Ok(&missing)).is_ok());
+        assert!(check_v1_backed_up(None, Err("no app data dir")).is_ok());
     }
 }
