@@ -33,7 +33,12 @@ import { ProviderMark } from "./provider-tiles";
 import { CardEyebrow, RoleCard, StatusDot } from "./role-card";
 import { ThinkingControl, thinkingHelp } from "./thinking-control";
 import { TuningSection } from "./tuning-section";
-import { capabilitiesQuery, useConnectionMutations, useLiveModels } from "./use-connections";
+import {
+  capabilitiesQuery,
+  connectionsKey,
+  useConnectionMutations,
+  useLiveModels,
+} from "./use-connections";
 
 type Mutations = ReturnType<typeof useConnectionMutations>;
 
@@ -202,11 +207,16 @@ function TranslationSummary({
 
   const changeModel = async (model: string) => {
     if (model === conn.model) return;
-    const next = await qc.fetchQuery(capabilitiesQuery(conn.provider, model)).catch(() => null);
+    const provider = conn.provider;
+    const next = await qc.fetchQuery(capabilitiesQuery(provider, model)).catch(() => null);
+    // Thinking or Tuning may have been saved while that loaded: build on the latest cached
+    // connection, not the one this render saw. Gone or re-pointed meanwhile → drop the change.
+    const latest = qc.getQueryData<ConnectionsConfig>(connectionsKey)?.translation;
+    if (!latest || latest.provider !== provider) return;
     m.updateTranslation.mutate({
-      ...conn,
+      ...latest,
       model,
-      thinking: next ? normaliseThinking(conn.thinking, next) : conn.thinking,
+      thinking: next ? normaliseThinking(latest.thinking, next) : latest.thinking,
     });
   };
 
