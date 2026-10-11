@@ -250,6 +250,11 @@ fn forget_unused_key(cfg: &mut AppConfig, provider: Provider) {
     }
 }
 
+/// The same provider, model id and address: one library entry.
+fn same_endpoint(a: &Model, b: &Model) -> bool {
+    a.provider == b.provider && a.model == b.model && a.base_url == b.base_url
+}
+
 /// Add a model to the library or update one (Connect, Edit, an inline model
 /// change). Returns its id.
 ///
@@ -259,6 +264,9 @@ fn forget_unused_key(cfg: &mut AppConfig, provider: Provider) {
 /// no model has; an updated one keeps both. A cloud key with a value becomes
 /// the provider's key for every model of that provider; an empty one is filled
 /// from the remembered key.
+///
+/// Editing a model into a twin of another library entry merges the two: the
+/// twin goes, and its steps move to the edited model with their settings.
 ///
 /// The first model does every step (web search too, when it can search).
 /// `assign` also hands `step` to this model, with the model's own Thinking
@@ -272,9 +280,7 @@ pub fn save_model(cfg: &mut AppConfig, model: Model, assign: Option<Step>) -> Ap
         return Err(cant_search(&model));
     }
     let existing = if model.id.is_empty() {
-        cfg.models.iter().position(|m| {
-            m.provider == model.provider && m.model == model.model && m.base_url == model.base_url
-        })
+        cfg.models.iter().position(|m| same_endpoint(m, &model))
     } else {
         Some(cfg.models.iter().position(|m| m.id == model.id).ok_or_else(unknown_model)?)
     };
@@ -284,6 +290,18 @@ pub fn save_model(cfg: &mut AppConfig, model: Model, assign: Option<Step>) -> Ap
             model.id = cfg.models[i].id.clone();
             model.color = cfg.models[i].color;
             cfg.models[i] = model.clone();
+            // Edited into a twin of another library model: keep one entry, not
+            // two. The twin's steps move to this one with their settings.
+            if let Some(j) = cfg.models.iter().position(|m| m.id != model.id && same_endpoint(m, &model)) {
+                let twin = cfg.models.remove(j).id;
+                if let Some(steps) = cfg.steps.as_mut() {
+                    for step in Step::ALL {
+                        if let Some(s) = steps.get_mut(step).filter(|s| s.model == twin) {
+                            s.model = model.id.clone();
+                        }
+                    }
+                }
+            }
         }
         None => {
             model.id = next_model_id(&cfg.models);
@@ -900,7 +918,16 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppResult<AppConfig> {
         return Ok(cfg);
     };
     if !is_v1(&value) {
-        return Ok(config_from_stored(value));
+        // A pre-release v2 config (earlier builds of this version) is rewritten
+        // in the library shape straight away, like a v1 one: no backup, since
+        // only those builds ever wrote it.
+        let rewrite = value.as_object().is_some_and(is_pre_release_v2);
+        let cfg = config_from_stored(value);
+        if rewrite {
+            store.set(STORE_KEY, serde_json::to_value(&cfg)?);
+            store.save().map_err(|e| AppError::Other(e.to_string()))?;
+        }
+        return Ok(cfg);
     }
     let cfg = config_from_stored(value.clone());
     let backup = tauri_plugin_store::resolve_store_path(app, V1_BACKUP_FILE)
@@ -1456,6 +1483,27 @@ mod tests {
         assert_eq!((cfg.models[2].api_key.as_str(), cfg.models[3].api_key.as_str()), ("sk-oai", "gw-key"));
         assert_eq!(remembered(&cfg, "anthropic").as_deref(), Some("sk-2"));
         assert_eq!(remembered(&cfg, "custom"), None);
+    }
+
+    #[test]
+    fn editing_a_model_into_a_twin_of_another_merges_them() {
+        // Sonnet does everything but Verify, which runs on Haiku.
+        let mut cfg = library(&[
+            keyed(Provider::Anthropic, "claude-sonnet-5-5", "k"),
+            keyed(Provider::Anthropic, "claude-haiku-5-5", "k"),
+        ]);
+        set_step(&mut cfg, Step::Verify, Some(on("m2"))).unwrap();
+        set_step(&mut cfg, Step::Translate, Some(StepSettings { thinking: Some(Low), ..on("m1") })).unwrap();
+        // Haiku edited into a second Sonnet: one Sonnet entry remains (Haiku's id and colour).
+        let edited = Model { id: "m2".into(), ..keyed(Provider::Anthropic, "claude-sonnet-5-5", "k") };
+        save_model(&mut cfg, edited, None).unwrap();
+        assert_eq!(ids(&cfg), ["m2"]);
+        assert_eq!(model(&cfg, "m2").color, 1);
+        // Every step is on it now, each keeping its own settings.
+        for s in [Step::Extract, Step::Normalize, Step::Translate, Step::Verify] {
+            assert_eq!(step(&cfg, s).model, "m2", "{s:?}");
+        }
+        assert_eq!(step(&cfg, Step::Translate).thinking, Some(Low));
     }
 
     #[test]
