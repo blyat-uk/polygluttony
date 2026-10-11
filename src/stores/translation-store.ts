@@ -12,13 +12,13 @@ export interface FileRow {
   state: FileStateKind
   detail: string | null
   translated: number
+  /** Highest `translated` seen. A full retranslation restarts `translated` from
+   *  zero; the run's progress bar reads this so it never moves backwards. */
+  peakTranslated: number
   total: number
   batch: number
   totalBatches: number
   retries: number
-  /** Epoch ms the current in-flight batch began awaiting the model (drives the
-   *  "awaiting model · Ns" timer; stored so it survives hero switches). */
-  inFlightSince: number
   hasWarnings: boolean | null
   error: string | null
   issues: VerifyIssue[]
@@ -39,10 +39,13 @@ const now = () => new Date().toLocaleTimeString("en-GB", { hour12: false })
 
 interface TranslationRunState {
   running: boolean
+  /** The folder the current or last run translated; file names are only
+   *  unique within it. */
+  folder: string | null
   files: Record<string, FileRow>
   logs: LogLine[]
   results: FileResult[] | null
-  start: (files: string[]) => void
+  start: (files: string[], folder: string) => void
   applyEvent: (e: RunEvent) => void
   reset: () => void
 }
@@ -51,11 +54,11 @@ const emptyRow = (): FileRow => ({
   state: "pending",
   detail: null,
   translated: 0,
+  peakTranslated: 0,
   total: 0,
   batch: 0,
   totalBatches: 0,
   retries: 0,
-  inFlightSince: 0,
   hasWarnings: null,
   error: null,
   issues: [],
@@ -64,13 +67,15 @@ const emptyRow = (): FileRow => ({
 
 export const useTranslationRun = create<TranslationRunState>((set) => ({
   running: false,
+  folder: null,
   files: {},
   logs: [],
   results: null,
 
-  start: (files) =>
+  start: (files, folder) =>
     set({
       running: true,
+      folder,
       results: null,
       logs: [],
       files: Object.fromEntries(files.map((f) => [f, emptyRow()])),
@@ -88,21 +93,16 @@ export const useTranslationRun = create<TranslationRunState>((set) => ({
             state: e.state,
             detail: e.detail,
             ...(e.state === "verifying" ? { reachedVerify: true } : {}),
-            // A fresh in-flight period begins when a batch is (re)dispatched.
-            ...(e.state === "translating" || e.state === "retranslating"
-              ? { inFlightSince: Date.now() }
-              : {}),
           })
           return { files }
         case "progress":
-          // A batch just landed → the next one is now awaiting the model.
           touch(e.file, {
             translated: e.translated,
+            peakTranslated: Math.max(files[e.file]?.peakTranslated ?? 0, e.translated),
             total: e.total,
             batch: e.batch,
             totalBatches: e.total_batches,
             retries: e.retries,
-            inFlightSince: Date.now(),
           })
           return { files }
         case "log":
@@ -125,5 +125,5 @@ export const useTranslationRun = create<TranslationRunState>((set) => ({
       }
     }),
 
-  reset: () => set({ running: false, files: {}, logs: [], results: null }),
+  reset: () => set({ running: false, folder: null, files: {}, logs: [], results: null }),
 }))

@@ -7,5 +7,10 @@ import type { VerifyIssue } from "./VerifyIssue";
 
 /**
  * Everything the UI hears during a run, on `TRANSLATION_EVENT`.
+ *
+ * The `#[ts(skip)]` variants are internal: the pipeline sends them down the
+ * same channel so they stay ordered with the rest, the run forwarder folds
+ * them into the live board (`translation::live`) and never emits them to the
+ * webview. Episode windows read the board through `episode_snapshot`.
  */
 export type RunEvent = { "kind": "state", file: string, state: FileStateKind, detail: string | null, } | { "kind": "progress", file: string, translated: number, total: number, batch: number, total_batches: number, retries: number, } | { "kind": "log", file: string | null, level: LogLevel, phase: LogPhase, message: string, } | { "kind": "file_done", file: string, has_warnings: boolean, issues: Array<VerifyIssue>, } | { "kind": "error", file: string, message: string, } | { "kind": "run_finished", results: Array<FileResult>, };

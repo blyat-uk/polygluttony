@@ -25,6 +25,7 @@ import type { ReferenceTerminology } from "@/types/generated/ReferenceTerminolog
 import type { WorldType } from "@/types/generated/WorldType";
 import type { PromptId } from "@/types/generated/PromptId";
 import type { PromptMeta } from "@/types/generated/PromptMeta";
+import type { EpisodeView } from "@/types/generated/EpisodeView";
 
 /**
  * Typed wrappers around the Rust core's Tauri commands. The webview never talks
@@ -93,6 +94,10 @@ export const ipc = {
   }) => invoke<void>("start_translation", args),
   /** O17 — cancel the active run. */
   cancelTranslation: () => invoke<void>("cancel_translation"),
+  /** One episode of the current or last run, from the run's live board. */
+  episodeSnapshot: (file: string) => invoke<EpisodeView>("episode_snapshot", { file }),
+  /** Open the episode's live window, or focus it when it's already open. */
+  openEpisodeWindow: (file: string) => invoke<void>("open_episode_window", { file }),
   /** O9 — load glossary.json (null when none exists). */
   loadGlossary: (folder: string) => invoke<GlossaryDoc | null>("load_glossary", { folder }),
   /** O14 — persist the whole glossary doc (atomic write). */
@@ -153,6 +158,9 @@ export const ipc = {
   /** Prompts — read a picked .txt file for "Load from file…" (≤1 MB, UTF-8). */
   readPromptFile: (path: string) => invoke<string>("read_prompt_file", { path }),
 };
+
+/** Tells episode windows to refetch; payload `EpisodeChanged` (`file: null` = all). */
+export const EPISODE_CHANGED_EVENT = "episode://changed";
 
 /** Subscribe to a backend-emitted event (progress, logs, …). Returns an unlisten fn. */
 export function onBackendEvent<T>(

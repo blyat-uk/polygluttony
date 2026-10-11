@@ -175,6 +175,9 @@
 @keyframes vt-recede { from { opacity:1; transform:scale(1); } to { opacity:0; transform:scale(.99); } }
 @keyframes sig-ping { 0%{box-shadow:0 0 0 0 color-mix(in oklch,var(--color-gold) 55%,transparent);} 70%,100%{box-shadow:0 0 0 8px transparent;} }
 @keyframes sig-shimmer { 0%{background-position:120% 0;} 100%{background-position:-120% 0;} }
-@keyframes sig-sweep { 0%{transform:translateX(-100%);opacity:.9;} 100%{transform:translateX(100%);opacity:0;} }
 @keyframes sig-flow { 0%{background-position:0 0;} 100%{background-position:34px 0;} }
 @keyframes gloss-pop { 0%{opacity:0;transform:translateY(8px) scale(.6);} 100%{opacity:1;transform:none;} }
+
+/* Episode window: a landed translation fades in warm gold, then settles to its
+   own ink (no end colour, so it returns to whatever the cell sets). */
+@keyframes ep-land { from { opacity:0; color:var(--color-gold-hi); } 30% { opacity:1; } }

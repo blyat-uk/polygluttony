@@ -11,6 +11,7 @@
 pub mod batch;
 pub mod batching;
 pub mod cleanup;
+pub mod live;
 pub mod parse_response;
 pub mod pipeline;
 pub mod prompts;

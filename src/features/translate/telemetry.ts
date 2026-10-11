@@ -1,41 +1,35 @@
 import type { FileRow } from "@/stores/translation-store"
 import type { FileStateKind } from "@/types/generated/FileStateKind"
 
-export type BatchState = "queued" | "in-flight" | "landing" | "done" | "retrans"
-const IN_FLIGHT: FileStateKind[] = ["translating", "retranslating", "cleanup", "verifying"]
+const SUCCEEDED: FileStateKind[] = ["done", "warning"]
+const FINISHED: FileStateKind[] = ["done", "warning", "failed"]
 
-/** Count of FULLY-completed batches = 0-based index of the frontier cell.
- *  `row.batch` is the completed count while translating; while retranslating the
- *  reported batch is being retried, so one fewer is actually done.
- *  (Confirmed against src-tauri/src/translation/pipeline.rs:363-442.) */
-function doneBatches(row: FileRow): number {
-  return row.state === "retranslating" ? Math.max(0, row.batch - 1) : row.batch
+export interface RunProgress {
+  /** Lines translated across the run's files. */
+  done: number
+  /** Lines across the run's files. */
+  total: number
+  /** Files that reached done, warning or failed. */
+  finished: number
+  files: number
 }
 
-/** Cell state for batch index `i` (0..totalBatches-1) of a file. */
-export function batchCellState(row: FileRow, i: number): BatchState {
-  const done = doneBatches(row)
-  if (i < done) return "done"
-  if (i > done) return "queued"
-  if (row.state === "retranslating") return "retrans"
-  if (row.state === "translating") return "in-flight"
-  return "done"
-}
-
-/** The file to spotlight as the hero: first in-flight file in insertion order. */
-export function pickHero(files: Record<string, FileRow>): string | null {
-  for (const [name, f] of Object.entries(files)) if (IN_FLIGHT.includes(f.state)) return name
-  return null
-}
-
-export interface RunIntegrity { done: number; total: number; retranslated: number }
-export function runIntegrity(files: Record<string, FileRow>): RunIntegrity {
-  let done = 0, total = 0, retranslated = 0
-  for (const f of Object.values(files)) {
-    total += f.totalBatches
-    const terminal = f.state === "done" || f.state === "warning"
-    done += terminal ? f.totalBatches : Math.min(doneBatches(f), f.totalBatches)
-    retranslated += f.retries
+/** Line-level progress of the run behind the bottom bar. A file counts its
+ *  dialogue lines until the pipeline reports its own total, so the bar has a
+ *  denominator from the start. Done follows each file's peak, not
+ *  `translated`, so a full retranslation doesn't pull the bar back. */
+export function runProgress(
+  files: Record<string, FileRow>,
+  dialogueCounts: Map<string, number>,
+): RunProgress {
+  let done = 0, total = 0, finished = 0
+  const names = Object.keys(files)
+  for (const name of names) {
+    const f = files[name]
+    const fileTotal = f.total > 0 ? f.total : (dialogueCounts.get(name) ?? 0)
+    total += fileTotal
+    done += SUCCEEDED.includes(f.state) ? fileTotal : f.peakTranslated
+    if (FINISHED.includes(f.state)) finished++
   }
-  return { done, total, retranslated }
+  return { done, total, finished, files: names.length }
 }
