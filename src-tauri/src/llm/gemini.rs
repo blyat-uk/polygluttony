@@ -150,24 +150,23 @@ impl Reply {
     }
 
     /// The answer, or why there isn't one. A truncated (`MAX_TOKENS`) answer
-    /// is still an answer — the pipeline handles the missing lines. A stream
-    /// must also have reported a `finishReason`: one that just stops was cut off.
+    /// is still an answer — the pipeline handles the missing lines — but one
+    /// a block cut off is not, even with some text already streamed: the rest
+    /// was withheld, not lost. A stream must also have reported a
+    /// `finishReason`: one that just stops was cut off.
     fn finish(self, streamed: bool) -> Result<LlmResponse, LlmError> {
-        let no_text = self.text.trim().is_empty();
-        if no_text {
-            if let Some(reason) = &self.block_reason {
-                return Err(LlmError::Declined(format!("Gemini blocked the prompt ({reason})")));
-            }
-            if let Some(reason) = self.finish_reason.as_deref() {
-                if BLOCKED_FINISH_REASONS.contains(&reason) {
-                    return Err(LlmError::Declined(format!("Gemini blocked the response ({reason})")));
-                }
+        if let Some(reason) = &self.block_reason {
+            return Err(LlmError::Declined(format!("Gemini blocked the prompt ({reason})")));
+        }
+        if let Some(reason) = self.finish_reason.as_deref() {
+            if BLOCKED_FINISH_REASONS.contains(&reason) {
+                return Err(LlmError::Declined(format!("Gemini blocked the response ({reason})")));
             }
         }
         if streamed && self.finish_reason.is_none() {
             return Err(LlmError::Transport("stream ended before completion".into()));
         }
-        if no_text {
+        if self.text.trim().is_empty() {
             return Err(LlmError::Empty);
         }
         let usage = self.usage();
@@ -487,6 +486,31 @@ mod tests {
             assert!(!err.is_retryable(), "{err:?}");
             assert!(err.to_string().contains("Gemini blocked the response (SAFETY)"), "{err}");
         }
+    }
+
+    /// Text that streamed before a block is a fragment, not an answer.
+    #[tokio::test]
+    async fn a_response_blocked_after_some_text_is_declined() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(GENERATE))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer("1|The song goes", "RECITATION")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(STREAM))
+            .respond_with(sse_reply(&[
+                json!({"candidates": [{"content": {"parts": [{"text": "1|Hello\n2|"}]}}]}),
+                json!({"candidates": [{"finishReason": "SAFETY"}]}),
+            ]))
+            .mount(&server)
+            .await;
+        let d = GeminiDriver::new(conn(&server, "gemini-2.5-pro"));
+        let one_shot = d.complete("s", "u").await.unwrap_err();
+        assert!(matches!(&one_shot, LlmError::Declined(m) if m == "Gemini blocked the response (RECITATION)"), "{one_shot:?}");
+        let streamed = d.stream(&req()).await.unwrap_err();
+        assert!(matches!(&streamed, LlmError::Declined(m) if m == "Gemini blocked the response (SAFETY)"), "{streamed:?}");
+        assert!(!streamed.is_retryable());
     }
 
     /// A blocked prompt gets no candidates at all — and so no `finishReason`,
