@@ -864,6 +864,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_batch_goes_idle_without_landing_then_resends() {
+        let src = ass_source(&["你好", "再见"]);
+        let (result, events, _, _dir) = run_pipeline(
+            &src,
+            vec![
+                Ok("not json".into()), // Failure: halve and requeue both lines
+                Ok(ok_batch(&[(1, "Hello there friend"), (2, "Goodbye for now")])),
+                Ok(r#"{"issues":[]}"#.into()),
+            ],
+        )
+        .await;
+        assert!(result.success);
+        assert_eq!(
+            board_events(&events),
+            vec![
+                "lines 2".to_string(),
+                "sending [1, 2] Batch { batch: 1, total_batches: 1 }".into(),
+                "idle".into(),
+                "sending [1, 2] Batch { batch: 2, total_batches: 2 }".into(),
+                r#"landed [(1, "Hello there friend"), (2, "Goodbye for now")]"#.into(),
+                "idle".into(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_cleanup_leaves_the_board_to_the_error_event() {
+        let src = ass_source(&["你好"]);
+        let (_, events, _, _dir) = run_pipeline(
+            &src,
+            vec![
+                Ok(ok_batch(&[(1, "还是中文 leftover")])),
+                Err(crate::llm::error::LlmError::Http {
+                    status: 401,
+                    body: "dead".into(),
+                    retry_after: None,
+                }),
+            ],
+        )
+        .await;
+        // No Idle after the cleanup request: the Error event settles the board.
+        assert_eq!(
+            board_events(&events),
+            vec![
+                "lines 1".to_string(),
+                "sending [1] Batch { batch: 1, total_batches: 1 }".into(),
+                r#"landed [(1, "还是中文 leftover")]"#.into(),
+                "idle".into(),
+                "sending [1] Cleanup".into(),
+            ]
+        );
+        assert!(matches!(events.last(), Some(RunEvent::State { state: FileStateKind::Failed, .. })));
+    }
+
+    #[tokio::test]
     async fn partial_batch_retries_remainder() {
         let src = ass_source(&["你好", "再见", "走吧"]);
         let (result, _, driver, _dir) = run_pipeline(

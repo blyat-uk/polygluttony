@@ -113,6 +113,14 @@ pub fn run() {
             commands::reset_prompt,
             commands::read_prompt_file,
         ])
+        // Tauri quits only once every window is gone, so an open episode
+        // window would keep the app (and its run) alive with no way back to
+        // Cancel. Closing the main window quits, as it did before.
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                tauri::Manager::app_handle(window).exit(0);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

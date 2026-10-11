@@ -39,10 +39,13 @@ const now = () => new Date().toLocaleTimeString("en-GB", { hour12: false })
 
 interface TranslationRunState {
   running: boolean
+  /** The folder the current or last run translated; file names are only
+   *  unique within it. */
+  folder: string | null
   files: Record<string, FileRow>
   logs: LogLine[]
   results: FileResult[] | null
-  start: (files: string[]) => void
+  start: (files: string[], folder: string) => void
   applyEvent: (e: RunEvent) => void
   reset: () => void
 }
@@ -64,13 +67,15 @@ const emptyRow = (): FileRow => ({
 
 export const useTranslationRun = create<TranslationRunState>((set) => ({
   running: false,
+  folder: null,
   files: {},
   logs: [],
   results: null,
 
-  start: (files) =>
+  start: (files, folder) =>
     set({
       running: true,
+      folder,
       results: null,
       logs: [],
       files: Object.fromEntries(files.map((f) => [f, emptyRow()])),
@@ -120,5 +125,5 @@ export const useTranslationRun = create<TranslationRunState>((set) => ({
       }
     }),
 
-  reset: () => set({ running: false, files: {}, logs: [], results: null }),
+  reset: () => set({ running: false, folder: null, files: {}, logs: [], results: null }),
 }))

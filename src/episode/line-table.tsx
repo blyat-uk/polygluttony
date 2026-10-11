@@ -165,12 +165,16 @@ export function LineTable({
       if (pointerDown) return userScrolled();
       const ex = expected.current;
       if (ex) {
-        const age = performance.now() - ex.at;
-        if (age < (ex.smooth ? SMOOTH_GRACE_MS : AUTO_GRACE_MS)) {
+        // Landed where we sent it: ours, however late the event comes. A hidden
+        // or minimized window doesn't render, so its scroll events can arrive
+        // long after the follow jump that caused them.
+        if (Math.abs(top - ex.target) < 2) {
           // A smooth scroll that has arrived stops covering later events.
-          if (Math.abs(top - ex.target) < 2) ex.smooth = false;
+          ex.smooth = false;
           return;
         }
+        // Frames on the way there.
+        if (performance.now() - ex.at < (ex.smooth ? SMOOTH_GRACE_MS : AUTO_GRACE_MS)) return;
       }
       // The browser pulled the position up because the list got shorter.
       if (top < prevTop && top >= el.scrollHeight - el.clientHeight - 1) return;

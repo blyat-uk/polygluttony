@@ -49,6 +49,7 @@ export function TranslatePage() {
 
   const running = useTranslationRun((s) => s.running);
   const storeFiles = useTranslationRun((s) => s.files);
+  const runFolder = useTranslationRun((s) => s.folder);
   const logs = useTranslationRun((s) => s.logs);
   const results = useTranslationRun((s) => s.results);
 
@@ -105,7 +106,7 @@ export function TranslatePage() {
 
   const handleStart = () => {
     setExpanded(new Set());
-    useTranslationRun.getState().start(selected);
+    useTranslationRun.getState().start(selected, workdir);
     ipc.startTranslation({
       folder: workdir,
       files: selected,
@@ -287,8 +288,9 @@ export function TranslatePage() {
                   const isExpanded = expandable && expanded.has(file.name);
                   const cells = stateToCells(state, row?.reachedVerify ?? false);
                   // Files of the current or last run have a live board behind
-                  // them, so they can open in their own window.
-                  const watchable = row !== undefined;
+                  // them, so they can open in their own window. Same-named
+                  // files in another folder don't.
+                  const watchable = row !== undefined && runFolder === workdir;
 
                   return (
                     <Fragment key={file.name}>
@@ -380,6 +382,8 @@ export function TranslatePage() {
                                 className="-my-1 grid size-6 shrink-0 place-items-center rounded-full text-muted-foreground opacity-0 outline-none transition hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-[3px] focus-visible:ring-ring/50"
                                 onClick={(e) => {
                                   e.stopPropagation();
+                                  // A double-click is two clicks; open once.
+                                  if (e.detail > 1) return;
                                   watchEpisode(file.name);
                                 }}
                                 onDoubleClick={(e) => e.stopPropagation()}

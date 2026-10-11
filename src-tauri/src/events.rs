@@ -136,14 +136,20 @@ pub enum RunEvent {
 
 impl RunEvent {
     /// True for the live-board variants the forwarder keeps from the webview.
+    /// No wildcard arm: a new variant has to decide which side it's on.
     pub fn is_internal(&self) -> bool {
-        matches!(
-            self,
+        match self {
             RunEvent::EpisodeLines { .. }
-                | RunEvent::Sending { .. }
-                | RunEvent::Landed { .. }
-                | RunEvent::Idle { .. }
-        )
+            | RunEvent::Sending { .. }
+            | RunEvent::Landed { .. }
+            | RunEvent::Idle { .. } => true,
+            RunEvent::State { .. }
+            | RunEvent::Progress { .. }
+            | RunEvent::Log { .. }
+            | RunEvent::FileDone { .. }
+            | RunEvent::Error { .. }
+            | RunEvent::RunFinished { .. } => false,
+        }
     }
 }
 

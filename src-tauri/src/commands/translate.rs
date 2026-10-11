@@ -2,8 +2,10 @@
 //! the live episode board in `translation::live`.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::LazyLock;
 
 use tauri::{AppHandle, Manager};
+use tokio::sync::Mutex;
 
 use crate::config::projects::Tone;
 use crate::error::{AppError, AppResult};
@@ -35,12 +37,19 @@ pub async fn cancel_translation(app: AppHandle) -> AppResult<()> {
     run::cancel(app).await
 }
 
-/// One episode of the current or last run, for its live window. `async` so a
-/// waiting episode's disk read stays off the main thread.
+/// One episode of the current or last run, for its live window. A waiting
+/// episode's source is read from disk, so that happens on a blocking thread.
 #[tauri::command]
 pub async fn episode_snapshot(app: AppHandle, file: String) -> AppResult<EpisodeView> {
-    Ok(app.state::<LiveBoard>().snapshot(&file))
+    tauri::async_runtime::spawn_blocking(move || app.state::<LiveBoard>().snapshot(&file))
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))
 }
+
+/// Held from "is it open?" to "it's built": the label only registers once the
+/// window exists, so two quick opens (a double-clicked button) would otherwise
+/// both build one.
+static OPENING_EPISODE_WINDOW: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Window label for an episode. Labels allow only a few characters and a file
 /// name may hold anything, so hash it; stable within a process, which is all
@@ -58,6 +67,7 @@ pub async fn open_episode_window(app: AppHandle, file: String) -> AppResult<()> 
     let window_err =
         |e: tauri::Error| AppError::Other(format!("couldn't open the episode window: {e}"));
     let label = episode_window_label(&file);
+    let _opening = OPENING_EPISODE_WINDOW.lock().await;
     if let Some(window) = app.get_webview_window(&label) {
         window.unminimize().map_err(window_err)?;
         window.show().map_err(window_err)?;

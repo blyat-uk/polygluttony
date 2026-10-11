@@ -40,6 +40,13 @@ export function EpisodeWindow({ file }: { file: string }) {
   const live = useMemo(() => liveIndices(lines), [lines]);
   const liveIds = useMemo(() => live.map((i) => lines[i].id), [live, lines]);
   const issues = useMemo(() => issuesByLine(snapshot?.issues ?? NO_ISSUES), [snapshot?.issues]);
+  // Lines that need a look: named by a verify issue, or left untranslated (the
+  // backend lists only the first few of those as issues).
+  const needsLook = useMemo(() => {
+    const ids = new Set(issues.keys());
+    for (const line of lines) if (line.status === "untranslated") ids.add(line.id);
+    return ids.size;
+  }, [issues, lines]);
 
   let body: ReactNode;
   if (view === null) {
@@ -72,7 +79,7 @@ export function EpisodeWindow({ file }: { file: string }) {
         file={file}
         snapshot={snapshot}
         liveIds={liveIds}
-        flaggedLines={issues.size}
+        flaggedLines={needsLook}
         refreshError={view !== null ? error : null}
       />
       <main className="relative flex min-h-0 flex-1 flex-col">{body}</main>

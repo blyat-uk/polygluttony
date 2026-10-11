@@ -106,12 +106,16 @@ export function describeActivity(
     return { text: why ? `Failed: ${why}` : "Failed", tone: "failed", since: null };
   }
   if (s.state === "done" || s.state === "warning") {
-    return flaggedLines > 0
-      ? {
-          text: `Done · ${flaggedLines} ${flaggedLines === 1 ? "line needs" : "lines need"} a look`,
-          tone: "warn",
-          since: null,
-        }
+    if (flaggedLines > 0) {
+      return {
+        text: `Done · ${flaggedLines} ${flaggedLines === 1 ? "line needs" : "lines need"} a look`,
+        tone: "warn",
+        since: null,
+      };
+    }
+    // A warning whose issues name no line still needs a look.
+    return s.state === "warning"
+      ? { text: "Done · needs a look", tone: "warn", since: null }
       : { text: "Done", tone: "done", since: null };
   }
 
