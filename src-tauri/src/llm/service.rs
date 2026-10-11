@@ -170,10 +170,10 @@ impl LlmService {
                             level: LogLevel::Debug,
                             phase: LogPhase::Llm,
                             message: format!(
-                                "{} ok in {:?} (out tokens: {:?})",
+                                "{} ok in {:?} (tokens: {})",
                                 self.driver.model(),
                                 started.elapsed(),
-                                resp.usage.output_tokens
+                                resp.usage.summary()
                             ),
                         })
                         .await;

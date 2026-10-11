@@ -38,6 +38,23 @@ pub struct LlmRequest {
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// One-line token meter for the run log; `?` marks a count the provider
+    /// didn't report.
+    pub fn summary(&self) -> String {
+        let n = |v: Option<u64>| v.map_or_else(|| "?".to_string(), |v| v.to_string());
+        format!(
+            "in {}, cache write {}, cache read {}, out {}",
+            n(self.input_tokens),
+            n(self.cache_creation_input_tokens),
+            n(self.cache_read_input_tokens),
+            n(self.output_tokens)
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +196,23 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_str(v).unwrap());
         h
+    }
+
+    #[test]
+    fn usage_summary_lists_every_meter() {
+        let u = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_creation_input_tokens: Some(300),
+            cache_read_input_tokens: Some(1200),
+        };
+        assert_eq!(u.summary(), "in 10, cache write 300, cache read 1200, out 5");
+    }
+
+    #[test]
+    fn usage_summary_marks_unreported_meters() {
+        let u = Usage { output_tokens: Some(5), ..Usage::default() };
+        assert_eq!(u.summary(), "in ?, cache write ?, cache read ?, out 5");
     }
 
     #[test]
