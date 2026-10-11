@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowClockwise, Eye, EyeSlash, XCircle } from "@phosphor-icons/react";
 import type { Connection } from "@/types/generated/Connection";
@@ -107,8 +107,20 @@ export function ConnectionForm({
   const settled = useDebouncedValue(probeSource, 500) === probeSource;
   const probe = draft && settled ? { ...draft, base_url: draft.base_url.trim(), api_key: draft.api_key.trim() } : null;
   const canProbe = !!probe && (kind === "cloud" ? probe.api_key !== "" : isHttpUrl(probe.base_url));
+  // Cloud/custom only use the list to enrich the curated models, so a failure is ignored there.
   const live = useLiveModels(probe, canProbe);
-  const checking = !settled || live.isFetching;
+  // Local: is the server there, and does it have any models? (Retry keeps the last answer
+  // in `data`, so a failed refetch must win over it.)
+  const server: "checking" | "unreachable" | "empty" | "found" =
+    !settled || live.isFetching
+      ? "checking"
+      : live.isError
+        ? "unreachable"
+        : !live.data
+          ? "checking"
+          : live.data.length === 0
+            ? "empty"
+            : "found";
 
   // Local: preselect the first model the server reports.
   useEffect(() => {
@@ -324,6 +336,12 @@ export function ConnectionForm({
     </Field>
   );
 
+  const retry = (
+    <TextButton onClick={() => void live.refetch()}>
+      <ArrowClockwise weight="bold" className="size-3" /> Retry
+    </TextButton>
+  );
+  const modelCount = live.data?.length ?? 0;
   const addressField = (
     <Field
       id={ids.address}
@@ -335,19 +353,19 @@ export function ConnectionForm({
           <Msg tone="help">The API format is detected when you connect.</Msg>
         ) : !isHttpUrl(d.base_url.trim()) ? (
           <Msg tone="help">Usually {p.base_url}</Msg>
-        ) : checking ? (
+        ) : server === "checking" ? (
           <Msg tone="busy">Checking {hostOf(d.base_url)}…</Msg>
-        ) : live.data && live.data.length > 0 ? (
+        ) : server === "found" ? (
           <Msg tone="ok">
-            {p.label} is running. Found {live.data.length}{" "}
-            {live.data.length === 1 ? "model" : "models"}.
+            {p.label} is running. Found {modelCount} {modelCount === 1 ? "model" : "models"}.
+          </Msg>
+        ) : server === "empty" ? (
+          <Msg tone="warn">
+            {p.label} is running, but no models are installed yet. {noModelsHint(p)} {retry}
           </Msg>
         ) : (
           <Msg tone="warn">
-            Can’t reach {p.label} at {hostOf(d.base_url)} — is it running?{" "}
-            <TextButton onClick={() => void live.refetch()}>
-              <ArrowClockwise weight="bold" className="size-3" /> Retry
-            </TextButton>
+            Can’t reach {p.label} at {hostOf(d.base_url)} — is it running? {retry}
           </Msg>
         )
       }
@@ -497,6 +515,22 @@ function validate(conn: Connection, info: ProviderInfo, kind: ProviderKind): Err
     e.model = kind === "cloud" ? "Choose a model." : "Choose a model, or type its name in the menu.";
   }
   return e;
+}
+
+/** What to do when a local server answers with no models. */
+function noModelsHint(info: ProviderInfo): ReactNode {
+  if (info.provider === "ollama") {
+    return (
+      <>
+        Run{" "}
+        <code className="font-mono text-[11px] whitespace-nowrap text-foreground">
+          ollama pull &lt;model&gt;
+        </code>{" "}
+        and press Retry.
+      </>
+    );
+  }
+  return `Download a model in ${info.label}, then Retry.`;
 }
 
 function cantSearchText(info: ProviderInfo, model: string): string {

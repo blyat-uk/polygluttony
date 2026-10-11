@@ -52,7 +52,8 @@ export const ipc = {
   /** O5 — send one tiny test request. Custom endpoints get their API format detected. */
   testConnection: (connection: Connection) =>
     invoke<TestResult>("test_connection", { connection }),
-  /** Live model ids from the provider; empty when it can't be reached. */
+  /** Live model ids from the provider. Rejects when it can't be reached or the request
+   *  fails; `[]` means it answered with no models. */
   listModels: (connection: Connection) => invoke<string[]>("list_models", { connection }),
   /** O6/O7/O8 — open a folder: discover files, counts, detect world/language, load prefs. */
   openFolder: (path: string) =>

@@ -72,7 +72,8 @@ export function useCapabilities(provider: Provider | undefined, model: string | 
   });
 }
 
-/** Live model ids from the provider. Empty when it can't be reached. */
+/** Live model ids from the provider. Errors when it can't be reached; `[]` = it answered
+ *  with no models. Cloud and custom callers ignore the error and keep the curated list. */
 export function useLiveModels(conn: Connection | null, enabled: boolean) {
   return useQuery({
     queryKey: ["live-models", conn?.provider, conn?.base_url, conn?.api_key] as const,
