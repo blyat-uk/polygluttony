@@ -11,7 +11,7 @@ use tauri::{AppHandle, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::config::providers::{self, capabilities, default_config, model_label, normalize_thinking};
-use crate::config::{AppConfig, Connection, Driver, ThinkingLevel, WebSearch, CONFIG_VERSION};
+use crate::config::{AppConfig, Connection, Driver, Provider, ThinkingLevel, WebSearch, CONFIG_VERSION};
 use crate::error::{AppError, AppResult};
 
 const STORE_FILE: &str = "config.json";
@@ -28,9 +28,14 @@ fn is_localhost(base_url: &str) -> bool {
 }
 
 /// A connection can make requests: it has a key, or it talks to a server that
-/// needs none (a local provider, or any localhost URL).
+/// needs none (a local provider, any localhost URL, or a Custom endpoint —
+/// its key is optional, e.g. a keyless server elsewhere on the LAN; Connect's
+/// test is what proves it works).
 pub fn connection_is_usable(conn: &Connection) -> bool {
-    !conn.api_key.trim().is_empty() || conn.provider.is_local() || is_localhost(&conn.base_url)
+    !conn.api_key.trim().is_empty()
+        || conn.provider.is_local()
+        || conn.provider == Provider::Custom
+        || is_localhost(&conn.base_url)
 }
 
 /// Fill unset tuning from the provider's defaults — what the UI shows for an
@@ -516,7 +521,7 @@ mod tests {
 
     #[test]
     fn connection_is_usable_rules() {
-        let mut c = sample(Provider::Custom, "m");
+        let mut c = sample(Provider::Openai, "m");
         c.base_url = "https://api.example.com".into();
         c.api_key.clear();
         assert!(!connection_is_usable(&c), "no key, remote URL");
@@ -533,6 +538,11 @@ mod tests {
         ollama.api_key.clear();
         ollama.base_url = "http://192.168.1.5:11434/v1".into();
         assert!(connection_is_usable(&ollama));
+        // Custom's key is optional: a keyless server on the LAN is usable.
+        let mut custom = sample(Provider::Custom, "m");
+        custom.api_key.clear();
+        custom.base_url = "http://192.168.1.20:8000/v1".into();
+        assert!(connection_is_usable(&custom));
     }
 
     #[test]
