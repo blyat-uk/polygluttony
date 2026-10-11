@@ -47,7 +47,7 @@ export function WelcomePage() {
 
       {!hasConnection ? (
         <div className="w-full max-w-xl space-y-2">
-          <Step n={1} title="Connect an AI provider" hint="Anthropic, OpenAI, Google, or a model on your computer (Ollama, LM Studio).">
+          <Step n={1} title="Connect an AI model" hint="Anthropic, OpenAI, Google, or a model on your computer (Ollama, LM Studio).">
             <Button variant="secondary" onClick={() => navigate({ to: "/connections" })}>
               Connect
             </Button>

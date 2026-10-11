@@ -24,9 +24,10 @@ interface AppState {
   dialogueLineCount: number;
   hasUntranslated: boolean;
   glossaryTerms: number | null;
-  /** Display label of the translation model (e.g. "Claude Sonnet 5.5"), null when none. */
+  /** Label of the Translate step's model, plus how many other models the steps use
+   *  (e.g. "Claude Sonnet 5.5", "Claude Sonnet 5.5 +3"); null when nothing is set up. */
   translationLabel: string | null;
-  /** A usable translation connection exists — gates Translate. */
+  /** Translate and Verify both have a usable model — gates Translate. */
   hasUsableConnection: boolean;
   setWorkdir: (dir: string | null) => void;
   setLanguages: (source: string, target: string) => void;

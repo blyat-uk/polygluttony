@@ -71,7 +71,7 @@ export function GlossaryBuildOptions({
           <p className="mt-1 flex items-start gap-1 text-[11px] leading-snug text-muted-foreground">
             <Globe className="mt-px size-3 shrink-0 text-muted-foreground" />
             <span>
-              Needs a web search model — set one up in{" "}
+              Needs a model that can search the web — set up Web search in{" "}
               <Link to="/connections" className="text-primary hover:underline">
                 Connections
               </Link>

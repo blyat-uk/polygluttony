@@ -42,7 +42,7 @@ export function NavRail() {
     if (!item.needsFolder) return null;
     if (!workdir) return "Open a folder first";
     if (item.to === "/translate") {
-      if (!hasUsableConnection) return "Connect an AI provider";
+      if (!hasUsableConnection) return "Connect an AI model";
       if (!hasUntranslated) return "No untranslated files in this folder";
     }
     return null;

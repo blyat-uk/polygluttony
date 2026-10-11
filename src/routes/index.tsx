@@ -8,8 +8,8 @@ import {
 
 export const Route = createFileRoute("/")({
   beforeLoad: async ({ context }) => {
-    // Seed the translation connection before first paint so the status bar label and
-    // the rail badge / Translate gating are right everywhere without visiting Connections.
+    // Seed the connections (Translate's model) before first paint so the status bar label
+    // and the rail badge / Translate gating are right everywhere without visiting Connections.
     // The results land in the query cache the Connections page reads.
     const [cfg, providers] = await Promise.all([
       context.queryClient.ensureQueryData(connectionsQuery),

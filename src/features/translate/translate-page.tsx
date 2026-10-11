@@ -142,7 +142,7 @@ export function TranslatePage() {
       ? ` · using glossary (${view.glossary_terms} terms)`
       : "";
 
-  const connLabel = translationLabel ?? "no connection";
+  const connLabel = translationLabel ?? "no model";
 
   // ── actions ──────────────────────────────────────────────────────────────────
 
@@ -479,7 +479,9 @@ export function TranslatePage() {
           </span>
         ) : !hasUsableConnection && !running ? (
           <span className="text-[11.5px] text-[color:var(--color-alert)]">
-            No translation connection — set one up in Connections.
+            {translationLabel
+              ? "A model needs its API key — add it in Connections."
+              : "No AI model connected — set one up in Connections."}
           </span>
         ) : null}
 

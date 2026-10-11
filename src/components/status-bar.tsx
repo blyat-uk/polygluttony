@@ -72,7 +72,7 @@ export function StatusBar() {
       <span className="shrink-0">
         {sourceLang}→{targetLang}
       </span>
-      <StatusChip variant="accent">{translationLabel ?? "No connection"}</StatusChip>
+      <StatusChip variant="accent">{translationLabel ?? "No model"}</StatusChip>
       <StateChip state={translating ? "translating" : gBusy ? "translating" : "idle"} label={gBusy && !translating ? "Busy" : undefined} />
       <span className="shrink-0 opacity-60">core {appInfo?.version ?? "…"}</span>
     </footer>
