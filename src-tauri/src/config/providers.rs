@@ -274,7 +274,9 @@ impl Family {
     fn capabilities(self) -> ModelCapabilities {
         use ThinkingLevel::{High, Low, Medium, Off};
         let (thinking_levels, default_thinking, web_search) = match self {
-            Family::ClaudeAdaptive => (vec![Low, Medium, High], Some(Medium), true),
+            // High is what the recommended Sonnet does when nothing is sent, so
+            // an untouched or migrated connection keeps the quality it had.
+            Family::ClaudeAdaptive => (vec![Low, Medium, High], Some(High), true),
             Family::ClaudeLegacy => (vec![Off, Low, Medium, High], Some(Off), true),
             Family::OpenAiReasoning => (vec![Low, Medium, High], None, true),
             Family::Gemini3 => (vec![Low, High], None, true),
@@ -472,7 +474,7 @@ mod tests {
 
     #[test]
     fn anthropic_capabilities_split_adaptive_from_legacy_claude() {
-        let adaptive = caps(&[Low, Medium, High], Some(Medium), true);
+        let adaptive = caps(&[Low, Medium, High], Some(High), true);
         for m in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-opus-4-6",
                   "claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-5",
                   "claude-opus-5", "claude-fable-5-1", "claude-mythos-5", "Claude-Sonnet-5-5",
@@ -519,8 +521,8 @@ mod tests {
         let n = |p, m, l| normalize_thinking(p, m, l);
         assert_eq!(n(Provider::Anthropic, "claude-sonnet-5-5", Some(High)), Some(High));
         // Adaptive Claude has no Off: fall back to its default, as for None.
-        assert_eq!(n(Provider::Anthropic, "claude-sonnet-5-5", Some(Off)), Some(Medium));
-        assert_eq!(n(Provider::Anthropic, "claude-sonnet-5-5", None), Some(Medium));
+        assert_eq!(n(Provider::Anthropic, "claude-sonnet-5-5", Some(Off)), Some(High));
+        assert_eq!(n(Provider::Anthropic, "claude-sonnet-5-5", None), Some(High));
         assert_eq!(n(Provider::Anthropic, "claude-haiku-4-5", None), Some(Off));
         // Gemini 3 has no Medium; its default is the model's own (nothing sent).
         assert_eq!(n(Provider::Google, "gemini-3-flash-preview", Some(Medium)), None);

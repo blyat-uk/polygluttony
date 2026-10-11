@@ -653,7 +653,7 @@ mod tests {
 
         // Adaptive Claude always has a level selected.
         set_translation(&mut cfg, sample(Provider::Anthropic, "claude-opus-5-5"));
-        assert_eq!(cfg.translation.as_ref().unwrap().thinking, Some(Medium));
+        assert_eq!(cfg.translation.as_ref().unwrap().thinking, Some(High));
 
         // Local and custom keys aren't account keys.
         let mut custom = sample(Provider::Custom, "m");
@@ -875,7 +875,7 @@ mod tests {
         assert_eq!(migrate("anthropic", ant, "claude-haiku-4-5", false), Some(Off));
         assert_eq!(migrate("anthropic", ant, "claude-sonnet-4-6", true), Some(Medium));
         // Adaptive Claude has no Off; it lands on its default.
-        assert_eq!(migrate("anthropic", ant, "claude-sonnet-4-6", false), Some(Medium));
+        assert_eq!(migrate("anthropic", ant, "claude-sonnet-4-6", false), Some(High));
         // Gemini 3 has no Medium: the model's own default.
         let google = "https://generativelanguage.googleapis.com/v1beta/openai/";
         assert_eq!(migrate("openai", google, "gemini-3-flash-preview", true), None);
