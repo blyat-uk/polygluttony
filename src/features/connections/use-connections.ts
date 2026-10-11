@@ -8,14 +8,16 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { toast } from "sonner";
-import type { Connection } from "@/types/generated/Connection";
 import type { ConnectionsConfig } from "@/types/generated/ConnectionsConfig";
+import type { Model } from "@/types/generated/Model";
 import type { Provider } from "@/types/generated/Provider";
 import type { ProviderInfo } from "@/types/generated/ProviderInfo";
-import type { WebSearch } from "@/types/generated/WebSearch";
+import type { Step } from "@/types/generated/Step";
+import type { StepSettings } from "@/types/generated/StepSettings";
 import { ipc } from "@/lib/ipc";
 import { useAppStore } from "@/stores/app-store";
 import { translationStatus } from "./connection-model";
+import { TEXT_STEPS, withStep } from "./steps";
 
 export const connectionsKey = ["connections"] as const;
 /** Glossary's "Look up names online" gates on this; every connection change refreshes it. */
@@ -40,7 +42,7 @@ export function capabilitiesQuery(provider: Provider, model: string) {
   });
 }
 
-/** Push the translation label + usability into the shell store (status bar, rail, Translate). */
+/** Push the Translate model's label + usability into the shell store (status bar, rail, Translate). */
 export function syncConnectionStore(cfg: ConnectionsConfig, providers: ProviderInfo[] | undefined) {
   const { label, usable } = translationStatus(cfg, providers);
   useAppStore.getState().setTranslationStatus(label, usable);
@@ -74,10 +76,10 @@ export function useCapabilities(provider: Provider | undefined, model: string | 
 
 /** Live model ids from the provider. Errors when it can't be reached; `[]` = it answered
  *  with no models. Cloud and custom callers ignore the error and keep the curated list. */
-export function useLiveModels(conn: Connection | null, enabled: boolean) {
+export function useLiveModels(conn: Model | null, enabled: boolean) {
   return useQuery({
     queryKey: ["live-models", conn?.provider, conn?.base_url, conn?.api_key] as const,
-    queryFn: () => ipc.listModels(conn as Connection),
+    queryFn: () => ipc.listModels(conn as Model),
     enabled: enabled && !!conn,
     staleTime: 60_000,
     retry: false,
@@ -95,6 +97,17 @@ async function patchCache(
   return { prev };
 }
 
+/** Mirrors `store::set_shared_steps` for the optimistic cache patch. */
+function withShared(cfg: ConnectionsConfig, settings: StepSettings): ConnectionsConfig {
+  const steps = cfg.steps;
+  if (!steps) return cfg;
+  const sharedModel = steps.translate.model;
+  let next = steps;
+  for (const step of TEXT_STEPS) next = withStep(next, step, settings);
+  if (steps.web_search?.model === sharedModel) next = { ...next, web_search: settings };
+  return { ...cfg, steps: next };
+}
+
 export function useConnectionMutations() {
   const qc = useQueryClient();
   // Every mutation returns the whole normalised state: write it straight into the cache.
@@ -109,23 +122,49 @@ export function useConnectionMutations() {
 
   return {
     /** From the setup / edit form, after a test. Errors surface in the form. */
-    saveTranslation: useMutation({ mutationFn: ipc.saveTranslation, onSuccess: apply }),
-    /** Inline changes on the connected card (model, thinking, tuning): optimistic. */
-    updateTranslation: useMutation({
-      mutationFn: ipc.saveTranslation,
-      onMutate: (connection) => patchCache(qc, (cfg) => ({ ...cfg, translation: connection })),
+    saveModel: useMutation({
+      mutationFn: ({ model, assign }: { model: Model; assign?: Step }) => ipc.saveModel(model, assign),
+      onSuccess: apply,
+    }),
+    /** Inline change to a saved library model (the one-model card's model menu): optimistic. */
+    updateModel: useMutation({
+      mutationFn: (model: Model) => ipc.saveModel(model),
+      onMutate: (model) =>
+        patchCache(qc, (cfg) => ({
+          ...cfg,
+          models: cfg.models.map((m) => (m.id === model.id ? model : m)),
+        })),
       onError: (e, _v, ctx) => rollback(e, ctx),
       onSuccess: apply,
     }),
-    removeTranslation: useMutation({ mutationFn: ipc.removeTranslation, onSuccess: apply }),
-    /** Separate web-search model from the form. Errors surface in the form. */
-    saveWebSearch: useMutation({ mutationFn: ipc.setWebSearch, onSuccess: apply }),
-    /** The switch / Remove: optimistic. */
-    updateWebSearch: useMutation({
-      mutationFn: (webSearch: WebSearch) => ipc.setWebSearch(webSearch),
-      onMutate: (webSearch) => patchCache(qc, (cfg) => ({ ...cfg, web_search: webSearch })),
+    /** After a confirm dialog. */
+    removeModel: useMutation({ mutationFn: ipc.removeModel, onSuccess: apply }),
+    /** A step's model, Thinking or Tuning; web search on/off: optimistic. */
+    setStep: useMutation({
+      mutationFn: ({ step, settings }: { step: Step; settings: StepSettings | null }) =>
+        ipc.setStep(step, settings),
+      onMutate: ({ step, settings }) =>
+        patchCache(qc, (cfg) =>
+          cfg.steps ? { ...cfg, steps: withStep(cfg.steps, step, settings) } : cfg,
+        ),
       onError: (e, _v, ctx) => rollback(e, ctx),
       onSuccess: apply,
     }),
+    /** The one-model card's Thinking / Tuning: optimistic. */
+    setSharedSteps: useMutation({
+      mutationFn: ipc.setSharedSteps,
+      onMutate: (settings) => patchCache(qc, (cfg) => withShared(cfg, settings)),
+      onError: (e, _v, ctx) => rollback(e, ctx),
+      onSuccess: apply,
+    }),
+    /** "Use different models for different steps": optimistic. */
+    showEveryStep: useMutation({
+      mutationFn: ipc.showEveryStep,
+      onMutate: () => patchCache(qc, (cfg) => ({ ...cfg, per_step: true })),
+      onError: (e, _v, ctx) => rollback(e, ctx),
+      onSuccess: apply,
+    }),
+    /** "Use one model for everything", after its dialog. */
+    useOneModel: useMutation({ mutationFn: ipc.useOneModel, onSuccess: apply }),
   };
 }

@@ -1,15 +1,16 @@
-import type { Connection } from "@/types/generated/Connection";
 import type { ConnectionsConfig } from "@/types/generated/ConnectionsConfig";
+import type { Model } from "@/types/generated/Model";
 import type { ModelCapabilities } from "@/types/generated/ModelCapabilities";
 import type { Provider } from "@/types/generated/Provider";
 import type { ProviderInfo } from "@/types/generated/ProviderInfo";
+import type { StepSettings } from "@/types/generated/StepSettings";
 import type { ThinkingLevel } from "@/types/generated/ThinkingLevel";
 import type { TuningDefaults } from "@/types/generated/TuningDefaults";
 
 /** Pure helpers for the Connections page: labels, usability, new drafts. */
 
-/** Which job a connection does on this page. */
-export type Role = "translation" | "web-search";
+/** What the setup form is connecting: any model, or one that must be able to search. */
+export type Role = "model" | "web-search";
 
 /** How much setup a provider needs: a key (cloud), an address (local), or both (custom). */
 export type ProviderKind = "cloud" | "local" | "custom";
@@ -60,9 +61,9 @@ function isLoopbackUrl(url: string): boolean {
   }
 }
 
-/** Mirrors `store::connection_is_usable`: a key, a local provider, a Custom
+/** Mirrors `store::model_is_usable`: a key, a local provider, a Custom
  *  endpoint (its key is optional), or a localhost URL. */
-export function isUsable(conn: Connection): boolean {
+export function isUsable(conn: Pick<Model, "provider" | "api_key" | "base_url">): boolean {
   return (
     conn.api_key.trim() !== "" ||
     conn.provider === "ollama" ||
@@ -72,44 +73,47 @@ export function isUsable(conn: Connection): boolean {
   );
 }
 
-/** Mirrors the backend's removal rule: taking `conn` out of its slot forgets the saved
- *  key for its (cloud) provider, unless the other slot still uses that provider. */
+export function isCloud(provider: Provider): boolean {
+  return provider === "anthropic" || provider === "openai" || provider === "google";
+}
+
+/** Mirrors the backend's removal rule: removing `model` from the library forgets the saved
+ *  key for its (cloud) provider, unless another model that stays still uses that provider. */
 export function removalForgetsKey(
-  conn: Connection,
-  other: Connection | null,
+  model: Model,
+  remaining: readonly Model[],
   providerKeys: Record<string, string>,
 ): boolean {
-  const cloud =
-    conn.provider === "anthropic" || conn.provider === "openai" || conn.provider === "google";
-  const hasKey = !!providerKeys[conn.provider] || conn.api_key.trim() !== "";
-  return cloud && hasKey && other?.provider !== conn.provider;
+  const hasKey = !!providerKeys[model.provider] || model.api_key.trim() !== "";
+  return (
+    isCloud(model.provider) &&
+    hasKey &&
+    !remaining.some((m) => m.id !== model.id && m.provider === model.provider)
+  );
 }
 
 /** The name a person recognises: the provider label, or the host for a custom endpoint. */
-export function providerName(info: ProviderInfo | undefined, conn: Connection): string {
+export function providerName(
+  info: ProviderInfo | undefined,
+  conn: Pick<Model, "provider" | "base_url">,
+): string {
   if (conn.provider === "custom") return hostOf(conn.base_url) || "Custom endpoint";
   return info?.label ?? conn.provider;
 }
 
-/** A fresh draft for `info`: its address and recommended model, plus a saved key if any.
- *  Thinking and tuning stay null so the backend/engine defaults apply. */
-export function newConnection(
-  info: ProviderInfo,
-  providerKeys: Record<string, string>,
-): Connection {
+/** A fresh library model for `info`: its address and recommended model, plus a saved key
+ *  if any. `id` stays empty until the backend assigns one. */
+export function newModel(info: ProviderInfo, providerKeys: Record<string, string>): Model {
   return {
+    id: "",
     provider: info.provider,
     // Custom has no fixed format: "openai" is a placeholder until Connect detects it.
     driver: info.driver ?? "openai",
     base_url: info.base_url,
     api_key: providerKeys[info.provider] ?? "",
     model: info.default_model,
-    thinking: null,
-    max_tokens: null,
-    batch_dialogue_limit: null,
-    timeout: null,
+    color: 0,
     connect_timeout: null,
-    concurrency: null,
   };
 }
 
@@ -134,8 +138,10 @@ export function maskKey(key: string): string {
 export const TUNING_FIELDS = ["batch_dialogue_limit", "concurrency", "timeout", "max_tokens"] as const;
 export type TuningField = (typeof TUNING_FIELDS)[number];
 
+export type Tuning = Pick<StepSettings, TuningField>;
+
 /** Saved tuning values, with nulls filled from the provider's defaults. */
-export function effectiveTuning(conn: Connection, defaults: TuningDefaults): TuningDefaults {
+export function effectiveTuning(conn: Tuning, defaults: TuningDefaults): TuningDefaults {
   return {
     batch_dialogue_limit: conn.batch_dialogue_limit ?? defaults.batch_dialogue_limit,
     concurrency: conn.concurrency ?? defaults.concurrency,
@@ -149,12 +155,25 @@ export function formatSeconds(s: number): string {
   return s >= 120 && s % 60 === 0 ? `${s / 60} min` : `${s} s`;
 }
 
-/** What the store needs to know: the translation model's label, and whether Translate can run. */
+/** What the shell needs to know: the Translate step's model label (plus how many other
+ *  models the steps use, e.g. "Claude Sonnet 5.5 +3"), and whether Translate can run. */
 export function translationStatus(
   cfg: ConnectionsConfig,
   providers: ProviderInfo[] | undefined,
 ): { label: string | null; usable: boolean } {
-  const t = cfg.translation;
-  if (!t) return { label: null, usable: false };
-  return { label: modelLabel(findProvider(providers, t.provider), t.model), usable: isUsable(t) };
+  const steps = cfg.steps;
+  const model = steps ? cfg.models.find((m) => m.id === steps.translate.model) : undefined;
+  if (!steps || !model) return { label: null, usable: false };
+  const verify = cfg.models.find((m) => m.id === steps.verify.model);
+  const used = new Set(
+    [steps.extract, steps.normalize, steps.web_search, steps.translate, steps.verify]
+      .filter((s) => s !== null)
+      .map((s) => s.model),
+  );
+  const others = cfg.per_step ? used.size - 1 : 0;
+  const label = modelLabel(findProvider(providers, model.provider), model.model);
+  return {
+    label: others > 0 ? `${label} +${others}` : label,
+    usable: isUsable(model) && !!verify && isUsable(verify),
+  };
 }

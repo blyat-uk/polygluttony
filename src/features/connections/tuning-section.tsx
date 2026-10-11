@@ -1,12 +1,17 @@
 import { useEffect, useId, useState } from "react";
 import { CaretRight } from "@phosphor-icons/react";
-import type { Connection } from "@/types/generated/Connection";
 import type { TuningDefaults } from "@/types/generated/TuningDefaults";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
-import { effectiveTuning, formatSeconds, TUNING_FIELDS, type TuningField } from "./connection-model";
+import {
+  effectiveTuning,
+  formatSeconds,
+  TUNING_FIELDS,
+  type Tuning,
+  type TuningField,
+} from "./connection-model";
 
 const FIELDS: Record<TuningField, { label: string; help: string; min: number; max: number }> = {
   batch_dialogue_limit: {
@@ -44,45 +49,59 @@ const toDraft = (v: TuningDefaults): Draft => ({
   max_tokens: String(v.max_tokens),
 });
 
-export function tuningSummary(v: TuningDefaults): string {
-  return `${v.batch_dialogue_limit} lines/batch · ${v.concurrency} at once · ${formatSeconds(v.timeout)} timeout`;
+const SUMMARY: Record<TuningField, (v: TuningDefaults) => string> = {
+  batch_dialogue_limit: (v) => `${v.batch_dialogue_limit} lines/batch`,
+  concurrency: (v) => `${v.concurrency} at once`,
+  timeout: (v) => `${formatSeconds(v.timeout)} timeout`,
+  max_tokens: (v) => `${v.max_tokens.toLocaleString()} max tokens`,
+};
+
+/** One line of the shown fields' values. Max tokens only appears when it's the sole extra. */
+export function tuningSummary(
+  v: TuningDefaults,
+  fields: readonly TuningField[] = TUNING_FIELDS,
+): string {
+  const shown = fields.length > 2 ? fields.filter((f) => f !== "max_tokens") : fields;
+  return shown.map((f) => SUMMARY[f](v)).join(" · ");
 }
 
 /**
  * Collapsed by default behind a one-line summary of the current values. Explicit Save.
- * A value equal to the provider's default is stored as null, so it keeps following
- * the default.
+ * Shows only `fields` (the ones the step uses); the patch carries only those. A value equal
+ * to the provider's default is stored as null, so it keeps following the default.
  */
 export function TuningSection({
-  conn,
+  value,
   defaults,
+  fields = TUNING_FIELDS,
   onSave,
 }: {
-  conn: Connection;
+  value: Tuning;
   defaults: TuningDefaults;
-  onSave: (patch: Pick<Connection, TuningField>) => Promise<unknown>;
+  fields?: readonly TuningField[];
+  onSave: (patch: Partial<Tuning>) => Promise<unknown>;
 }) {
   const baseId = useId();
-  const effective = effectiveTuning(conn, defaults);
+  const effective = effectiveTuning(value, defaults);
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<Draft>(() => toDraft(effective));
   const [errors, setErrors] = useState<Partial<Record<TuningField, string>>>({});
   const [saving, setSaving] = useState(false);
 
   // When the saved values change (a save, or a new provider), start the draft from them.
-  const savedKey = TUNING_FIELDS.map((f) => effective[f]).join("|");
+  const savedKey = fields.map((f) => effective[f]).join("|");
   useEffect(() => {
     setDraft(toDraft(effective));
     setErrors({});
   }, [savedKey]);
 
-  const dirty = TUNING_FIELDS.some((f) => draft[f].trim() !== String(effective[f]));
-  const atDefaults = TUNING_FIELDS.every((f) => draft[f].trim() === String(defaults[f]));
+  const dirty = fields.some((f) => draft[f].trim() !== String(effective[f]));
+  const atDefaults = fields.every((f) => draft[f].trim() === String(defaults[f]));
 
   const save = async () => {
     const next: Partial<Record<TuningField, string>> = {};
-    const patch = {} as Pick<Connection, TuningField>;
-    for (const f of TUNING_FIELDS) {
+    const patch: Partial<Tuning> = {};
+    for (const f of fields) {
       const { min, max } = FIELDS[f];
       const raw = draft[f].trim();
       const n = Number(raw);
@@ -116,14 +135,14 @@ export function TuningSection({
         />
         <span className="font-medium text-foreground">Tuning</span>
         <span className="truncate font-mono text-[11px] text-[color:var(--color-ink-dim)] tabular-nums">
-          {tuningSummary(effective)}
+          {tuningSummary(effective, fields)}
         </span>
       </button>
 
       {open ? (
         <div id={panelId} className="mt-2.5">
           <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-            {TUNING_FIELDS.map((f) => {
+            {fields.map((f) => {
               const id = `${baseId}-${f}`;
               const err = errors[f];
               return (

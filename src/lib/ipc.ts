@@ -2,13 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "@/types/generated/AppInfo";
 import type { BuildMode } from "@/types/generated/BuildMode";
-import type { Connection } from "@/types/generated/Connection";
 import type { ConnectionsConfig } from "@/types/generated/ConnectionsConfig";
 import type { ModelCapabilities } from "@/types/generated/ModelCapabilities";
 import type { Provider } from "@/types/generated/Provider";
 import type { ProviderInfo } from "@/types/generated/ProviderInfo";
 import type { TestResult } from "@/types/generated/TestResult";
-import type { WebSearch } from "@/types/generated/WebSearch";
+import type { Model } from "@/types/generated/Model";
+import type { Step } from "@/types/generated/Step";
+import type { StepSettings } from "@/types/generated/StepSettings";
 import type { FirstRunStatus } from "@/types/generated/FirstRunStatus";
 import type { Language } from "@/types/generated/Language";
 import type { ProjectView } from "@/types/generated/ProjectView";
@@ -34,31 +35,39 @@ export const ipc = {
   appInfo: () => invoke<AppInfo>("app_info"),
   /** O21 — whether a usable translation connection exists (first-run gate). */
   firstRunStatus: () => invoke<FirstRunStatus>("first_run_status"),
-  /** The Connections page's whole state: translation, web search, remembered keys. */
+  /** The Connections page's whole state: the model library, the steps, remembered keys. */
   getConnections: () => invoke<ConnectionsConfig>("get_connections"),
   /** Provider catalog (labels, key links, curated models, tuning defaults). */
   listProviders: () => invoke<ProviderInfo[]>("list_providers"),
   /** What a provider + model supports: thinking levels, web search. */
   modelCapabilities: (provider: Provider, model: string) =>
     invoke<ModelCapabilities>("model_capabilities", { provider, model }),
-  /** Save the translation connection; returns the normalised page state. */
-  saveTranslation: (connection: Connection) =>
-    invoke<ConnectionsConfig>("save_translation", { connection }),
-  /** Remove the translation connection (web search on "translation" turns off). */
-  removeTranslation: () => invoke<ConnectionsConfig>("remove_translation"),
-  /** Set who searches the web: off, the translation model, or a separate connection. */
-  setWebSearch: (webSearch: WebSearch) =>
-    invoke<ConnectionsConfig>("set_web_search", { webSearch }),
+  /** Add a library model (empty `id`) or update one. The first model does every step;
+   *  `assign` also hands that step this model. Returns the normalised page state. */
+  saveModel: (model: Model, assign?: Step) =>
+    invoke<ConnectionsConfig>("save_model", assign === undefined ? { model } : { model, assign }),
+  /** Remove a library model. Steps on it move to the first remaining model (web search: the
+   *  first that can search, else off); removing the last one goes back to first-run. */
+  removeModel: (id: string) => invoke<ConnectionsConfig>("remove_model", { id }),
+  /** One step's model and settings. `null` only for "web-search" (off). */
+  setStep: (step: Step, settings: StepSettings | null) =>
+    invoke<ConnectionsConfig>("set_step", { step, settings }),
+  /** One-model view: the same settings for extract, normalize, translate and verify — and
+   *  for web search while it runs on that same model. */
+  setSharedSteps: (settings: StepSettings) =>
+    invoke<ConnectionsConfig>("set_shared_steps", { settings }),
+  /** Switch the page to the per-step view; nothing else changes. */
+  showEveryStep: () => invoke<ConnectionsConfig>("show_every_step"),
+  /** Back to one model: every step takes `modelId` and its settings, and models no step
+   *  uses any more leave the library. */
+  useOneModel: (modelId: string) => invoke<ConnectionsConfig>("use_one_model", { modelId }),
   /** O5 — send one tiny test request. Custom endpoints get their API format detected.
-   *  `webSearch` also exercises the provider's web-search tool (the separate search model). */
-  testConnection: (connection: Connection, webSearch?: boolean) =>
-    invoke<TestResult>(
-      "test_connection",
-      webSearch === undefined ? { connection } : { connection, webSearch },
-    ),
+   *  `webSearch` also exercises the provider's web-search tool. */
+  testConnection: (model: Model, webSearch?: boolean) =>
+    invoke<TestResult>("test_connection", webSearch === undefined ? { model } : { model, webSearch }),
   /** Live model ids from the provider. Rejects when it can't be reached or the request
    *  fails; `[]` means it answered with no models. */
-  listModels: (connection: Connection) => invoke<string[]>("list_models", { connection }),
+  listModels: (model: Model) => invoke<string[]>("list_models", { model }),
   /** O6/O7/O8 — open a folder: discover files, counts, detect world/language, load prefs. */
   openFolder: (path: string) =>
     invoke<ProjectView>("open_folder", { path, now: Math.floor(Date.now() / 1000) }),
