@@ -84,11 +84,15 @@ export function stepsUsing(cfg: ConnectionsConfig, modelId: string): Step[] {
   return STEP_ORDER.filter((s) => stepSettings(steps, s)?.model === modelId);
 }
 
-/** "Extract and Translate", "Extract, Normalize and Verify". */
-export function stepNames(steps: Step[]): string {
-  const names = steps.map((s) => STEP_INFO[s].name);
+/** "A", "A and B", "A, B and C". */
+export function listNames(names: readonly string[]): string {
   if (names.length <= 1) return names[0] ?? "";
   return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/** "Extract names and Translate", "Extract names, Normalize and Verify". */
+export function stepNames(steps: Step[]): string {
+  return listNames(steps.map((s) => STEP_INFO[s].name));
 }
 
 /** Fresh settings for `modelId`: the model's own Thinking default and provider tuning. */

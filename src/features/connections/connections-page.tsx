@@ -39,7 +39,8 @@ export function ConnectionsPage() {
   const [prevPerStep, setPrevPerStep] = useState(perStep);
   if (perStep !== prevPerStep) {
     setPrevPerStep(perStep);
-    if (prevPerStep === true && perStep === false) setFocus("edit");
+    // (Removing the last model also lands here, on setup.)
+    if (prevPerStep === true && perStep === false) setFocus(steps ? "edit" : "setup");
     // Into it: the footer link that did it is gone too, so focus the pipeline.
     if (prevPerStep === false && perStep === true) setFocus("steps");
   }

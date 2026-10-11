@@ -149,7 +149,9 @@ function outcomeCopy(
   const parts = [
     o.webSearchStaysOn
       ? `Every step but Web search will use ${label} ${settings}; Web search stays on ${labelOf(o.webSearchStaysOn, providers)}.`
-      : `Every step will use ${label} ${settings}.`,
+      : cfg.steps?.web_search
+        ? `Every step will use ${label} ${settings}.`
+        : `Every step will use ${label} ${settings}. Web search stays off.`,
   ];
   if (o.removed.length > 0) {
     const names = listNames(o.removed.map((m) => labelOf(m, providers)));

@@ -1,5 +1,5 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { ArrowCounterClockwise, Check } from "@phosphor-icons/react";
+import { useId, useState, type ReactNode } from "react";
+import { ArrowCounterClockwise } from "@phosphor-icons/react";
 import type { ConnectionsConfig } from "@/types/generated/ConnectionsConfig";
 import type { ProviderInfo } from "@/types/generated/ProviderInfo";
 import type { Step } from "@/types/generated/Step";
@@ -7,6 +7,7 @@ import type { StepSettings } from "@/types/generated/StepSettings";
 import type { ThinkingLevel } from "@/types/generated/ThinkingLevel";
 import { findProvider, type Tuning } from "./connection-model";
 import type { LibraryCaps } from "./per-step-model";
+import { SaveFeedback, useSaveFeedback } from "./role-card";
 import { StepModelMenu } from "./step-model-menu";
 import { StepRow } from "./step-row";
 import { PHASE_LABEL, STEP_ORDER, STEP_INFO, modelById, stepSettings, type Phase } from "./steps";
@@ -121,7 +122,9 @@ export function PipelineCard({
           <ArrowCounterClockwise weight="bold" className="size-3.5" />
           Use one model for everything
         </button>
-        <SaveFeedback state={feedback} />
+        <span className="ml-auto">
+          <SaveFeedback state={feedback} />
+        </span>
       </div>
 
       <UseOneModelDialog
@@ -145,36 +148,5 @@ function Marker({ children }: { children: ReactNode }) {
       />
       {children}
     </div>
-  );
-}
-
-type Feedback = "saving" | "saved" | null;
-
-/** "Saving…" while a change is in flight, then "Saved" for a moment. */
-function useSaveFeedback(pending: boolean, failed: boolean): Feedback {
-  const [justSaved, setJustSaved] = useState(false);
-  const wasPending = useRef(false);
-  useEffect(() => {
-    const finished = wasPending.current && !pending;
-    wasPending.current = pending;
-    if (!finished || failed) return;
-    setJustSaved(true);
-    const t = setTimeout(() => setJustSaved(false), 1600);
-    return () => clearTimeout(t);
-  }, [pending, failed]);
-  return pending ? "saving" : justSaved ? "saved" : null;
-}
-
-function SaveFeedback({ state }: { state: Feedback }) {
-  return (
-    <span aria-live="polite" className="ml-auto text-[11px] text-[color:var(--color-ink-dim)]">
-      {state === "saving" ? (
-        "Saving…"
-      ) : state === "saved" ? (
-        <span className="inline-flex items-center gap-1">
-          <Check weight="bold" className="size-3" /> Saved
-        </span>
-      ) : null}
-    </span>
   );
 }

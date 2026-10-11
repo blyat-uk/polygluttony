@@ -117,6 +117,8 @@ export function useConnectionMutations() {
   };
   const rollback = (e: unknown, ctx: { prev: ConnectionsConfig | undefined } | undefined) => {
     if (ctx?.prev) qc.setQueryData(connectionsKey, ctx.prev);
+    // The snapshot predates any save that landed meanwhile: re-read the real state.
+    void qc.invalidateQueries({ queryKey: connectionsKey });
     toast.error(`Couldn't save: ${String(e)}`);
   };
 

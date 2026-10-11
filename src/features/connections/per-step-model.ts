@@ -5,7 +5,7 @@ import type { ModelCapabilities } from "@/types/generated/ModelCapabilities";
 import type { ProviderInfo } from "@/types/generated/ProviderInfo";
 import type { Step } from "@/types/generated/Step";
 import { findProvider, modelLabel, providerName, removalForgetsKey } from "./connection-model";
-import { STEP_ORDER, TEXT_STEPS, stepSettings, stepsUsing } from "./steps";
+import { listNames, STEP_ORDER, stepSettings, stepsUsing, TEXT_STEPS } from "./steps";
 import { capabilitiesQuery } from "./use-connections";
 
 /** Per-step view helpers: library capabilities, and what a removal or "use one model" will
@@ -38,11 +38,7 @@ export function labelOf(model: Model, providers: ProviderInfo[]): string {
   return modelLabel(findProvider(providers, model.provider), model.model);
 }
 
-/** "A", "A and B", "A, B and C". */
-export function listNames(names: readonly string[]): string {
-  if (names.length <= 1) return names[0] ?? "";
-  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
-}
+export { listNames };
 
 export type RemovalOutcome =
   | { kind: "last" }
