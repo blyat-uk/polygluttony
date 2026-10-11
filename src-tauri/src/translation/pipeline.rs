@@ -61,12 +61,16 @@ const SCOPE_PADDING: u32 = 5;
 const MAX_UNTRANSLATED_ISSUES: usize = 10;
 
 /// Everything needed to translate one file. Borrowed pieces (`svc`,
-/// `glossary`) are shared across the files of a run.
+/// `verify_svc`, `glossary`) are shared across the files of a run.
 pub struct FileJob<'a> {
     pub input: PathBuf,
     /// Relative file name — every emitted event uses this, never a path.
     pub file_name: String,
+    /// The Translate step: the batches, the cleanup passes and the
+    /// retranslations verify asks for.
     pub svc: &'a LlmService,
+    /// The Verify step, which may run on another model.
+    pub verify_svc: &'a LlmService,
     pub glossary: &'a Glossary,
     pub pair: LanguagePair,
     pub prompts: &'a crate::prompts::TranslationPrompts,
@@ -144,7 +148,8 @@ async fn run(job: FileJob<'_>) -> Result<FileResult, String> {
         }
         st.state(FileStateKind::Verifying, None).await;
         let stripped = st.stripped_pairs();
-        let report = verify_file(job.svc, &stripped, &job.glossary.all_terms(), &job.prompts.verify).await;
+        let report =
+            verify_file(job.verify_svc, &stripped, &job.glossary.all_terms(), &job.prompts.verify).await;
         let report = match report {
             Ok(r) => r,
             Err(e) => {
@@ -672,10 +677,12 @@ mod tests {
             crate::config::projects::Tone::Standard,
         );
 
+        // One scripted driver behind both steps, so a script reads in call order.
         let result = translate_file(FileJob {
             input: input.clone(),
             file_name: "ep01.ass".into(),
             svc: &svc,
+            verify_svc: &svc,
             glossary: &Glossary::default(),
             pair: LanguagePair::from_codes("zh", "en").unwrap(),
             prompts: &prompts,
@@ -776,6 +783,51 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, RunEvent::State { state: FileStateKind::Retranslating, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn verify_runs_on_its_own_service_and_retranslation_on_translates() {
+        // Translate and Verify on different models: each driver gets only its
+        // step's requests (a request to the wrong one would exhaust its script).
+        let src = ass_source(&["你好", "再见", "走吧", "好的", "不行", "可以", "什么", "哪里",
+                               "怎么", "为何", "真的", "假的"]);
+        let all_ok: Vec<(u32, &str)> = (1..=12).map(|i| (i, "A clean English line here")).collect();
+        let translator = ScriptedDriver::new(vec![
+            Ok(ok_batch(&all_ok)),
+            Ok(ok_batch(&[(6, "Retranslated line six properly")])), // the redo verify asked for
+        ]);
+        let verifier = ScriptedDriver::new(vec![
+            Ok(r#"{"issues":[{"id":6,"reason":"unrelated"}]}"#.into()),
+            Ok(r#"{"issues":[]}"#.into()),
+        ]);
+        let (tx, _rx) = mpsc::channel(256);
+        let cancel = CancellationToken::new();
+        let svc = LlmService::new(translator.clone(), 2, cancel.clone(), tx.clone());
+        let verify_svc = LlmService::new(verifier.clone(), 2, cancel.clone(), tx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("ep01.ass");
+        std::fs::write(&input, &src).unwrap();
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+        let prompts =
+            crate::prompts::TranslationPrompts::defaults(&pair, crate::config::projects::Tone::Standard);
+        let result = translate_file(FileJob {
+            input,
+            file_name: "ep01.ass".into(),
+            svc: &svc,
+            verify_svc: &verify_svc,
+            glossary: &Glossary::default(),
+            pair,
+            prompts: &prompts,
+            batch_limit: Some(100),
+            cancel,
+            tx,
+        })
+        .await;
+        assert!(result.success && !result.has_warnings, "{result:?}");
+        assert_eq!((translator.call_count(), verifier.call_count()), (2, 2));
+        // The redo of line 6 went to Translate; the checks to Verify.
+        assert!(translator.last_request().unwrap().user.contains("<0006:D>"));
+        assert_eq!(verifier.last_request().unwrap().system, prompts.verify.to_string());
     }
 
     #[tokio::test]
@@ -1035,6 +1087,7 @@ mod tests {
             input,
             file_name: "ep01.ass".into(),
             svc: &svc,
+            verify_svc: &svc,
             glossary: &Glossary::default(),
             pair: LanguagePair::from_codes("zh", "en").unwrap(),
             prompts: &prompts,

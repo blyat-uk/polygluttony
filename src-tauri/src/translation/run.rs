@@ -3,7 +3,7 @@
 //!
 //! # tx lifecycle — why the forwarder terminates
 //!
-//! There are three `mpsc::Sender<RunEvent>` clones at peak:
+//! There are four `mpsc::Sender<RunEvent>` clones at peak:
 //!
 //! 1. **`tx`** — held by the spawner task until it drops at the end of its
 //!    body (after sending `RunFinished`).
@@ -15,9 +15,11 @@
 //!    are dropped when the spawner task and each file task finish. No other code path
 //!    holds an `Arc<LlmService>`, so the service and its inner tx clone are freed once
 //!    the last file task exits and the spawner drops its `svc`.
+//! 4. **`verify_svc`'s internal clone** — the Verify step's own service, shared
+//!    and dropped exactly like `svc` (`job_verify_svc` per file task).
 //!
-//! Once (1), (2) for every file, and (3) have all dropped, `rx.recv()` returns `None`
-//! and the forwarder loop exits — triggering state clear.
+//! Once (1), (2) for every file, (3) and (4) have all dropped, `rx.recv()` returns
+//! `None` and the forwarder loop exits — triggering state clear.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,6 +73,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
 
     let cfg = config_store::load(&app)?;
     let conn = config_store::step_connection(&cfg, Step::Translate)?;
+    let verify_conn = config_store::step_connection(&cfg, Step::Verify)?;
 
     if args.files.is_empty() {
         return Err(AppError::Other("no files selected".into()));
@@ -89,9 +92,17 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
 
     let cancel = CancellationToken::new();
     let (tx, mut rx) = mpsc::channel::<RunEvent>(512);
+    // Translate's concurrency is the run's: how many files at once, and so how
+    // many requests each service may have in flight. Verify checks files as
+    // they finish translating, so it runs as many at once as Translate does;
+    // its own model and settings otherwise.
     let concurrency = conn.concurrency.unwrap_or(2).max(1);
-    let driver: Arc<dyn crate::llm::LlmDriver> = Arc::from(crate::llm::create_driver(conn.clone()));
-    let svc = Arc::new(LlmService::new(driver, concurrency, cancel.clone(), tx.clone()));
+    let service = |conn: crate::config::Connection| {
+        let driver: Arc<dyn crate::llm::LlmDriver> = Arc::from(crate::llm::create_driver(conn));
+        Arc::new(LlmService::new(driver, concurrency, cancel.clone(), tx.clone()))
+    };
+    let svc = service(conn.clone());
+    let verify_svc = service(verify_conn);
 
     *guard = Some(RunHandle { cancel: cancel.clone() });
     drop(guard);
@@ -136,6 +147,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
             let job_tx = tx.clone();
             let job_cancel = cancel.clone();
             let job_svc = svc.clone();
+            let job_verify_svc = verify_svc.clone();
             let job_glossary = glossary.clone();
             let job_pair = pair.clone();
             let job_prompts = prompts.clone();
@@ -147,6 +159,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
                     input,
                     file_name: task_name,
                     svc: &job_svc,
+                    verify_svc: &job_verify_svc,
                     glossary: &job_glossary,
                     pair: job_pair,
                     prompts: &job_prompts,
@@ -159,12 +172,13 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
             handles.push((name, handle));
         }
 
-        // Drop svc here so the service's inner tx clone is released before we
-        // wait on handles. File tasks each have their own Arc<LlmService> clone;
-        // those drop when their task finishes. The spawner's `svc` binding is
-        // the only one left at this point, and must be dropped before the join
-        // loop or the forwarder could otherwise outlive the RunFinished send.
+        // Drop both services here so their inner tx clones are released before
+        // we wait on handles. File tasks each have their own Arc<LlmService>
+        // clones; those drop when their task finishes. The spawner's bindings
+        // are the only ones left at this point, and must be dropped before the
+        // join loop or the forwarder could otherwise outlive the RunFinished send.
         drop(svc);
+        drop(verify_svc);
 
         let mut results = Vec::new();
         for (name, handle) in handles {
