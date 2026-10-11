@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowClockwise, Eye, EyeSlash, XCircle } from "@phosphor-icons/react";
-import type { Connection } from "@/types/generated/Connection";
+import type { Model } from "@/types/generated/Model";
 import type { Provider } from "@/types/generated/Provider";
 import type { ProviderInfo } from "@/types/generated/ProviderInfo";
 import type { TestResult } from "@/types/generated/TestResult";
@@ -15,7 +15,7 @@ import {
   isHttpUrl,
   maskKey,
   modelLabel,
-  newConnection,
+  newModel,
   providerKind,
   type ProviderKind,
   type Role,
@@ -30,10 +30,10 @@ type Errors = Partial<Record<FieldKey, string>>;
 export type FormStage = "pick" | "fields";
 
 const COPY: Record<Role, { heading: string; lead: string; remove: string }> = {
-  translation: {
-    heading: "Which AI should translate?",
+  model: {
+    heading: "Connect an AI model",
     lead: "Pick a provider. You’ll need an API key from them (local models don’t need one).",
-    remove: "Remove connection",
+    remove: "Remove model",
   },
   "web-search": {
     heading: "Which AI should search the web?",
@@ -49,8 +49,9 @@ const FOOT_HINT: Record<ProviderKind, string> = {
 };
 
 /**
- * The setup / edit form shared by both role cards: provider tiles → one chosen row →
- * only the fields that provider needs → Connect (test, then save).
+ * The setup / edit form for one library model (first run, Edit, adding a model): provider
+ * tiles → one chosen row → only the fields that provider needs → Connect (test, then save).
+ * It only knows where to reach the model; Thinking and Tuning live on the steps.
  */
 export function ConnectionForm({
   role,
@@ -62,24 +63,30 @@ export function ConnectionForm({
   onRemove,
   onStageChange,
   autoFocus = false,
+  heading,
+  lead,
 }: {
   role: Role;
   providers: ProviderInfo[];
   providerKeys: Record<string, string>;
-  /** The saved connection when editing; null for first setup. */
-  initial: Connection | null;
-  /** Persist the connection; `tested` is false for "Save anyway". Throwing keeps the form open. */
-  onSave: (conn: Connection, tested: boolean) => Promise<void>;
+  /** The saved model when editing (its id is kept, even across a provider change); null to add. */
+  initial: Model | null;
+  /** Persist the model; `tested` is false for "Save anyway". Throwing keeps the form open. */
+  onSave: (model: Model, tested: boolean) => Promise<void>;
   onCancel?: () => void;
   /** Edit mode only: the last control on the form. */
   onRemove?: () => void;
   onStageChange?: (stage: FormStage) => void;
   /** Focus the first provider tile on mount (the form was opened by a click). */
   autoFocus?: boolean;
+  /** Overrides the role's heading above the provider tiles. */
+  heading?: string;
+  /** Overrides the role's lead line under the heading. */
+  lead?: string;
 }) {
   const qc = useQueryClient();
   const uid = useId();
-  const [draft, setDraft] = useState<Connection | null>(initial);
+  const [draft, setDraft] = useState<Model | null>(initial);
   const [keyMode, setKeyMode] = useState<"saved" | "edit">(initial?.api_key ? "saved" : "edit");
   const [reveal, setReveal] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -152,7 +159,11 @@ export function ConnectionForm({
   };
 
   const pick = (next: ProviderInfo) => {
-    const base = initial?.provider === next.provider ? initial : newConnection(next, providerKeys);
+    // Editing keeps the library entry (id, colour) even when the provider changes.
+    const base =
+      initial?.provider === next.provider
+        ? initial
+        : { ...newModel(next, providerKeys), id: initial?.id ?? "", color: initial?.color ?? 0 };
     setDraft(base);
     setKeyMode(base.api_key ? "saved" : "edit");
     setReveal(false);
@@ -166,7 +177,7 @@ export function ConnectionForm({
     resetFeedback();
   };
 
-  const update = (patch: Partial<Connection>, field: FieldKey) => {
+  const update = (patch: Partial<Model>, field: FieldKey) => {
     setDraft((d) => (d ? { ...d, ...patch } : d));
     setFailure(null);
     setErrors((e) => ({ ...e, [field]: undefined }));
@@ -174,13 +185,11 @@ export function ConnectionForm({
 
   const connect = async (skipTest: boolean) => {
     if (!draft || !info) return;
-    const conn: Connection = {
+    const conn: Model = {
       ...draft,
       base_url: draft.base_url.trim(),
       api_key: draft.api_key.trim(),
       model: draft.model.trim(),
-      // The separate web-search model does one call per build: no thinking.
-      ...(role === "web-search" ? { thinking: null } : {}),
     };
     const found = validate(conn, info, kind);
     if (!found.model && role === "web-search") {
@@ -199,11 +208,8 @@ export function ConnectionForm({
       setPhase("testing");
       let result: TestResult;
       try {
-        // The separate search model is only worth saving if its web-search tool works too.
-        result =
-          role === "web-search"
-            ? await ipc.testConnection(conn, true)
-            : await ipc.testConnection(conn);
+        // A web-search model is only worth saving if its web-search tool works too.
+        result = await ipc.testConnection(conn, role === "web-search" ? true : undefined);
       } catch (e) {
         result = commandFailure(conn, e);
       }
@@ -230,9 +236,9 @@ export function ConnectionForm({
     return (
       <div>
         <h3 className="mt-3 text-[15px] font-semibold text-[color:var(--color-ink-emphasis)]">
-          {COPY[role].heading}
+          {heading ?? COPY[role].heading}
         </h3>
-        <p className="mt-0.5 mb-3 text-[12px] text-muted-foreground">{COPY[role].lead}</p>
+        <p className="mt-0.5 mb-3 text-[12px] text-muted-foreground">{lead ?? COPY[role].lead}</p>
         <ProviderTiles providers={choices} onPick={pick} focus={returnTo} />
         {onCancel ? (
           <div className="mt-3">
@@ -246,7 +252,7 @@ export function ConnectionForm({
   }
 
   // ── fields stage ───────────────────────────────────────────────────────────
-  const d = draft as Connection;
+  const d = draft as Model;
   const p = info as ProviderInfo;
   const problem = failure ? problemCopy(failure, p, d) : null;
   const fieldError = (f: FieldKey) => errors[f] ?? (problem?.field === f ? problem.text : undefined);
@@ -505,7 +511,7 @@ export function ConnectionForm({
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
-function validate(conn: Connection, info: ProviderInfo, kind: ProviderKind): Errors {
+function validate(conn: Model, info: ProviderInfo, kind: ProviderKind): Errors {
   const e: Errors = {};
   if (kind === "cloud" && !conn.api_key) e.key = `Paste your ${info.label} API key.`;
   if (kind !== "cloud") {

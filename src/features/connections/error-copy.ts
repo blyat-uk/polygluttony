@@ -1,4 +1,4 @@
-import type { Connection } from "@/types/generated/Connection";
+import type { Model } from "@/types/generated/Model";
 import type { ProviderInfo } from "@/types/generated/ProviderInfo";
 import type { TestResult } from "@/types/generated/TestResult";
 import { hostOf, providerKind } from "./connection-model";
@@ -16,7 +16,7 @@ export interface ProblemCopy {
 export function problemCopy(
   result: TestResult,
   info: ProviderInfo,
-  conn: Connection,
+  conn: Pick<Model, "base_url">,
 ): ProblemCopy {
   const kind = providerKind(info);
   const who = kind === "custom" ? "The server" : info.label;
@@ -48,7 +48,7 @@ export function problemCopy(
 }
 
 /** A failure that never reached the test (the command itself rejected). */
-export function commandFailure(conn: Connection, e: unknown): TestResult {
+export function commandFailure(conn: Pick<Model, "model">, e: unknown): TestResult {
   return {
     ok: false,
     model: conn.model,
