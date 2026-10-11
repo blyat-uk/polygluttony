@@ -72,6 +72,19 @@ export function isUsable(conn: Connection): boolean {
   );
 }
 
+/** Mirrors the backend's removal rule: taking `conn` out of its slot forgets the saved
+ *  key for its (cloud) provider, unless the other slot still uses that provider. */
+export function removalForgetsKey(
+  conn: Connection,
+  other: Connection | null,
+  providerKeys: Record<string, string>,
+): boolean {
+  const cloud =
+    conn.provider === "anthropic" || conn.provider === "openai" || conn.provider === "google";
+  const hasKey = !!providerKeys[conn.provider] || conn.api_key.trim() !== "";
+  return cloud && hasKey && other?.provider !== conn.provider;
+}
+
 /** The name a person recognises: the provider label, or the host for a custom endpoint. */
 export function providerName(info: ProviderInfo | undefined, conn: Connection): string {
   if (conn.provider === "custom") return hostOf(conn.base_url) || "Custom endpoint";

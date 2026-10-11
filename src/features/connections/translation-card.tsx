@@ -25,6 +25,7 @@ import {
   normaliseThinking,
   providerKind,
   providerName,
+  removalForgetsKey,
 } from "./connection-model";
 import { ConnectionForm, type FormStage } from "./connection-form";
 import { ModelPicker } from "./model-picker";
@@ -61,6 +62,11 @@ export function TranslationCard({
 
   const conn = config.translation;
   const formMode = !conn || editing;
+  const searchConn = config.web_search.mode === "separate" ? config.web_search.connection : null;
+  const keyNote =
+    conn && removalForgetsKey(conn, searchConn, config.provider_keys)
+      ? ` Your saved ${providerName(findProvider(providers, conn.provider), conn)} API key will be forgotten too.`
+      : null;
   const leaveForm = () => {
     setEditing(false);
     setReturnFocus(true);
@@ -144,6 +150,7 @@ export function TranslationCard({
             <AlertDialogTitle>Remove the translation connection?</AlertDialogTitle>
             <AlertDialogDescription>
               You won’t be able to translate until you connect a provider again.
+              {keyNote}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

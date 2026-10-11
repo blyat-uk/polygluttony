@@ -4,8 +4,24 @@ import { toast } from "sonner";
 import type { ConnectionsConfig } from "@/types/generated/ConnectionsConfig";
 import type { ModelCapabilities } from "@/types/generated/ModelCapabilities";
 import type { ProviderInfo } from "@/types/generated/ProviderInfo";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { findProvider, isUsable, modelLabel, providerName } from "./connection-model";
+import {
+  findProvider,
+  isUsable,
+  modelLabel,
+  providerName,
+  removalForgetsKey,
+} from "./connection-model";
 import { ConnectionForm, type FormStage } from "./connection-form";
 import { ProviderMark } from "./provider-tiles";
 import { CardEyebrow, EyebrowNote, RoleCard, StatusDot } from "./role-card";
@@ -32,6 +48,7 @@ export function WebSearchCard({
   const m = useConnectionMutations();
   const [form, setForm] = useState<"add" | "edit" | null>(null);
   const [stage, setStage] = useState<FormStage>("pick");
+  const [confirmRemove, setConfirmRemove] = useState(false);
   const ws = config.web_search;
   const eyebrow = (aside: ReactNode) => (
     <CardEyebrow n={2} title="Web search" id={titleId} aside={aside} />
@@ -47,6 +64,31 @@ export function WebSearchCard({
         },
       },
     );
+
+  const keyNote =
+    ws.mode === "separate" &&
+    removalForgetsKey(ws.connection, config.translation, config.provider_keys)
+      ? ` Your saved ${providerName(findProvider(providers, ws.connection.provider), ws.connection)} API key will be forgotten too.`
+      : null;
+  const removeDialog = (
+    <AlertDialog open={confirmRemove} onOpenChange={setConfirmRemove}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Remove the web search model?</AlertDialogTitle>
+          <AlertDialogDescription>
+            The glossary won’t look up names online until you set web search up again.
+            {keyNote}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Keep it</AlertDialogCancel>
+          <AlertDialogAction variant="destructive" onClick={remove}>
+            Remove
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
 
   // Adding or editing a separate model: the shared form, search-capable providers only.
   if (form) {
@@ -80,8 +122,9 @@ export function WebSearchCard({
             toast.success(tested ? `Web search connected: ${name}` : `Web search saved (not yet confirmed): ${name}`);
           }}
           onCancel={() => setForm(null)}
-          onRemove={editing ? remove : undefined}
+          onRemove={editing ? () => setConfirmRemove(true) : undefined}
         />
+        {removeDialog}
       </RoleCard>
     );
   }
@@ -125,12 +168,13 @@ export function WebSearchCard({
               size="sm"
               className="text-muted-foreground"
               disabled={m.updateWebSearch.isPending}
-              onClick={remove}
+              onClick={() => setConfirmRemove(true)}
             >
               Remove
             </Button>
           </div>
         </div>
+        {removeDialog}
       </RoleCard>
     );
   }
