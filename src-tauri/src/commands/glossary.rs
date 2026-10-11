@@ -85,11 +85,7 @@ pub async fn normalize_glossary(app: AppHandle, folder: String) -> AppResult<Nor
         return Err(AppError::Other("glossary is empty".into()));
     }
     let cfg = config_store::load(&app)?;
-    let conn =
-        crate::translation::run::usable_connection(&cfg).ok_or(AppError::NoActiveConnection)?;
-    if let Some(msg) = conn.thinking_config_error() {
-        return Err(AppError::Other(msg));
-    }
+    let conn = config_store::usable_translation(&cfg).ok_or(AppError::NoActiveConnection)?;
     let templates =
         crate::prompts::GlossaryPrompts::resolve_normalize(&crate::prompts::overrides_dir(&app)?)?;
     let cancel = run::claim_slot(&app, GlossaryOpKind::Normalize).await?;
@@ -98,7 +94,7 @@ pub async fn normalize_glossary(app: AppHandle, folder: String) -> AppResult<Nor
     let _guard = run::SlotGuard::new(app.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     run::spawn_forwarder(app.clone(), rx);
-    let svc = run::service_for(&conn.for_glossary_norm(), cancel.clone(), tx.clone());
+    let svc = run::service_for(&conn, cancel.clone(), tx.clone());
     let normalized = normalize_pass(&svc, &original, &tx, &templates).await;
     Ok(NormalizeReview {
         diff: GlossaryDiff::compute(Some(&original), &normalized),
@@ -119,11 +115,7 @@ pub async fn import_reference_files(
     }
     let dir = PathBuf::from(&folder);
     let cfg = config_store::load(&app)?;
-    let conn =
-        crate::translation::run::usable_connection(&cfg).ok_or(AppError::NoActiveConnection)?;
-    if let Some(msg) = conn.thinking_config_error() {
-        return Err(AppError::Other(msg));
-    }
+    let conn = config_store::usable_translation(&cfg).ok_or(AppError::NoActiveConnection)?;
     let reference_template = crate::prompts::resolve(
         crate::prompts::PromptId::ReferenceExtract,
         &crate::prompts::overrides_dir(&app)?,
@@ -134,7 +126,7 @@ pub async fn import_reference_files(
     let _guard = run::SlotGuard::new(app.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     run::spawn_forwarder(app.clone(), rx);
-    let svc = run::service_for(&conn.for_glossary(), cancel.clone(), tx.clone());
+    let svc = run::service_for(&conn, cancel.clone(), tx.clone());
     let files: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let (terms, files_processed, errors) =
         reference::extract_from_files(&svc, &files, conn.batch_dialogue_limit, &tx, &reference_template).await;
@@ -232,10 +224,9 @@ pub fn unwatch_glossary(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-/// Name of a usable web-capable personalization connection, else None —
-/// powers the "Look up established names online" checkbox gating.
+/// Label of the model that answers web searches ("Claude Sonnet 5.5"), else
+/// None — powers the "Look up established names online" checkbox gating.
 #[tauri::command]
-pub fn personalization_status(app: AppHandle) -> AppResult<Option<String>> {
-    let cfg = config_store::load(&app)?;
-    Ok(run::web_capable_personalization(&cfg).map(|(name, _)| name))
+pub fn web_search_status(app: AppHandle) -> AppResult<Option<String>> {
+    Ok(config_store::web_search_label(&config_store::load(&app)?))
 }

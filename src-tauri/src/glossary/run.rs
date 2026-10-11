@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::store as config_store;
-use crate::config::{AppConfig, Connection, Driver};
+use crate::config::Connection;
 use crate::error::{AppError, AppResult};
 use crate::events::{self, GlossaryEvent, RunEvent};
 use crate::glossary::build::{build_glossary, BuildJob, BuildMode};
@@ -131,21 +131,6 @@ pub fn service_for(
     LlmService::new(driver, concurrency, cancel, llm_log_channel(g_tx))
 }
 
-/// The personalization connection, iff usable AND web-capable
-/// (openai-responses driver with web search on).
-pub fn web_capable_personalization(cfg: &AppConfig) -> Option<(String, Connection)> {
-    let name = cfg.personalization_model.as_ref()?;
-    let conn = cfg.connections.get(name)?;
-    if !config_store::connection_is_usable(conn) {
-        return None;
-    }
-    if conn.driver == Driver::OpenaiResponses && conn.web_search == Some(true) {
-        Some((name.clone(), conn.clone()))
-    } else {
-        None
-    }
-}
-
 pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     if args.files.is_empty() {
         return Err(AppError::Other("no files selected".into()));
@@ -158,11 +143,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         )));
     }
     let cfg = config_store::load(&app)?;
-    let conn =
-        crate::translation::run::usable_connection(&cfg).ok_or(AppError::NoActiveConnection)?;
-    if let Some(msg) = conn.thinking_config_error() {
-        return Err(AppError::Other(msg));
-    }
+    let conn = config_store::usable_translation(&cfg).ok_or(AppError::NoActiveConnection)?;
 
     let prompt_pack =
         crate::prompts::GlossaryPrompts::resolve(&crate::prompts::overrides_dir(&app)?)?;
@@ -190,15 +171,13 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     let (tx, rx) = mpsc::channel::<GlossaryEvent>(512);
     spawn_forwarder(app.clone(), rx);
 
-    // Stage clones: extraction runs on the glossary budget, normalization on
-    // its own dedicated budget (spec: three explicit per-stage budgets).
-    let svc = service_for(&conn.for_glossary(), cancel.clone(), tx.clone());
-    let norm_svc = service_for(&conn.for_glossary_norm(), cancel.clone(), tx.clone());
-    // Personalization service only when requested AND a web-capable
-    // personalization connection exists (cap 1 — single call). MUST share the
-    // build's cancel token so cancel can interrupt a long web-search call.
+    // Extraction and normalization both run on the translation connection.
+    let svc = service_for(&conn, cancel.clone(), tx.clone());
+    // Personalization service only when requested AND a web-search model
+    // resolves (cap 1 — single call). MUST share the build's cancel token so
+    // cancel can interrupt a long web-search call.
     let personalize_svc = if args.personalize {
-        web_capable_personalization(&cfg).map(|(_, p_conn)| {
+        config_store::resolve_web_search(&cfg).map(|p_conn| {
             let d: Arc<dyn LlmDriver> = Arc::from(crate::llm::create_driver(p_conn));
             LlmService::new(d, 1, cancel.clone(), llm_log_channel(tx.clone()))
         })
@@ -227,9 +206,8 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         // so their internal log-adapter senders close before a new op can
         // claim the channel.
         let _guard = SlotGuard::new(app_for_release);
-        build_glossary(job, &svc, &norm_svc, personalize_svc.as_ref(), tx).await;
+        build_glossary(job, &svc, &svc, personalize_svc.as_ref(), tx).await;
         drop(svc);
-        drop(norm_svc);
         drop(personalize_svc);
         // tx consumed by build_glossary → forwarder drains & exits; then
         // _guard drops here, releasing the slot.
@@ -247,44 +225,5 @@ pub async fn cancel(app: AppHandle) -> AppResult<()> {
             Ok(())
         }
         None => Err(AppError::NoActiveRun),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::presets::default_config;
-    use crate::config::Driver;
-
-    #[test]
-    fn web_capable_personalization_gating() {
-        let mut cfg = default_config();
-        // Point personalization at a connection we fully control.
-        cfg.personalization_model = Some("p".into());
-        let mut conn = cfg.connections.values().next().unwrap().clone();
-        conn.driver = Driver::OpenaiResponses;
-        conn.web_search = Some(true);
-        conn.api_key = "sk-x".into();
-        conn.base_url = "https://api.example.com".into();
-        cfg.connections.insert("p".into(), conn);
-        assert_eq!(web_capable_personalization(&cfg).unwrap().0, "p");
-
-        // Wrong driver → None.
-        cfg.connections.get_mut("p").unwrap().driver = Driver::Openai;
-        assert!(web_capable_personalization(&cfg).is_none());
-        cfg.connections.get_mut("p").unwrap().driver = Driver::OpenaiResponses;
-
-        // Web search off → None.
-        cfg.connections.get_mut("p").unwrap().web_search = Some(false);
-        assert!(web_capable_personalization(&cfg).is_none());
-        cfg.connections.get_mut("p").unwrap().web_search = Some(true);
-
-        // Unusable (no key, not localhost) → None.
-        cfg.connections.get_mut("p").unwrap().api_key.clear();
-        assert!(web_capable_personalization(&cfg).is_none());
-
-        // No personalization set → None.
-        cfg.personalization_model = None;
-        assert!(web_capable_personalization(&cfg).is_none());
     }
 }

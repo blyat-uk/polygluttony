@@ -1,11 +1,13 @@
 //! Shared data types surfaced to the webview. TypeScript bindings are generated
 //! by `ts-rs` into `src/types/generated/` (run `cargo test` to regenerate).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::config::projects::FolderPrefs;
-use crate::config::Driver;
+use crate::config::{Connection, Driver, WebSearch};
 use crate::glossary::world_detector::WorldType;
 
 pub mod language_pair;
@@ -18,25 +20,31 @@ pub struct AppInfo {
     pub version: String,
 }
 
-/// One row in the Connections list (no secret material).
+/// The Connections page's whole state.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../src/types/generated/")]
-pub struct ConnectionSummary {
-    pub name: String,
-    pub driver: Driver,
-    pub has_key: bool,
+pub struct ConnectionsConfig {
+    pub translation: Option<Connection>,
+    pub web_search: WebSearch,
+    pub provider_keys: BTreeMap<String, String>,
 }
 
-/// O1 — the Connections list view-model.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+/// Which field a failed connection test points at, so the UI can show the
+/// error under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
 #[ts(export, export_to = "../../src/types/generated/")]
-pub struct ConnectionsView {
-    pub connections: Vec<ConnectionSummary>,
-    pub active: String,
-    pub personalization: Option<String>,
+pub enum TestProblem {
+    /// The provider rejected the API key.
+    Key,
+    /// The provider doesn't know the model.
+    Model,
+    /// The server couldn't be reached (or didn't answer in time).
+    Address,
+    Other,
 }
 
-/// O5 — result of a Test.
+/// Result of a connection test.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../src/types/generated/")]
 pub struct TestResult {
@@ -44,6 +52,11 @@ pub struct TestResult {
     pub model: String,
     pub detected_driver: Option<Driver>,
     pub message: String,
+    /// `None` when ok.
+    pub problem: Option<TestProblem>,
+    /// The failure may be temporary (unreachable, rate-limited, server error),
+    /// so saving the connection untested is reasonable. Never for a bad key or model.
+    pub can_save_anyway: bool,
 }
 
 /// O21 — first-run check.

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
 
+use crate::config::providers::{self, ThinkingParam};
 use crate::config::Connection;
 use crate::llm::error::LlmError;
 use crate::llm::{base_of, client_for, get_json, parse_model_ids, post_json, timeout_of, LlmDriver, LlmRequest, LlmResponse, Usage};
@@ -32,9 +33,10 @@ impl AnthropicDriver {
 
     /// Build the base request body shared by `complete` and `stream`.
     fn build_body(&self, system: &str, user: &str) -> Value {
+        let max_tokens = self.conn.max_tokens.unwrap_or(8192);
         let mut body = json!({
             "model": self.conn.model,
-            "max_tokens": self.conn.max_tokens.unwrap_or(8192),
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": user}],
         });
         // The system prompt (instructions + glossary) repeats verbatim across a
@@ -45,12 +47,18 @@ impl AnthropicDriver {
                 {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
             ]);
         }
-        if self.conn.thinking_enabled.unwrap_or(false) {
-            let mut thinking = json!({"type": "enabled"});
-            if let Some(b) = self.conn.thinking_budget {
-                thinking["budget_tokens"] = b.into();
+        // Claude 4.6+ rejects `budget_tokens`: it thinks adaptively at an
+        // effort level. Older models still take a token budget.
+        let c = &self.conn;
+        match providers::thinking_param(c.provider, &c.model, c.thinking, max_tokens) {
+            ThinkingParam::AnthropicAdaptive(effort) => {
+                body["thinking"] = json!({"type": "adaptive"});
+                body["output_config"] = json!({"effort": effort});
             }
-            body["thinking"] = thinking;
+            ThinkingParam::AnthropicBudget(budget) => {
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+            }
+            _ => {}
         }
         body
     }
@@ -145,19 +153,26 @@ impl LlmDriver for AnthropicDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Driver;
+    use crate::config::{sample, Provider, ThinkingLevel};
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn conn(base: &str) -> Connection {
         Connection {
-            driver: Driver::Anthropic, base_url: base.into(), api_key: "k".into(),
-            model: "claude-x".into(), max_tokens: Some(16), batch_dialogue_limit: None,
-            timeout: Some(10), connect_timeout: None, concurrency: None,
-            thinking_enabled: Some(false), thinking_budget: None,
-            thinking_glossary_budget: None, thinking_glossary_norm_budget: None,
-            web_search: None,
+            base_url: base.into(),
+            max_tokens: Some(16),
+            timeout: Some(10),
+            ..sample(Provider::Anthropic, "claude-x")
         }
+    }
+
+    fn body_for(model: &str, thinking: Option<ThinkingLevel>, max_tokens: u32) -> Value {
+        let c = Connection {
+            thinking,
+            max_tokens: Some(max_tokens),
+            ..sample(Provider::Anthropic, model)
+        };
+        AnthropicDriver::new(c).build_body("sys", "u")
     }
 
     #[tokio::test]
@@ -319,27 +334,59 @@ mod tests {
         assert_eq!(resp.usage.cache_read_input_tokens, Some(1200));
     }
 
-    /// A stage clone's budget must land in the request's thinking block.
-    /// (wiremock returns 404 on an unmatched body, failing the test.)
+    /// Claude 4.6+ thinks adaptively at an effort level — `budget_tokens` is
+    /// rejected there. (wiremock returns 404 on an unmatched body.)
     #[tokio::test]
-    async fn stage_clone_budget_lands_in_request_body() {
+    async fn adaptive_claude_sends_adaptive_thinking_with_effort() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(body_partial_json(serde_json::json!({
-                "thinking": {"type": "enabled", "budget_tokens": 24000}
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "content": [{"type":"text","text":"OK"}]
             })))
             .mount(&server)
             .await;
-        let mut c = conn(&server.uri());
-        c.thinking_enabled = Some(true);
-        c.thinking_budget = Some(6000);
-        c.thinking_glossary_norm_budget = Some(24000);
-        let d = AnthropicDriver::new(c.for_glossary_norm());
-        assert_eq!(d.complete("sys", "ping").await.unwrap(), "OK");
+        let c = Connection {
+            model: "claude-sonnet-5-5".into(),
+            thinking: Some(ThinkingLevel::High),
+            ..conn(&server.uri())
+        };
+        assert_eq!(AnthropicDriver::new(c).complete("sys", "ping").await.unwrap(), "OK");
+
+        let body = body_for("claude-opus-4-6", Some(ThinkingLevel::Low), 32000);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "low"}));
+    }
+
+    #[test]
+    fn legacy_claude_sends_a_budget_below_max_tokens() {
+        let body = body_for("claude-haiku-4-5", Some(ThinkingLevel::Medium), 32000);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "enabled", "budget_tokens": 8000}));
+        assert!(body.get("output_config").is_none());
+        // A budget that can't fit under max_tokens is dropped, not sent.
+        let tiny = body_for("claude-haiku-4-5", Some(ThinkingLevel::High), 1024);
+        assert!(tiny.get("thinking").is_none());
+    }
+
+    #[test]
+    fn no_thinking_fields_without_a_level_or_on_custom_endpoints() {
+        for body in [
+            body_for("claude-sonnet-5-5", None, 32000),
+            body_for("claude-haiku-4-5", Some(ThinkingLevel::Off), 32000),
+        ] {
+            assert!(body.get("thinking").is_none() && body.get("output_config").is_none());
+        }
+        // An Anthropic-compatible gateway: we can't know what its model takes.
+        let custom = Connection {
+            thinking: Some(ThinkingLevel::High),
+            ..sample(Provider::Custom, "claude-sonnet-5-5")
+        };
+        let body = AnthropicDriver::new(custom).build_body("s", "u");
+        assert!(body.get("thinking").is_none());
     }
 
     /// A stream that closes without `message_stop` must return Err.

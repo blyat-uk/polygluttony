@@ -4,4 +4,23 @@ import type { ModelOption } from "./ModelOption";
 import type { Provider } from "./Provider";
 import type { TuningDefaults } from "./TuningDefaults";
 
-export type ProviderInfo = { provider: Provider, label: string, tagline: string, driver: Driver | null, base_url: string, needs_key: boolean, local: boolean, key_url: string | null, key_hint: string | null, models: Array<ModelOption>, default_model: string, can_search: boolean, can_think: boolean, tuning: TuningDefaults, };
+/**
+ * One provider tile on the Connections page and everything its form needs.
+ */
+export type ProviderInfo = { provider: Provider, label: string, tagline: string, 
+/**
+ * `None` = detect the API format on Connect (Custom).
+ */
+driver: Driver | null, 
+/**
+ * Default address; editable for local and custom providers only.
+ */
+base_url: string, 
+/**
+ * `false` for local servers, and for Custom where the key is optional.
+ */
+needs_key: boolean, local: boolean, key_url: string | null, key_hint: string | null, models: Array<ModelOption>, 
+/**
+ * Preselected model; empty when the provider's models are live-only.
+ */
+default_model: string, can_search: boolean, can_think: boolean, tuning: TuningDefaults, };

@@ -28,8 +28,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::projects::Tone;
 use crate::config::store as config_store;
-use crate::config::AppConfig;
-use crate::config::Connection;
 use crate::error::{AppError, AppResult};
 use crate::events::{self, FileResult, RunEvent};
 use crate::glossary::io::load_folder_glossary;
@@ -54,18 +52,6 @@ pub struct StartArgs {
     pub target_lang: String,
 }
 
-/// Return the active connection if it is usable. Delegates the per-connection
-/// rule to `config_store::connection_is_usable` so both call sites stay in
-/// sync. Pure helper so it can be unit-tested without an AppHandle.
-pub fn usable_connection(cfg: &AppConfig) -> Option<Connection> {
-    let conn = cfg.connections.get(&cfg.active_connection)?;
-    if config_store::connection_is_usable(conn) {
-        Some(conn.clone())
-    } else {
-        None
-    }
-}
-
 pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     let state = app.state::<RunState>();
     let mut guard = state.0.lock().await;
@@ -83,10 +69,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     }
 
     let cfg = config_store::load(&app)?;
-    let conn = usable_connection(&cfg).ok_or(AppError::NoActiveConnection)?;
-    if let Some(msg) = conn.thinking_config_error() {
-        return Err(AppError::Other(msg));
-    }
+    let conn = config_store::usable_translation(&cfg).ok_or(AppError::NoActiveConnection)?;
 
     if args.files.is_empty() {
         return Err(AppError::Other("no files selected".into()));
@@ -251,47 +234,5 @@ pub async fn cancel(app: AppHandle) -> AppResult<()> {
             Ok(())
         }
         None => Err(AppError::NoActiveRun),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::presets::default_config;
-
-    #[test]
-    fn usable_connection_requires_key_or_localhost() {
-        let mut cfg = default_config();
-        // Clear all keys to put us in a clean state.
-        for c in cfg.connections.values_mut() {
-            c.api_key.clear();
-            c.base_url = "https://api.example.com".into();
-        }
-        // No key, no localhost → None.
-        assert!(usable_connection(&cfg).is_none());
-
-        // Non-empty key → Some.
-        cfg.connections.get_mut(&cfg.active_connection).unwrap().api_key = "sk-test".into();
-        assert!(usable_connection(&cfg).is_some());
-
-        // Localhost without key → Some.
-        {
-            let conn = cfg.connections.get_mut(&cfg.active_connection).unwrap();
-            conn.api_key.clear();
-            conn.base_url = "http://localhost:11434".into();
-        }
-        assert!(usable_connection(&cfg).is_some());
-
-        // 127.0.0.1 without key → Some.
-        cfg.connections.get_mut(&cfg.active_connection).unwrap().base_url =
-            "http://127.0.0.1:11434".into();
-        assert!(usable_connection(&cfg).is_some());
-    }
-
-    #[test]
-    fn missing_active_connection_returns_none() {
-        let mut cfg = default_config();
-        cfg.active_connection = "nonexistent".into();
-        assert!(usable_connection(&cfg).is_none());
     }
 }

@@ -5,4 +5,13 @@ import type { TestProblem } from "./TestProblem";
 /**
  * Result of a connection test.
  */
-export type TestResult = { ok: boolean, model: string, detected_driver: Driver | null, message: string, problem: TestProblem | null, can_save_anyway: boolean, };
+export type TestResult = { ok: boolean, model: string, detected_driver: Driver | null, message: string, 
+/**
+ * `None` when ok.
+ */
+problem: TestProblem | null, 
+/**
+ * The failure may be temporary (unreachable, rate-limited, server error),
+ * so saving the connection untested is reasonable. Never for a bad key or model.
+ */
+can_save_anyway: boolean, };
