@@ -117,7 +117,7 @@ impl AnthropicDriver {
         }
         // Not `Transport`: the service would retry it, re-running (and
         // re-billing) every search for a turn that is unlikely to settle.
-        Err(LlmError::Parse(format!(
+        Err(LlmError::Declined(format!(
             "web search didn't finish after {MAX_PAUSE_CONTINUATIONS} continuations"
         )))
     }

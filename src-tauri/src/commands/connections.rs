@@ -192,7 +192,9 @@ pub(crate) fn classify_test_error(err: &LlmError) -> (TestProblem, bool) {
         }
         LlmError::Http { status: 408, .. } | LlmError::Transport(_) => (TestProblem::Address, true),
         LlmError::Http { status: 429 | 500..=599, .. } => (TestProblem::Other, true),
-        LlmError::Http { .. } | LlmError::Parse(_) | LlmError::Empty => (TestProblem::Other, false),
+        LlmError::Http { .. } | LlmError::Parse(_) | LlmError::Declined(_) | LlmError::Empty => {
+            (TestProblem::Other, false)
+        }
     }
 }
 

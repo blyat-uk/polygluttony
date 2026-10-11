@@ -88,6 +88,8 @@ struct Reply {
     finish_reason: Option<String>,
     block_reason: Option<String>,
     prompt_tokens: Option<u64>,
+    /// Google Search results fed back to the model (grounded calls only).
+    tool_prompt_tokens: Option<u64>,
     candidates_tokens: Option<u64>,
     thoughts_tokens: Option<u64>,
     cached_tokens: Option<u64>,
@@ -120,6 +122,7 @@ impl Reply {
         // latest value reported.
         let m = &v["usageMetadata"];
         self.prompt_tokens = m["promptTokenCount"].as_u64().or(self.prompt_tokens);
+        self.tool_prompt_tokens = m["toolUsePromptTokenCount"].as_u64().or(self.tool_prompt_tokens);
         self.candidates_tokens = m["candidatesTokenCount"].as_u64().or(self.candidates_tokens);
         self.thoughts_tokens = m["thoughtsTokenCount"].as_u64().or(self.thoughts_tokens);
         self.cached_tokens = m["cachedContentTokenCount"].as_u64().or(self.cached_tokens);
@@ -132,8 +135,14 @@ impl Reply {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
         };
+        // Google Search results are fed back to the model as extra input,
+        // reported apart from the prompt.
+        let input_tokens = match (self.prompt_tokens, self.tool_prompt_tokens) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
         Usage {
-            input_tokens: self.prompt_tokens,
+            input_tokens,
             output_tokens,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: self.cached_tokens,
@@ -147,11 +156,11 @@ impl Reply {
         let no_text = self.text.trim().is_empty();
         if no_text {
             if let Some(reason) = &self.block_reason {
-                return Err(LlmError::Parse(format!("Gemini blocked the prompt ({reason})")));
+                return Err(LlmError::Declined(format!("Gemini blocked the prompt ({reason})")));
             }
             if let Some(reason) = self.finish_reason.as_deref() {
                 if BLOCKED_FINISH_REASONS.contains(&reason) {
-                    return Err(LlmError::Parse(format!("Gemini blocked the response ({reason})")));
+                    return Err(LlmError::Declined(format!("Gemini blocked the response ({reason})")));
                 }
             }
         }
@@ -405,7 +414,7 @@ mod tests {
                         "finishReason": "STOP"
                     }],
                     "usageMetadata": {
-                        "promptTokenCount": 12, "candidatesTokenCount": 5, "thoughtsTokenCount": 7,
+                        "promptTokenCount": 12, "toolUsePromptTokenCount": 3, "candidatesTokenCount": 5, "thoughtsTokenCount": 7,
                         "cachedContentTokenCount": 4, "totalTokenCount": 24
                     }
                 }),
@@ -414,7 +423,7 @@ mod tests {
             .await;
         let resp = GeminiDriver::new(conn(&server, "gemini-2.5-pro")).stream(&req()).await.unwrap();
         assert_eq!(resp.text, "Hello world");
-        assert_eq!(resp.usage.input_tokens, Some(12));
+        assert_eq!(resp.usage.input_tokens, Some(15)); // prompt + search results
         assert_eq!(resp.usage.output_tokens, Some(12), "answer + thinking tokens");
         assert_eq!(resp.usage.cache_read_input_tokens, Some(4));
         assert_eq!(resp.usage.cache_creation_input_tokens, None);

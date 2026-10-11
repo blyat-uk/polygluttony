@@ -336,7 +336,12 @@ pub fn thinking_param(
         Family::OpenAiReasoning => ThinkingParam::OpenAiEffort(effort),
         Family::Gemini3 => ThinkingParam::GeminiLevel(effort),
         Family::Gemini25 => {
-            ThinkingParam::GeminiBudget(match level { Low => 1024, Medium => 8192, _ => 24576 })
+            // 2.5 counts thinking against maxOutputTokens: leave the answer
+            // 8k tokens, or half the cap when the cap is small (128 is the
+            // smallest budget 2.5 Pro takes).
+            let budget = match level { Low => 1024, Medium => 8192, _ => 24576 };
+            let room = max_tokens.saturating_sub(8192).max(max_tokens / 2);
+            ThinkingParam::GeminiBudget(budget.min(room).max(128))
         }
         Family::OpenAiOther | Family::GeminiOther | Family::Plain => ThinkingParam::None,
     }
@@ -563,7 +568,10 @@ mod tests {
         let g25 = |l| thinking_param(Provider::Google, "gemini-2.5-flash", Some(l), 32000);
         assert_eq!(g25(Low), ThinkingParam::GeminiBudget(1024));
         assert_eq!(g25(Medium), ThinkingParam::GeminiBudget(8192));
-        assert_eq!(g25(High), ThinkingParam::GeminiBudget(24576));
+        assert_eq!(g25(High), ThinkingParam::GeminiBudget(23808)); // 32000 − 8k for the answer
+        let small = |l| thinking_param(Provider::Google, "gemini-2.5-flash", Some(l), 16000);
+        assert_eq!(small(Medium), ThinkingParam::GeminiBudget(8000)); // half of a small cap
+        assert_eq!(small(High), ThinkingParam::GeminiBudget(8000));
     }
 
     #[test]
