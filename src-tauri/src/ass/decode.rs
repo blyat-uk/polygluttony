@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use chardetng::EncodingDetector;
+use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::Encoding;
 
 use crate::error::AppResult;
@@ -16,9 +16,11 @@ pub fn decode_bytes(bytes: &[u8]) -> String {
     let encoding = match Encoding::for_bom(bytes) {
         Some((enc, _bom_len)) => enc,
         None => {
-            let mut detector = EncodingDetector::new();
+            // Subtitles are local files, not script-running Web content, so
+            // ISO-2022-JP stays a candidate (the pre-1.0 chardetng default).
+            let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
             detector.feed(bytes, true);
-            detector.guess(None, true)
+            detector.guess(None, Utf8Detection::Allow)
         }
     };
     // `decode` re-sniffs and strips a leading BOM that matches `encoding`.

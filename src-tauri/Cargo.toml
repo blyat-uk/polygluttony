@@ -22,29 +22,29 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri-plugin-store = "2.4.3"
-tauri-plugin-dialog = "2.7.1"
-tauri-plugin-fs = "2.5.1"
-tauri-plugin-notification = "2.3.3"
-tokio = { version = "1.52.3", features = ["sync", "time", "macros", "rt-multi-thread"] }
-futures = "0.3.32"
-regex = "1.12.3"
-anyhow = "1.0.102"
-thiserror = "2.0.18"
-tiktoken-rs = "0.12.0"
+tauri-plugin-store = "2.5.0"
+tauri-plugin-dialog = "2.8.2"
+tauri-plugin-fs = "2.7.0"
+tauri-plugin-notification = "2.6.0"
+tokio = { version = "1.53.2", features = ["sync", "time", "macros", "rt-multi-thread"] }
+futures = "0.3.34"
+regex = "1.13.1"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+tiktoken-rs = "0.12.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ts-rs = "12.0.1"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls", "http2", "charset"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls", "http2", "charset"] }
 async-trait = "0.1"
 encoding_rs = "0.8"
-chardetng = "0.1"
-tokio-util = "0.7.18"
-rand = "0.10.1"
+chardetng = "1"
+tokio-util = "0.7.20"
+rand = "0.10.3"
 eventsource-stream = "0.2.3"
 notify = "8.2.0"
 
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
-tokio = { version = "1.52.3", features = ["test-util"] }
+tokio = { version = "1.53.2", features = ["test-util"] }
