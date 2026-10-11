@@ -6,7 +6,7 @@ use tauri::AppHandle;
 use crate::config::providers::{self, ModelCapabilities, ProviderInfo};
 use crate::config::store;
 use crate::config::{AppConfig, Connection, Driver, Provider, WebSearch};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::llm::create_driver;
 use crate::llm::detect::detect_format;
 use crate::llm::error::LlmError;
@@ -77,11 +77,14 @@ pub fn first_run_status(app: AppHandle) -> AppResult<FirstRunStatus> {
     })
 }
 
-/// A cheap, valid probe of `c` on `driver`: no thinking, no tools, 16 tokens.
-fn probe_connection(mut c: Connection, driver: Driver) -> Connection {
+/// A cheap, valid probe of `c` on `driver`: no thinking, 16 tokens (the
+/// Responses API's floor; enough with a search tool attached too). The search
+/// tool rides along only when asked for and the model can search — exactly
+/// when `store::resolve_web_search` would attach it at run time.
+fn probe_connection(mut c: Connection, driver: Driver, web_search: bool) -> Connection {
     c.driver = driver;
     c.thinking = None;
-    c.web_search = false;
+    c.web_search = web_search && providers::capabilities(c.provider, &c.model).web_search;
     c.max_tokens = Some(16);
     c
 }
@@ -98,61 +101,69 @@ async fn resolve_driver(conn: &Connection) -> Result<(Driver, Option<Driver>), L
     }
 }
 
+/// Connect's test: one tiny real request. `web_search` (JS `webSearch`, may be
+/// omitted) also attaches the provider's search tool, so a model or account
+/// that rejects it fails here instead of at glossary time.
 #[tauri::command]
-pub async fn test_connection(connection: Connection) -> AppResult<TestResult> {
-    let connection = providers::canonicalize(connection);
+pub async fn test_connection(connection: Connection, web_search: Option<bool>) -> AppResult<TestResult> {
+    Ok(run_test(providers::canonicalize(connection), web_search.unwrap_or(false)).await)
+}
+
+/// The test itself, on an already-canonical connection (split out so tests can
+/// aim it at a mock server; canonicalizing pins cloud providers' base URLs).
+async fn run_test(connection: Connection, web_search: bool) -> TestResult {
     let (driver, detected) = match resolve_driver(&connection).await {
         Ok(resolved) => resolved,
         // Undetermined format (both routes 404 / host unreachable): a graceful
         // result rather than an IPC-level error (spec §5.7).
         Err(_) => {
-            let message = format!(
-                "No OpenAI- or Anthropic-compatible API answered at {}. Check the URL.",
-                host_of(&connection.base_url)
-            );
-            return Ok(failed(&connection, None, TestProblem::Address, true, message));
+            let message = undetected_message(&connection);
+            return failed(&connection, None, TestProblem::Address, true, message);
         }
     };
 
     let model = connection.model.clone();
-    let client = create_driver(probe_connection(connection.clone(), driver));
+    let client = create_driver(probe_connection(connection.clone(), driver, web_search));
     match client.complete("Reply with OK.", "ping").await {
         // A 200 response with empty content still proves the key + model are
         // valid — some reasoning models (e.g. GLM via z.ai) emit no text within
-        // the tiny probe budget. A connectivity test treats that as success.
+        // the tiny probe budget, and a search turn can spend it all on the
+        // tool call. A connectivity test treats that as success.
         Ok(_) | Err(LlmError::Empty) => {
             let message = match detected {
                 Some(d) => format!("✓ Detected {} — responded as {model}", driver_label(d)),
                 None => format!("✓ Connection works — responded as {model}"),
             };
-            Ok(TestResult {
+            TestResult {
                 ok: true,
                 model,
                 detected_driver: detected,
                 message,
                 problem: None,
                 can_save_anyway: false,
-            })
+            }
         }
         Err(e) => {
             let (problem, can_save_anyway) = classify_test_error(&e);
             let message = failure_message(&connection, problem, &e);
-            Ok(failed(&connection, detected, problem, can_save_anyway, message))
+            failed(&connection, detected, problem, can_save_anyway, message)
         }
     }
 }
 
+/// The models the server offers, for the model menu. `Err` (a message fit to
+/// show) when the server couldn't be asked — unreachable, key rejected, no
+/// recognisable API, an error reply — and `Ok(vec![])` only when it answered
+/// with no models. The page reads the first as "can't reach" and the second as
+/// "running, but no models installed"; the curated list stays either way.
 #[tauri::command]
 pub async fn list_models(connection: Connection) -> AppResult<Vec<String>> {
-    // Best-effort enrichment: the UI falls back to the curated list (and, for
-    // local servers, reads an empty list as "not running"), so any failure —
-    // detection included — yields an empty list rather than an error.
     let mut conn = providers::canonicalize(connection);
-    let Ok((driver, _)) = resolve_driver(&conn).await else {
-        return Ok(Vec::new());
-    };
+    let (driver, _) =
+        resolve_driver(&conn).await.map_err(|_| AppError::Other(undetected_message(&conn)))?;
     conn.driver = driver;
-    Ok(create_driver(conn).list_models().await.unwrap_or_default())
+    let listed = create_driver(conn.clone()).list_models().await;
+    listed.map_err(|e| AppError::Other(list_failure_message(&conn, &e)))
 }
 
 fn failed(
@@ -205,10 +216,39 @@ fn host_of(base_url: &str) -> &str {
     rest.split(['/', '?', '#']).next().filter(|h| !h.is_empty()).unwrap_or(url)
 }
 
+/// Who answered, for messages: the provider's name, or "The server" for Custom.
+fn who(conn: &Connection) -> String {
+    if conn.provider == Provider::Custom {
+        "The server".to_string()
+    } else {
+        providers::provider_info(conn.provider).label
+    }
+}
+
+/// Pure: a Custom URL where neither API format answered.
+fn undetected_message(conn: &Connection) -> String {
+    format!(
+        "No OpenAI- or Anthropic-compatible API answered at {}. Check the URL.",
+        host_of(&conn.base_url)
+    )
+}
+
+/// Pure: why the model list couldn't be fetched — in a failed test's words
+/// for a bad key or an unreachable server. A 404 here means the server has no
+/// model list, not that it doesn't know a model.
+fn list_failure_message(conn: &Connection, err: &LlmError) -> String {
+    match classify_test_error(err).0 {
+        problem @ (TestProblem::Key | TestProblem::Address) => failure_message(conn, problem, err),
+        TestProblem::Model | TestProblem::Other => {
+            format!("{} didn't list its models ({err}).", who(conn))
+        }
+    }
+}
+
 /// Pure: the message shown with a failed test.
 fn failure_message(conn: &Connection, problem: TestProblem, err: &LlmError) -> String {
     let info = providers::provider_info(conn.provider);
-    let who = if conn.provider == Provider::Custom { "The server".to_string() } else { info.label.clone() };
+    let who = who(conn);
     match problem {
         TestProblem::Key => {
             let hint = info.key_hint.map(|h| format!(" ({h})")).unwrap_or_default();
@@ -239,6 +279,9 @@ mod tests {
     use super::*;
     use crate::config::providers::default_config;
     use crate::config::sample;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn http(status: u16, body: &str) -> LlmError {
         LlmError::Http { status, body: body.into(), retry_after: None }
@@ -260,8 +303,137 @@ mod tests {
         c.thinking = Some(crate::config::ThinkingLevel::High);
         c.web_search = true;
         c.max_tokens = Some(32000);
-        let p = probe_connection(c, Driver::OpenaiResponses);
+        let p = probe_connection(c, Driver::OpenaiResponses, false);
         assert_eq!((p.thinking, p.web_search, p.max_tokens), (None, false, Some(16)));
+    }
+
+    #[test]
+    fn probe_attaches_search_only_when_asked_and_the_model_can_search() {
+        let gpt = sample(Provider::Openai, "gpt-5.5");
+        let p = probe_connection(gpt, Driver::OpenaiResponses, true);
+        assert_eq!((p.thinking, p.web_search, p.max_tokens), (None, true, Some(16)));
+        // At run time these never search, so the probe doesn't either.
+        for c in [sample(Provider::Ollama, "qwen3"), sample(Provider::Openai, "o3-mini")] {
+            let driver = c.driver;
+            assert!(!probe_connection(c, driver, true).web_search);
+        }
+    }
+
+    fn json_reply(body: serde_json::Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+
+    async fn sent_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+        let requests = server.received_requests().await.unwrap();
+        requests.iter().map(|r| r.body_json().unwrap()).collect()
+    }
+
+    /// A Claude connection on the mock server (`run_test` skips canonicalize,
+    /// which would pin it back to api.anthropic.com).
+    fn claude_on(server: &MockServer) -> Connection {
+        Connection { base_url: server.uri(), ..sample(Provider::Anthropic, "claude-sonnet-5-5") }
+    }
+
+    #[tokio::test]
+    async fn a_web_search_test_sends_the_tool_and_counts_a_bare_reply_as_working() {
+        let server = MockServer::start().await;
+        // The probe budget went on the search call: no text, still a success.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(json!({
+                "stop_reason": "max_tokens",
+                "content": [{"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {}}],
+                "usage": {"input_tokens": 9, "output_tokens": 16}
+            })))
+            .mount(&server)
+            .await;
+        let searched = run_test(claude_on(&server), true).await;
+        assert!(searched.ok, "{}", searched.message);
+        let plain = run_test(claude_on(&server), false).await;
+        assert!(plain.ok, "{}", plain.message);
+
+        let bodies = sent_bodies(&server).await;
+        assert_eq!(bodies[0]["tools"][0]["name"], "web_search");
+        assert_eq!(bodies[0]["max_tokens"], 16);
+        assert!(bodies[1].get("tools").is_none(), "a plain test attaches no tool");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_search_tool_fails_the_test() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"web search is not enabled for this organization"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let r = run_test(claude_on(&server), true).await;
+        assert!(!r.ok);
+        assert_eq!((r.problem, r.can_save_anyway), (Some(TestProblem::Other), false));
+        assert!(r.message.contains("web search is not enabled"), "{}", r.message);
+    }
+
+    fn ollama_on(base_url: String) -> Connection {
+        Connection { base_url, ..sample(Provider::Ollama, "qwen3") }
+    }
+
+    /// A port nothing listens on.
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn list_models_tells_no_models_from_an_error_reply() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/empty/models"))
+            .respond_with(json_reply(json!({"object": "list", "data": []})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/full/models"))
+            .respond_with(json_reply(json!({"object": "list", "data": [{"id": "qwen3"}]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/broken/models"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let list = |dir: &str| list_models(ollama_on(format!("{}/{dir}", server.uri())));
+        // Running, but nothing installed.
+        assert_eq!(list("empty").await.unwrap(), Vec::<String>::new());
+        assert_eq!(list("full").await.unwrap(), vec!["qwen3"]);
+        let err = list("broken").await.unwrap_err().to_string();
+        assert_eq!(err, "Ollama didn't list its models (HTTP 500: boom).");
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_an_unreachable_server() {
+        let port = closed_port();
+        let err = list_models(ollama_on(format!("http://127.0.0.1:{port}/v1"))).await.unwrap_err();
+        assert_eq!(err.to_string(), format!("Can't reach Ollama at 127.0.0.1:{port} — is it running?"));
+
+        // A Custom URL is detected first; nothing answering is an error too.
+        let mut custom = sample(Provider::Custom, "m");
+        custom.base_url = format!("http://127.0.0.1:{port}/v1");
+        let err = list_models(custom).await.unwrap_err().to_string();
+        assert!(err.starts_with("No OpenAI- or Anthropic-compatible API answered at 127.0.0.1:"), "{err}");
+    }
+
+    #[test]
+    fn list_failures_reuse_the_tests_words_for_key_and_address() {
+        let gemini = sample(Provider::Google, "gemini-2.5-pro");
+        let bad_key = http(400, r#"{"error":{"message":"API key not valid."}}"#);
+        assert!(list_failure_message(&gemini, &bad_key).starts_with("Google rejected this key."));
+        // No model list at all isn't "doesn't recognise the model".
+        let mut custom = sample(Provider::Custom, "m");
+        custom.base_url = "https://gw.example.com/v1".into();
+        assert_eq!(
+            list_failure_message(&custom, &http(404, "not found")),
+            "The server didn't list its models (HTTP 404: not found)."
+        );
     }
 
     #[test]
