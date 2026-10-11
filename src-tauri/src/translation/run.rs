@@ -15,8 +15,9 @@
 //!    are dropped when the spawner task and each file task finish. No other code path
 //!    holds an `Arc<LlmService>`, so the service and its inner tx clone are freed once
 //!    the last file task exits and the spawner drops its `svc`.
-//! 4. **`verify_svc`'s internal clone** — the Verify step's own service, shared
-//!    and dropped exactly like `svc` (`job_verify_svc` per file task).
+//! 4. **`verify_svc`'s internal clone** — the Verify step's own service (or
+//!    another `Arc` of `svc` when Verify runs on Translate's model and settings),
+//!    shared and dropped exactly like `svc` (`job_verify_svc` per file task).
 //!
 //! Once (1), (2) for every file, (3) and (4) have all dropped, `rx.recv()` returns
 //! `None` and the forwarder loop exits — triggering state clear.
@@ -53,6 +54,19 @@ pub struct StartArgs {
     pub tone: Tone,
     pub source_lang: String,
     pub target_lang: String,
+}
+
+/// Verify on Translate's model with Translate's settings shares Translate's
+/// service: one pool of requests in flight (the user's "Requests at once"
+/// covers both) and one rate-limit back-off, as before steps had their own
+/// models. Batch size and concurrency are ignored: Verify uses neither.
+fn same_service(translate: &crate::config::Connection, verify: &crate::config::Connection) -> bool {
+    let verify = crate::config::Connection {
+        batch_dialogue_limit: translate.batch_dialogue_limit,
+        concurrency: translate.concurrency,
+        ..verify.clone()
+    };
+    *translate == verify
 }
 
 pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
@@ -102,7 +116,11 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         Arc::new(LlmService::new(driver, concurrency, cancel.clone(), tx.clone()))
     };
     let svc = service(conn.clone());
-    let verify_svc = service(verify_conn);
+    let verify_svc = if same_service(&conn, &verify_conn) {
+        svc.clone()
+    } else {
+        service(verify_conn)
+    };
 
     *guard = Some(RunHandle { cancel: cancel.clone() });
     drop(guard);
@@ -249,5 +267,29 @@ pub async fn cancel(app: AppHandle) -> AppResult<()> {
             Ok(())
         }
         None => Err(AppError::NoActiveRun),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_service;
+    use crate::config::{sample, Provider, ThinkingLevel};
+
+    #[test]
+    fn verify_shares_translates_service_only_on_the_same_model_and_settings() {
+        let mut translate = sample(Provider::Anthropic, "claude-sonnet-5-5");
+        translate.concurrency = Some(5);
+        translate.batch_dialogue_limit = Some(200);
+        // One-model view, or a per-step Verify left on Translate's model: Verify's
+        // unused batch size / concurrency don't split the pool.
+        let mut verify = translate.clone();
+        verify.concurrency = Some(2);
+        verify.batch_dialogue_limit = None;
+        assert!(same_service(&translate, &verify));
+
+        let mut other_thinking = verify.clone();
+        other_thinking.thinking = Some(ThinkingLevel::Low);
+        assert!(!same_service(&translate, &other_thinking));
+        assert!(!same_service(&translate, &sample(Provider::Anthropic, "claude-haiku-5-5")));
     }
 }
