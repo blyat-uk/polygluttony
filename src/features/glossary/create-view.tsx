@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import type { ProjectView } from "@/types/generated/ProjectView";
 import type { WorldType } from "@/types/generated/WorldType";
 import { ipc } from "@/lib/ipc";
+import { plural } from "@/lib/utils";
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { referenceKey, referenceStatusKey, useImportReference } from "./use-import-reference";
 import { useImportGlossary } from "./use-import-glossary";
@@ -102,7 +103,7 @@ export function CreateView({ view }: { view: ProjectView }) {
         ) : null}
         {summary?.cancelled ? (
           <p className="text-sm text-[color:var(--color-alert)]">
-            Build cancelled — {summary.terms_final} terms kept.
+            Build cancelled — {plural(summary.terms_final, "term")} kept.
           </p>
         ) : null}
         {summary && summary.errors.length > 0 ? (
@@ -111,7 +112,7 @@ export function CreateView({ view }: { view: ProjectView }) {
               Last build finished with {summary.errors.length} issue
               {summary.errors.length !== 1 ? "s" : ""}
               {summary.terms_final > 0
-                ? ` — ${summary.terms_final} terms were still saved:`
+                ? ` — ${plural(summary.terms_final, "term")} ${summary.terms_final === 1 ? "was" : "were"} still saved:`
                 : ":"}
             </p>
             <ul className="space-y-0.5">
@@ -133,8 +134,8 @@ export function CreateView({ view }: { view: ProjectView }) {
               <h2 className="text-sm font-semibold text-foreground">Generate from these subtitles</h2>
             </div>
             <p className="mb-4 text-[12.5px] text-muted-foreground">
-              Scan the {view.files.length} files and extract names, terms &amp; places. Most common
-              choice.
+              Scan the {plural(view.files.length, "file")} and extract names, terms &amp; places.
+              Most common choice.
             </p>
 
             <GlossaryBuildOptions
@@ -144,7 +145,7 @@ export function CreateView({ view }: { view: ProjectView }) {
               onPersonalizeChange={setPersonalize}
               context={context}
               onContextChange={setContext}
-              normalizeHelp="Merges duplicate names and fixes inconsistent spellings."
+              normalizeHelp="Fixes inconsistent spellings and drops terms too generic to be useful."
             />
           </div>
 
@@ -171,7 +172,7 @@ export function CreateView({ view }: { view: ProjectView }) {
               {/* ref/ folder chip — cached imports get the summary block below */}
               {refStatus?.source === "ref_dir" ? (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-[color:var(--color-bg-raised)] px-2.5 py-1 text-[11px] text-muted-foreground">
-                  ref/ folder detected · {refStatus.count} files
+                  ref/ folder detected · {plural(refStatus.count, "file")}
                 </span>
               ) : null}
             </div>
@@ -180,7 +181,7 @@ export function CreateView({ view }: { view: ProjectView }) {
             {refStatus?.source === "cached" ? (
               <div className="mt-3 rounded-md border border-border bg-[color:var(--color-bg-raised)] px-3 py-2 text-[11.5px]">
                 <p className="text-foreground">
-                  <span className="font-semibold">{refStatus.count} reference terms</span> ·
+                  <span className="font-semibold">{plural(refStatus.count, "reference term")}</span> ·
                   imported
                 </p>
                 {refTerms ? (

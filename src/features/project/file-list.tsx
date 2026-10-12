@@ -1,6 +1,7 @@
 import { CheckCircle } from "@phosphor-icons/react";
 import type { SourceFile } from "@/types/generated/SourceFile";
 import { Checkbox } from "@/components/ui/checkbox";
+import { plural } from "@/lib/utils";
 
 /**
  * Source-file list with per-file selection. `selected` is the explicit list of
@@ -34,7 +35,7 @@ export function FileList({
           onCheckedChange={toggleAll}
         />
         <span>
-          {files.length} files · {selected.length} selected
+          {plural(files.length, "file")} · {selected.length} selected
         </span>
       </div>
       <ul className="max-h-64 overflow-auto" aria-label="Source files">
@@ -46,7 +47,7 @@ export function FileList({
             />
             <span className="flex-1 truncate">{f.name}</span>
             <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
-              {f.dialogue_count} lines
+              {plural(f.dialogue_count, "line")}
             </span>
             {f.has_translation ? (
               <span className="inline-flex shrink-0 items-center gap-0.5 text-[10px] text-[color:var(--color-success)]">

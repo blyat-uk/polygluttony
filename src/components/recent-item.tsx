@@ -2,6 +2,7 @@ import { Folder } from "@phosphor-icons/react";
 import type { RecentFolder } from "@/types/generated/RecentFolder";
 import { formatRelativeTime } from "@/lib/relative-time";
 import { folderTitle } from "@/lib/folder-title";
+import { plural } from "@/lib/utils";
 
 export function RecentItem({
   recent,
@@ -30,7 +31,7 @@ export function RecentItem({
         </span>
       </button>
       <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
-        {recent.file_count} files · {formatRelativeTime(Number(recent.last_opened))}
+        {plural(Number(recent.file_count), "file")} · {formatRelativeTime(Number(recent.last_opened))}
       </span>
       <button
         type="button"

@@ -5,6 +5,7 @@ import { StateChip } from "@/components/state-chip";
 import { StatusChip } from "@/components/status-chip";
 import { Separator } from "@/components/ui/separator";
 import { ipc } from "@/lib/ipc";
+import { plural } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { useTranslationRun } from "@/stores/translation-store";
@@ -28,7 +29,7 @@ export function StatusBar() {
   const translatingCounts = (() => {
     const all = Object.values(tFiles);
     const done = all.filter((f) => ["done", "warning", "failed"].includes(f.state)).length;
-    return `${done}/${all.length} files`;
+    return `${done}/${plural(all.length, "file")}`;
   })();
 
   const activeBatch = (() => {
@@ -60,7 +61,7 @@ export function StatusBar() {
       </span>
       <Separator orientation="vertical" className="h-4" />
       <span className="shrink-0 tabular-nums">
-        {workdir ? `${fileCount} files · ${lineCount} lines` : "— files · — lines"}
+        {workdir ? `${plural(fileCount, "file")} · ${plural(lineCount, "line")}` : "— files · — lines"}
       </span>
       <span className="flex-1" />
       {activity ? (

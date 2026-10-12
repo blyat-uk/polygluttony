@@ -9,6 +9,7 @@ import { runProgress } from "./telemetry";
 import { LogToggleButton, LogPanel } from "@/components/log-drawer";
 import type { Tone } from "@/types/generated/Tone";
 import { ipc } from "@/lib/ipc";
+import { plural } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
 import { useProject, syncProjectStore, projectKey } from "@/features/project/use-project";
 import { useTranslationRun } from "@/stores/translation-store";
@@ -88,7 +89,7 @@ export function TranslatePage() {
 
   const glossaryClause =
     view.glossary_terms != null
-      ? ` · using glossary (${view.glossary_terms} terms)`
+      ? ` · using glossary (${plural(view.glossary_terms, "term")})`
       : "";
 
   const connLabel = translationLabel ?? "no model";
@@ -158,7 +159,7 @@ export function TranslatePage() {
             {warn > 0 ? (
               <>
                 <span className="text-muted-foreground">, </span>
-                <span className="text-[color:var(--color-alert)]">{warn} need a look</span>
+                <span className="text-[color:var(--color-alert)]">{warn} {warn === 1 ? "needs" : "need"} a look</span>
               </>
             ) : null}
             {failed > 0 ? (
@@ -234,7 +235,7 @@ export function TranslatePage() {
         {selected.length > 0 ? (
           <div className="rounded-md border border-primary/30 bg-primary/5 px-4 py-2.5 text-[12.5px] text-foreground">
             <span className="tabular-nums">
-              {selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""} · {totalLines.toLocaleString()} lines
+              {plural(selectedFiles.length, "file")} · {plural(totalLines, "line")}
               {glossaryClause} · est.{" "}
               <span className="font-medium">~{estimateMinutes}m</span> on{" "}
               <span className="font-medium text-primary">{connLabel}</span>.
@@ -411,12 +412,16 @@ export function TranslatePage() {
 
         <SectionHelp title="What the automatic checks look for">
           <ul className="ml-1 list-disc space-y-1 pl-4 text-[11.5px] text-muted-foreground">
-            <li>Drift — the translation wandering off the original meaning.</li>
-            <li>Dropped or merged lines.</li>
-            <li>Terms that don’t match your glossary.</li>
+            <li>
+              Drift — the translation wandering off the original meaning. Glossary terms that go
+              missing count toward it.
+            </li>
+            <li>Lines that couldn’t be translated. They’re left out of the file.</li>
           </ul>
           <p className="mt-1.5 text-[11.5px] text-muted-foreground">
-            These are flagged as issues to review — there’s no quality score.
+            Dropped, merged or reordered lines are caught and re-sent while translating. Anything
+            still wrong after the retries is flagged as an issue to review — there’s no quality
+            score.
           </p>
         </SectionHelp>
 
@@ -425,7 +430,7 @@ export function TranslatePage() {
           <div className="space-y-1.5">
             <div className="flex justify-between text-[11px] text-muted-foreground tabular-nums">
               <span>
-                Pipeline · {progress.done.toLocaleString()} of {progress.total.toLocaleString()} lines ·{" "}
+                Pipeline · {progress.done.toLocaleString()} of {plural(progress.total, "line")} ·{" "}
                 {progress.finished.toLocaleString()} of {progress.files.toLocaleString()}{" "}
                 episode{progress.files !== 1 ? "s" : ""} finished
               </span>

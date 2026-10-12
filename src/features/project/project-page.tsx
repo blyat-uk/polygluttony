@@ -7,6 +7,7 @@ import type { FolderPrefs } from "@/types/generated/FolderPrefs";
 import type { Tone } from "@/types/generated/Tone";
 import type { WorldType } from "@/types/generated/WorldType";
 import { ipc } from "@/lib/ipc";
+import { plural } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
 import { useProject, syncProjectStore, projectKey } from "./use-project";
 import { FileList } from "./file-list";
@@ -84,7 +85,7 @@ export function ProjectPage() {
       />
       <div className="flex-1 overflow-auto p-5">
         <p className="mb-3 text-[12.5px] text-muted-foreground tabular-nums">
-          {view.files.length} subtitle files · {view.total_dialogue_lines} lines
+          {plural(view.files.length, "subtitle file")} · {plural(view.total_dialogue_lines, "line")}
         </p>
 
         <div className="grid grid-cols-2 gap-x-4">

@@ -335,7 +335,7 @@ pub fn resolve(id: PromptId, overrides_dir: &Path) -> AppResult<String> {
         std::fs::read_to_string(&path).map_err(|err| {
             AppError::Other(format!(
                 "custom \"{}\" prompt exists but can't be read ({err}) — fix or restore \
-it in Settings",
+it on the Prompts page",
                 e.name
             ))
         })

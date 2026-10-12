@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { Stop } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import { ipc } from "@/lib/ipc";
+import { plural } from "@/lib/utils";
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
@@ -41,7 +42,7 @@ export function RunScreen({
             <div className="flex items-center gap-3">
               <Progress value={total > 0 ? (done / total) * 100 : 0} className="flex-1" />
               <span className="text-[11px] text-muted-foreground tabular-nums">
-                {done}/{total} batches
+                {done}/{plural(total, "batch", "batches")}
               </span>
             </div>
           </>
