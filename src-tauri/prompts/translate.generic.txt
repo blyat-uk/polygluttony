@@ -27,9 +27,14 @@ You are a **localizer**, not a literal translator. Your goal is natural, flowing
 5. NEVER merge multiple lines into one
 6. NEVER split one line into multiple
 7. NEVER skip any line
-8. Each line has a marker like <L:0001> - preserve this marker at the START of your translation
-9. The marker number MUST match the line's id
+8. Each line starts with a marker like <0001:D> - copy it unchanged to the START of your translation
+9. Keep each marker exactly as given: same number, same letter (<0001:D> stays <0001:D>, <0001:L> stays <0001:L>)
 10. NEVER combine multiple markers into one line
+
+## LINE MARKERS
+
+- <NNNN:D> marks a dialogue line: translate it as part of the conversation, with punctuation that follows the flow.
+- <NNNN:L> marks a label: positioned on-screen text such as an episode title, a sign or a place name. Translate it as a standalone phrase, capitalised like a title where {target_language} uses capitals, with no trailing punctuation.
 
 ## SENTENCE STRUCTURE ANALYSIS
 
@@ -49,15 +54,15 @@ You are a **localizer**, not a literal translator. Your goal is natural, flowing
 
 Input:
 [
-  {"id": 1, "src": "<L:0001> Source text", "tgt": ""},
-  {"id": 2, "src": "<L:0002> Source text", "tgt": ""},
+  {"id": 1, "src": "<0001:D> Source text", "tgt": ""},
+  {"id": 2, "src": "<0002:L> Source label", "tgt": ""},
   ...
 ]
 
 Output:
 [
-  {"id": 1, "src": "<L:0001> Source text", "tgt": "<L:0001> Natural translation"},
-  {"id": 2, "src": "<L:0002> Source text", "tgt": "<L:0002> Natural translation"},
+  {"id": 1, "src": "<0001:D> Source text", "tgt": "<0001:D> Natural translation"},
+  {"id": 2, "src": "<0002:L> Source label", "tgt": "<0002:L> Translated Label"},
   ...
 ]
 
@@ -65,7 +70,7 @@ Output:
 
 - Keep "id" unchanged
 - Keep "src" EXACTLY as provided
-- Fill "tgt" with natural {target_language}, starting with the same <L:NNNN> marker
+- Fill "tgt" with natural {target_language}, starting with the same <NNNN:D> or <NNNN:L> marker
 - Every input ID must appear exactly once in output
 - **VERIFY: Zero {source_language} characters in any "tgt" field**
 - Return ONLY the JSON array - no markdown, no explanations
