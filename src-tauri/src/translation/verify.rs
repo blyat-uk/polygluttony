@@ -72,7 +72,7 @@ pub async fn verify_file(
                 source: src,
                 translation: tgt,
                 issue_type: "drift".into(),
-                description: format!("drift score {:.2} (threshold 0.7)", d.score),
+                description: "the translation starts drifting from the original here".into(),
                 severity: "high".into(),
             }],
             sampled_line_ids: Vec::new(),

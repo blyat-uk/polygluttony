@@ -24,6 +24,7 @@ import type { NormalizeReview } from "@/types/generated/NormalizeReview";
 import type { Language } from "@/types/generated/Language";
 import { ipc } from "@/lib/ipc";
 import { formatRelativeTime } from "@/lib/relative-time";
+import { plural } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { projectKey } from "@/features/project/use-project";
@@ -268,7 +269,7 @@ export function EditorView({ view, doc }: { view: ProjectView; doc: GlossaryDoc 
   return (
     <div className="flex h-full flex-col">
       <PageHeader
-        title={`Glossary · ${doc.count} terms`}
+        title={`Glossary · ${plural(doc.count, "term")}`}
         description="Double-click any term to edit. Changes auto-save to glossary.json."
         actions={
           <div className="flex items-center gap-2">

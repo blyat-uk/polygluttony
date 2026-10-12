@@ -484,12 +484,18 @@ impl FileState<'_, '_> {
                         self.log(
                             LogLevel::Debug,
                             LogPhase::Batch,
-                            format!(
-                                "drift score {:.2} (threshold {}) suspected from line {:?}",
-                                d.score,
-                                drift::THRESHOLD,
-                                d.suspected_drift_start_id
-                            ),
+                            match d.suspected_drift_start_id {
+                                Some(line) => format!(
+                                    "drift suspected from line {line} (score {:.2}, threshold {})",
+                                    d.score,
+                                    drift::THRESHOLD
+                                ),
+                                None => format!(
+                                    "drift suspected (score {:.2}, threshold {})",
+                                    d.score,
+                                    drift::THRESHOLD
+                                ),
+                            },
                         )
                         .await;
                     }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { FileStateChip } from "@/features/translate/file-state-chip";
-import { cn } from "@/lib/utils";
+import { cn, plural } from "@/lib/utils";
 import type { EpisodeSnapshot } from "@/types/generated/EpisodeSnapshot";
 import { describeActivity, formatElapsed, type ActivityTone } from "./format";
 
@@ -55,7 +55,7 @@ export function EpisodeHeader({
             <b className="font-semibold text-[color:var(--color-gold-hi)]">
               {snapshot.translated.toLocaleString()}
             </b>{" "}
-            / {snapshot.total.toLocaleString()} lines
+            / {plural(snapshot.total, "line")}
           </span>
         ) : null}
       </div>

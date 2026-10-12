@@ -27,7 +27,7 @@ export const STEP_INFO: Record<
   },
   normalize: {
     name: "Normalize",
-    purpose: "Merges duplicates, fixes spellings",
+    purpose: "Fixes spellings, drops generic terms",
     phase: "glossary",
     tuning: ["concurrency", "timeout", "max_tokens"],
   },

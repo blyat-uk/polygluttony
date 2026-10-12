@@ -198,14 +198,15 @@ function BehindTheScenes() {
           title="It checks its own work as it goes"
           example={
             <>
-              e.g. if the lines start paraphrasing partway through a batch, it flags where the drift
-              began and retranslates from there.
+              e.g. if lines start paraphrasing partway through an episode, it flags the ones that
+              drifted and retranslates just those, with a few lines around them for context.
             </>
           }
         >
-          While translating it watches for the AI drifting off the original meaning, dropping or
-          merging lines, or breaking glossary consistency — and re-does just the part that went
-          wrong. Afterward you get a list of anything still worth a look. It’s issues, not a score.
+          While translating it catches the AI dropping, merging or reordering lines. Then it checks
+          each finished episode for drift off the original meaning, including glossary terms that
+          went missing — and re-does just the part that went wrong. Afterward you get a list of
+          anything still worth a look. It’s issues, not a score.
         </Explainer>
 
         <Explainer
@@ -217,8 +218,9 @@ function BehindTheScenes() {
             </>
           }
         >
-          Only the dialogue is translated. Positioning, styling, fonts, and effects come back
-          exactly as they were.
+          Only the dialogue is translated. Styles, timings and positioning come back as they were,
+          and tags inside a line go back at the same relative spot. Embedded fonts and comment lines
+          aren’t copied over.
         </Explainer>
       </div>
     </Section>
@@ -241,7 +243,7 @@ const TROUBLE: {
     ],
   },
   {
-    q: "Look up names online is disabled",
+    q: "Look up established names online is disabled",
     a: "It needs a model that can search the web. In Connections, turn on Web search for your model, or add one that can — Anthropic, OpenAI and Google can search.",
     links: [{ to: "/connections", label: "Connections" }],
   },
@@ -249,7 +251,9 @@ const TROUBLE: {
     q: "I want to fix a translation by hand",
     a: (
       <>
-        Open the glossary in your own editor with{" "}
+        Open the translated .ass file in your subtitle editor. To change how a name or term is
+        translated in every episode, double-click it in the Glossary, or open the whole glossary in
+        your own editor with{" "}
         <span className="font-semibold text-foreground">Glossary ▸ Open in editor</span> —
         Polygluttony reloads it automatically when you save.
       </>

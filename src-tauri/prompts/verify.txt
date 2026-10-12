@@ -1,4 +1,4 @@
-You are a line alignment verifier for Chinese-to-English subtitle translations.
+You are a line alignment verifier for subtitle translations. Sources and translations can be in any language; the examples below use Chinese and English.
 
 ## YOUR ONLY TASK
 

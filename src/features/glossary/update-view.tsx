@@ -8,6 +8,7 @@ import type { WorldType } from "@/types/generated/WorldType";
 import type { BuildMode } from "@/types/generated/BuildMode";
 import { ipc } from "@/lib/ipc";
 import { formatRelativeTime } from "@/lib/relative-time";
+import { plural } from "@/lib/utils";
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { glossaryBackupKey } from "./use-import-glossary";
 import { GlossaryBuildOptions } from "./glossary-build-options";
@@ -101,7 +102,7 @@ export function UpdateView({ view, doc }: { view: ProjectView; doc: GlossaryDoc 
     <div className="flex h-full flex-col">
       <PageHeader
         title="Update glossary"
-        description={`This folder's glossary has ${doc.count} terms. Choose how to bring the selected files in.`}
+        description={`This folder's glossary has ${plural(doc.count, "term")}. Choose how to bring the selected files in.`}
         actions={
           <Button size="sm" variant="secondary" onClick={closeUpdate}>
             ← Back to glossary
@@ -130,8 +131,10 @@ export function UpdateView({ view, doc }: { view: ProjectView; doc: GlossaryDoc 
               <h2 className="text-sm font-semibold text-foreground">Append to glossary</h2>
             </div>
             <p className="mb-4 text-[12.5px] text-muted-foreground">
-              Scan the selected files and add only terms you don&apos;t already have. Every existing
-              term keeps its current translation — including ones you edited by hand.
+              Scan the selected files and add only terms you don&apos;t already have.{" "}
+              {personalize
+                ? "Looking up names online then checks every term, so it can change existing ones too — including ones you edited by hand."
+                : "Every existing term keeps its current translation — including ones you edited by hand."}
             </p>
           </div>
 
@@ -154,8 +157,8 @@ export function UpdateView({ view, doc }: { view: ProjectView; doc: GlossaryDoc 
               <h2 className="text-sm font-semibold text-foreground">Re-generate from scratch</h2>
             </div>
             <p className="mb-3 text-[12.5px] text-muted-foreground">
-              Throw away all {doc.count} current terms and build a brand-new glossary from the
-              selected files. Anything you edited by hand is lost.
+              Throw away the current glossary ({plural(doc.count, "term")}) and build a brand-new one
+              from the selected files. Anything you edited by hand is lost.
             </p>
             <p className="text-[11px] text-muted-foreground">
               {backupNote} Whatever ends up in{" "}
@@ -174,7 +177,7 @@ export function UpdateView({ view, doc }: { view: ProjectView; doc: GlossaryDoc 
             onPersonalizeChange={setPersonalize}
             context={context}
             onContextChange={setContext}
-            normalizeHelp="Merges duplicate names and fixes inconsistent spellings."
+            normalizeHelp="Tidies the newly found terms: fixes inconsistent spellings and drops ones too generic to be useful."
           />
         </div>
 

@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import type { ProjectView } from "@/types/generated/ProjectView";
 import type { ReferenceTerminology } from "@/types/generated/ReferenceTerminology";
 import { ipc } from "@/lib/ipc";
+import { plural } from "@/lib/utils";
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { referenceKey, referenceStatusKey, useImportReference } from "./use-import-reference";
 import { PageHeader } from "@/components/page-header";
@@ -125,13 +126,13 @@ export function ReferenceReview({ view }: { view: ProjectView }) {
   return (
     <div className="flex h-full flex-col">
       <PageHeader
-        title={`Reference terms · ${total}${lastImport ? ` extracted from ${lastImport.files_processed} files` : ""}`}
+        title={`Reference terms · ${total}${lastImport ? ` extracted from ${plural(lastImport.files_processed, "file")}` : ""}`}
         description="These English terms guide extraction — delete anything wrong before it steers your glossary."
       />
       <div className="flex-1 overflow-auto p-5">
         {lastImport?.cancelled ? (
           <div className="mb-3 rounded-md border border-[color:var(--color-alert)]/40 bg-[color:var(--color-alert)]/10 px-4 py-2 text-[12px] text-[color:var(--color-alert)]">
-            Import cancelled — kept {total} terms.
+            Import cancelled — kept {plural(total, "term")}.
           </div>
         ) : null}
         {lastImport && lastImport.errors.length > 0 ? (
