@@ -106,8 +106,8 @@ jobs:
           esac
           ls -la dist-release
 
-      # The release page is the changelog, then the Downloads table, nothing
-      # else. Install and first-launch notes live in README.md. Every OS job
+      # The release page is the changelog, then the Downloads table and a link
+      # to the wiki, where install and first-launch notes live. Every OS job
       # writes the same notes, so whichever publishes last changes nothing.
       - name: Release notes
         shell: bash
@@ -134,6 +134,8 @@ jobs:
           | \`Polygluttony-$TAG-windows.exe\` | Windows 10/11 (x64) installer |
           | \`Polygluttony-$TAG-macos.zip\` | macOS (Apple Silicon) |
           | \`Polygluttony-$TAG-linux.AppImage\` | Linux x86_64, any distribution |
+
+          First launch, setup and everything else: [Getting started](https://github.com/blyat-uk/polygluttony/wiki/Getting-Started) in the wiki.
           EOF
           cat notes.md
 
