@@ -10,6 +10,7 @@ pub mod languages;
 pub mod projects;
 pub mod providers;
 pub mod store;
+pub mod transfer;
 
 use std::collections::BTreeMap;
 

@@ -43,6 +43,7 @@ tokio-util = "0.7.20"
 rand = "0.10.3"
 eventsource-stream = "0.2.3"
 notify = "8.2.0"
+zip = { version = "9.0.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 wiremock = "0.6"
