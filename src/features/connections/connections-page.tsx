@@ -1,5 +1,6 @@
 import { useId, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { DownloadSimple, UploadSimple } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import type { ConnectionsConfig } from "@/types/generated/ConnectionsConfig";
 import type { Model } from "@/types/generated/Model";
@@ -14,6 +15,7 @@ import { FlowStrip, type WebSearchNode } from "./flow-strip";
 import { OneModelCard } from "./one-model-card";
 import { PerStepView } from "./per-step-view";
 import { CardEyebrow, RoleCard, StatusDot } from "./role-card";
+import { useSetupTransfer } from "./setup-transfer";
 import { modelById } from "./steps";
 import {
   capabilitiesQuery,
@@ -23,10 +25,12 @@ import {
   useProviders,
 } from "./use-connections";
 
-/** Nothing set up → connect a model; then one model for every step, or a model per step. */
+/** Nothing set up → connect a model (or import a setup); then one model for every step, or a
+ *  model per step. The header carries a whole setup to and from another computer. */
 export function ConnectionsPage() {
   const config = useConnectionsConfig();
   const providers = useProviders();
+  const transfer = useSetupTransfer();
   const steps = config.data?.steps ?? null;
   const main = config.data && steps ? modelById(config.data, steps.translate.model) : undefined;
   const caps = useCapabilities(main?.provider, main?.model);
@@ -44,6 +48,14 @@ export function ConnectionsPage() {
     // Into it: the footer link that did it is gone too, so focus the pipeline.
     if (prevPerStep === false && perStep === true) setFocus("steps");
   }
+  // Setup → the card (a model connected, or a setup imported): the control that did it is
+  // gone with the setup card, so focus what replaced it.
+  const setup = config.data ? !steps || !main : undefined;
+  const [prevSetup, setPrevSetup] = useState(setup);
+  if (setup !== prevSetup) {
+    setPrevSetup(setup);
+    if (prevSetup === true && setup === false) setFocus(perStep ? "steps" : "edit");
+  }
 
   const error = config.error ?? providers.error;
   return (
@@ -51,6 +63,29 @@ export function ConnectionsPage() {
       <PageHeader
         title="Connections"
         description="The AI models that build your glossary and translate your subtitles."
+        actions={
+          <div className="flex shrink-0 items-center gap-2">
+            {/* aria-disabled, not disabled: a disabled button drops focus to the page. */}
+            <Button
+              size="sm"
+              variant="secondary"
+              aria-disabled={transfer.busy || undefined}
+              className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
+              onClick={() => void transfer.startImport()}
+            >
+              <UploadSimple className="size-4" /> Import…
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              aria-disabled={transfer.busy || undefined}
+              className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
+              onClick={() => void transfer.exportSetup()}
+            >
+              <DownloadSimple className="size-4" /> Export…
+            </Button>
+          </div>
+        }
       />
       <div className="px-5 py-5">
         <div className="mx-auto flex w-full max-w-[700px] flex-col gap-3">
@@ -60,7 +95,8 @@ export function ConnectionsPage() {
                 config={config.data}
                 providers={providers.data}
                 autoFocus={focus === "setup"}
-                onConnected={() => setFocus("edit")}
+                importing={transfer.busy}
+                onImport={() => void transfer.startImport()}
               />
             ) : config.data.per_step ? (
               <PerStepView
@@ -109,22 +145,28 @@ export function ConnectionsPage() {
           )}
         </div>
       </div>
+      {transfer.dialog}
     </div>
   );
 }
 
-/** First run: the connection form in the card it turns into. */
+/** First run: the connection form in the card it turns into, and a way to bring a setup over
+ *  instead. */
 function FirstRunCard({
   config,
   providers,
   autoFocus,
-  onConnected,
+  importing,
+  onImport,
 }: {
   config: ConnectionsConfig;
   providers: ProviderInfo[];
   /** Focus the first provider tile (the last model was just removed). */
   autoFocus: boolean;
-  onConnected: () => void;
+  /** An export or import is in flight. */
+  importing: boolean;
+  /** "Import your setup": the header's Import… flow. */
+  onImport: () => void;
 }) {
   const qc = useQueryClient();
   const titleId = useId();
@@ -154,12 +196,24 @@ function FirstRunCard({
           // Load what the model supports first, so the card it turns into paints whole.
           await qc.prefetchQuery(capabilitiesQuery(model.provider, model.model));
           await m.saveModel.mutateAsync({ model });
-          onConnected();
           const name = providerName(findProvider(providers, model.provider), model);
           if (tested) toast.success(`Connected to ${name}`);
           else toast.success(`Saved without confirming — ${name} didn’t answer the test.`);
         }}
       />
+      {stage === "pick" ? (
+        <div className="mt-4 border-t border-border pt-3 text-[12px] leading-5">
+          <span className="text-muted-foreground">Coming from another computer?</span>{" "}
+          <button
+            type="button"
+            aria-disabled={importing || undefined}
+            onClick={onImport}
+            className="rounded-md font-medium text-primary outline-none hover:underline focus-visible:ring-[3px] focus-visible:ring-ring/50 aria-disabled:pointer-events-none aria-disabled:opacity-60"
+          >
+            Import your setup
+          </button>
+        </div>
+      ) : null}
     </RoleCard>
   );
 }

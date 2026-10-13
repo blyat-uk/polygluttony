@@ -276,6 +276,11 @@ pub fn entry(id: PromptId) -> &'static Entry {
     e
 }
 
+/// The whole catalog, in display order.
+pub fn entries() -> &'static [Entry] {
+    &ENTRIES
+}
+
 pub fn default_text(id: PromptId) -> &'static str {
     entry(id).default
 }

@@ -112,6 +112,9 @@ pub fn run() {
             commands::save_prompt,
             commands::reset_prompt,
             commands::read_prompt_file,
+            commands::export_setup,
+            commands::inspect_setup,
+            commands::import_setup,
         ])
         // Tauri quits only once every window is gone, so an open episode
         // window would keep the app (and its run) alive with no way back to

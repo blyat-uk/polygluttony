@@ -16,6 +16,9 @@ pub use translate::*;
 pub mod prompts;
 pub use prompts::*;
 
+pub mod setup;
+pub use setup::*;
+
 use crate::models::AppInfo;
 
 /// Returns app/core metadata. Used by the webview as a startup health check for
