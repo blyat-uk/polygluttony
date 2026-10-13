@@ -26,6 +26,7 @@ import type { WorldType } from "@/types/generated/WorldType";
 import type { PromptId } from "@/types/generated/PromptId";
 import type { PromptMeta } from "@/types/generated/PromptMeta";
 import type { EpisodeView } from "@/types/generated/EpisodeView";
+import type { SetupSummary } from "@/types/generated/SetupSummary";
 
 /**
  * Typed wrappers around the Rust core's Tauri commands. The webview never talks
@@ -157,6 +158,15 @@ export const ipc = {
   resetPrompt: (id: PromptId) => invoke<string>("reset_prompt", { id }),
   /** Prompts — read a picked .txt file for "Load from file…" (≤1 MB, UTF-8). */
   readPromptFile: (path: string) => invoke<string>("read_prompt_file", { path }),
+  /** Setup — write the model library (with API keys), steps, default languages and edited
+   *  prompts to a zip at `path`. Recent folders stay out. */
+  exportSetup: (path: string) => invoke<void>("export_setup", { path }),
+  /** Setup — read and check an export, writing nothing: what it brings, and whether it
+   *  replaces anything here. Rejects when it isn't a Polygluttony export. */
+  inspectSetup: (path: string) => invoke<SetupSummary>("inspect_setup", { path }),
+  /** Setup — replace this install's config and edited prompts with an export's. Recent
+   *  folders and `default_workdir` stay. */
+  importSetup: (path: string) => invoke<SetupSummary>("import_setup", { path }),
 };
 
 /** Tells episode windows to refetch; payload `EpisodeChanged` (`file: null` = all). */
