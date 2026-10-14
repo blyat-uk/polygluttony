@@ -1,18 +1,30 @@
 //! Discover source `.ass` files in a folder and detect existing translations.
 //! Ported from `utils/file_utils.py`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::models::language_pair::{output_filename, warning_filename, LanguagePair};
+use crate::models::language_pair::{
+    output_filename, strip_language_suffix, warning_filename, LanguagePair,
+};
 
 /// All `.ass` files in `dir` (non-recursive) that are *source* files — not
-/// themselves translation outputs. Sorted by path.
+/// themselves translation outputs. A file tagged with the target language
+/// (`ep01.eng.ass`) is an output only when a source with the same base name
+/// sits beside it; on its own it's a source (an English `movie.en.ass` opened
+/// under a zh→en default). Sorted by path.
 pub fn discover_source_files(dir: &Path, pair: &LanguagePair) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return files;
+        return Vec::new();
     };
     let target_suffixes = pair.target_suffixes();
+    let target_tagged = |stem: &str| {
+        let lower = stem.to_lowercase();
+        target_suffixes
+            .iter()
+            .any(|suf| lower.ends_with(&format!(".{}", suf.to_lowercase())))
+    };
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -26,19 +38,29 @@ pub fn discover_source_files(dir: &Path, pair: &LanguagePair) -> Vec<PathBuf> {
         if !is_ass {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let lower = stem.to_lowercase();
-        if lower.contains(".warning.") {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if stem.to_lowercase().contains(".warning.") {
             continue;
         }
-        let is_translation = target_suffixes
-            .iter()
-            .any(|suf| lower.ends_with(&format!(".{}", suf.to_lowercase())));
-        if is_translation {
-            continue;
-        }
-        files.push(path);
+        candidates.push((path, stem));
     }
+    let source_bases: HashSet<String> = candidates
+        .iter()
+        .filter(|(_, stem)| !target_tagged(stem))
+        .map(|(_, stem)| strip_language_suffix(stem).to_lowercase())
+        .collect();
+    let mut files: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|(_, stem)| {
+            !target_tagged(stem)
+                || !source_bases.contains(&strip_language_suffix(stem).to_lowercase())
+        })
+        .map(|(path, _)| path)
+        .collect();
     files.sort();
     files
 }
@@ -81,5 +103,30 @@ mod tests {
         assert!(has_existing_translation(&p.join("ep01.ass"), &pair));
         assert!(has_existing_translation(&p.join("ep03.ass"), &pair));
         assert!(!has_existing_translation(&p.join("ep02.ass"), &pair));
+    }
+
+    #[test]
+    fn lone_target_tagged_file_is_a_source() {
+        // An English source opened under the default zh→en pair: `.en` matches
+        // the target suffix, but with no sibling source it isn't an output.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        for name in [
+            "movie.en.ass",
+            "movie.mkv",
+            "ep01.ass",
+            "ep01.eng.ass",
+            "ep02.chi.ass",
+            "ep02.en.ass",
+        ] {
+            fs::write(p.join(name), "x").unwrap();
+        }
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+
+        let names: Vec<String> = discover_source_files(p, &pair)
+            .iter()
+            .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["ep01.ass", "ep02.chi.ass", "movie.en.ass"]);
     }
 }
