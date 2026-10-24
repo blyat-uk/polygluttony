@@ -144,7 +144,7 @@ export function StatusBar() {
     : null;
 
   return (
-    <footer className="col-start-2 flex h-8 min-w-0 items-center gap-1.5 border-t border-border bg-[color:var(--color-bg-deepest)] px-2 text-[11px] text-muted-foreground [box-shadow:inset_0_1px_0_rgba(225,166,54,.10)]">
+    <footer className="col-start-2 flex h-8 min-w-0 items-center gap-1.5 overflow-hidden border-t [contain:inline-size] border-border bg-[color:var(--color-bg-deepest)] px-2 text-[11px] text-muted-foreground [box-shadow:inset_0_1px_0_rgba(225,166,54,.10)]">
       {folder ? (
         <>
           <Segment onClick={() => go("/episodes")} title={`${workdir} — open its episodes`}>
