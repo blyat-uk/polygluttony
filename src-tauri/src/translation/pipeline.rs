@@ -64,7 +64,7 @@ use crate::translation::output;
 use crate::translation::results::fingerprint;
 use crate::translation::source_detect::SourceDetector;
 use crate::translation::stop::{RunStop, StopCause};
-use crate::translation::verify::{verify_file, VerifyReport};
+use crate::translation::verify::{insert_by_line, name_issues, verify_file, VerifyReport};
 use crate::validation::drift;
 use crate::validation::scopes::{compute_scopes, is_full_file, Scope};
 use crate::validation::LinePair;
@@ -393,6 +393,12 @@ impl<'j, 'a> FileState<'j, 'a> {
             // Re-run cleanup after any retranslation (`translator.py:307-311`).
             self.run_cleanup(detector.as_ref()).await?;
         }
+
+        // Names: every line as it ends up, checked against the glossary
+        // whatever Verify decided. Review issues only: they never cause a
+        // retranslation (that already happened, or didn't, above).
+        issues.retain(|i| i.issue_type != "name");
+        insert_by_line(&mut issues, name_issues(&self.stripped_pairs(), &job.glossary.all_terms()));
 
         // 5. Final write.
         let untranslated = self.lines.len() - self.translations.len();
@@ -1068,9 +1074,14 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
     retranslated.sort_unstable();
     retranslated.dedup();
 
+    // The retranslated lines lose their issues (the model rewrote them), then
+    // get their names checked again against the glossary as it is now.
     let fixed: BTreeSet<u32> = retranslated.iter().copied().collect();
-    let issues: Vec<VerifyIssue> =
+    let mut issues: Vec<VerifyIssue> =
         review.issues.iter().filter(|i| !fixed.contains(&i.line_id)).cloned().collect();
+    let rechecked: BTreeMap<u32, (String, String)> =
+        st.stripped_pairs().into_iter().filter(|(id, _)| fixed.contains(id)).collect();
+    insert_by_line(&mut issues, name_issues(&rechecked, &job.glossary.all_terms()));
     let mut output_path = None;
     let mut output_hash = None;
     if !retranslated.is_empty() {
@@ -1165,15 +1176,16 @@ mod tests {
         responses: Vec<Result<String, crate::llm::error::LlmError>>,
         seed: Option<Seed>,
     ) -> Ran {
-        run_in(tempfile::tempdir().unwrap(), source, responses, seed).await
+        run_in(tempfile::tempdir().unwrap(), source, responses, seed, &Glossary::default()).await
     }
 
-    /// `run_with` in a folder the test prepared.
+    /// `run_with` in a folder the test prepared, with a glossary.
     async fn run_in(
         dir: tempfile::TempDir,
         source: &str,
         responses: Vec<Result<String, crate::llm::error::LlmError>>,
         seed: Option<Seed>,
+        glossary: &Glossary,
     ) -> Ran {
         let driver = ScriptedDriver::new(responses);
         let (tx, mut rx) = mpsc::channel(256);
@@ -1193,7 +1205,7 @@ mod tests {
             file_name: "ep01.ass".into(),
             svc: &svc,
             verify_svc: &svc,
-            glossary: &Glossary::default(),
+            glossary,
             pair: LanguagePair::from_codes("zh", "en").unwrap(),
             prompts: &prompts,
             batch_limit: Some(100),
@@ -2243,10 +2255,125 @@ mod tests {
         let src = ass_source(&["你好"]);
         std::fs::write(dir.path().join("ep01.warning.eng.ass"), "an older run's").unwrap();
         let script = vec![Ok(ok_batch(&[(1, "Hello there")])), Ok(r#"{"issues":[]}"#.into())];
-        let Ran { outcome, dir, .. } = run_in(dir, &src, script, None).await;
+        let Ran { outcome, dir, .. } = run_in(dir, &src, script, None, &Glossary::default()).await;
         assert_eq!(outcome.output_name.as_deref(), Some("ep01.eng.ass"));
         assert!(!dir.path().join("ep01.warning.eng.ass").exists());
         let bytes = std::fs::read(dir.path().join("ep01.eng.ass")).unwrap();
         assert_eq!(outcome.output_hash, Some(crate::translation::results::fingerprint_bytes(&bytes)));
+    }
+
+    fn glossary_of(terms: &[(&str, &str)]) -> Glossary {
+        let mut g = Glossary::new("xianxia");
+        for (s, t) in terms {
+            g.characters.insert(s.to_string(), t.to_string());
+        }
+        g
+    }
+
+    #[tokio::test]
+    async fn a_missing_name_is_flagged_without_a_retranslation() {
+        let src = ass_source(&["元清，我不信。", "走吧。"]);
+        let glossary = glossary_of(&[("元清", "Yuan Qing")]);
+        let script = vec![
+            Ok(ok_batch(&[(1, "Follow them."), (2, "Let's go.")])),
+            Ok(r#"{"issues":[]}"#.into()),
+        ];
+        let Ran { outcome, events, driver, dir, .. } =
+            run_in(tempfile::tempdir().unwrap(), &src, script, None, &glossary).await;
+        assert_eq!(driver.call_count(), 2, "one batch and one check: nothing translated again");
+        assert_eq!(outcome.end, FileEnd::NeedsLook);
+        let names: Vec<(u32, Option<&str>, Option<&str>)> = outcome
+            .result
+            .issues
+            .iter()
+            .map(|i| (i.line_id, i.term.as_deref(), i.expected.as_deref()))
+            .collect();
+        assert_eq!(names, [(1, Some("元清"), Some("Yuan Qing"))]);
+        assert_eq!(outcome.output_name.as_deref(), Some("ep01.warning.eng.ass"));
+        assert!(dir.path().join("ep01.warning.eng.ass").exists());
+        assert!(events.iter().any(|e| matches!(e, RunEvent::FileDone { has_warnings: true, issues, .. } if issues.len() == 1)));
+    }
+
+    #[tokio::test]
+    async fn a_name_written_in_any_case_is_fine() {
+        let src = ass_source(&["{\\an8}元清，我不信。"]);
+        let glossary = glossary_of(&[("元清", "Yuan Qing")]);
+        let script = vec![Ok(ok_batch(&[(1, "YUAN QING, I don't believe it.")])), Ok(r#"{"issues":[]}"#.into())];
+        let Ran { outcome, .. } = run_in(tempfile::tempdir().unwrap(), &src, script, None, &glossary).await;
+        assert_eq!(outcome.end, FileEnd::Done, "{:?}", outcome.result.issues);
+    }
+
+    #[tokio::test]
+    async fn a_review_checks_the_names_of_the_lines_it_retranslated() {
+        let src = ass_source(&["元清，我不信。", "林动，走吧。", "好。"]);
+        let driver =
+            ScriptedDriver::new(vec![Ok(ok_batch(&[(1, "Listen to me."), (2, "Lin Dong, let's go.")]))]);
+        let (tx, mut rx) = mpsc::channel(256);
+        let stop = RunStop::default();
+        let svc = LlmService::new(driver.clone(), 1, stop.token().clone(), tx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ep01.ass"), &src).unwrap();
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+        let prompts =
+            crate::prompts::TranslationPrompts::defaults(&pair, crate::config::projects::Tone::Standard);
+        let glossary = glossary_of(&[("元清", "Yuan Qing"), ("林动", "Lin Dong")]);
+        let issue = |line_id: u32, issue_type: &str, term: Option<&str>| VerifyIssue {
+            line_id,
+            source: String::new(),
+            translation: String::new(),
+            issue_type: issue_type.into(),
+            description: "d".into(),
+            severity: "high".into(),
+            term: term.map(String::from),
+            expected: None,
+        };
+        let outcome = retranslate_episode_lines(ReviewJob {
+            job: FileJob {
+                input: dir.path().join("ep01.ass"),
+                file_name: "ep01.ass".into(),
+                svc: &svc,
+                verify_svc: &svc,
+                glossary: &glossary,
+                pair,
+                prompts: &prompts,
+                batch_limit: Some(100),
+                stop,
+                tx,
+                seed: Some(Seed {
+                    source_hash: fingerprint(&src),
+                    translations: [(1, "Listen.".to_string()), (2, "Go.".to_string())].into(),
+                }),
+            },
+            line_ids: vec![1, 2],
+            output_name: "ep01.warning.eng.ass".into(),
+            output_hash: None,
+            issues: vec![
+                issue(1, "name", Some("元清")),
+                issue(1, "meaning", None),
+                issue(2, "name", Some("林动")),
+                issue(3, "untranslated", None),
+            ],
+            needs_look: true,
+        })
+        .await;
+        drop(svc);
+        while rx.recv().await.is_some() {}
+        assert_eq!(outcome.retranslated, [1, 2]);
+        let left: Vec<(u32, String, Option<String>)> = outcome
+            .result
+            .issues
+            .iter()
+            .map(|i| (i.line_id, i.issue_type.clone(), i.term.clone()))
+            .collect();
+        assert_eq!(
+            left,
+            [
+                // Still without the name: flagged again. Its meaning issue went.
+                (1, "name".to_string(), Some("元清".to_string())),
+                // Line 3 wasn't retranslated: still untranslated.
+                (3, "untranslated".to_string(), None),
+            ],
+            "line 2 has its name now"
+        );
     }
 }

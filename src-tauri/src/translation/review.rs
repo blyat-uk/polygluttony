@@ -14,7 +14,9 @@ use crate::error::{AppError, AppResult};
 use crate::events::{EpisodeLine, EpisodeSnapshot, EpisodeView, FileStateKind, LineStatus};
 use crate::models::language_pair::{output_filename, warning_filename, LanguagePair};
 use crate::translation::live::episode_sources;
+use crate::glossary::io::load_folder_glossary;
 use crate::translation::output;
+use crate::translation::verify::{insert_by_line, name_issues};
 use crate::translation::results::{
     fingerprint, now_ms, EpisodeOutcome, EpisodeRecord, ResultsStore, StoredLines, TermLines,
 };
@@ -165,8 +167,9 @@ fn finished<'a>(
 /// The user's own translation of one line, override tags kept: the source
 /// line's tags go back where they were, as the pipeline does; when the user
 /// typed tags of their own, those the typed text doesn't set already. Rewrites
-/// the output and clears the line's issues. Refused when the output changed
-/// on disk since Polygluttony wrote it.
+/// the output; the line's issues go, except the names it still misses (checked
+/// against the folder's glossary as it is now). Refused when the output
+/// changed on disk since Polygluttony wrote it.
 ///
 /// `free` says whether the episode may be edited now (no run has it). It is
 /// asked under the store's lock, so a review run that marks the episode
@@ -203,6 +206,12 @@ pub fn save_line_when(
             write_output(folder, file, &pair, &output_name, &source, &lines.translations)?;
         lines.output_hash = Some(hash);
         record.issues.retain(|i| i.line_id != line_id);
+        let terms = load_folder_glossary(folder).map(|g| g.all_terms()).unwrap_or_default();
+        let line = BTreeMap::from([(
+            line_id,
+            (strip_for_text(&raw.text), strip_for_text(&lines.translations[&line_id])),
+        )]);
+        insert_by_line(&mut record.issues, name_issues(&line, &terms));
         record.translated_lines = lines.translations.len() as u32;
         Ok(())
     })
@@ -634,6 +643,32 @@ mod tests {
         assert!(err.unwrap_err().to_string().contains("being translated"));
         let lines = fx.store.lines(fx.folder.path(), "ep01.ass").unwrap();
         assert_eq!(lines.translations[&2], "You go first.", "nothing written");
+    }
+
+    #[test]
+    fn a_saved_line_is_checked_for_its_names_again() {
+        let fx = fixture(EpisodeOutcome::NeedsLook);
+        let mut g = crate::glossary::model::Glossary::new("xianxia");
+        g.characters.insert("叶长生".into(), "Ye Changsheng".into());
+        crate::glossary::io::save_folder_glossary(fx.folder.path(), &g).unwrap();
+        let issues_on = |fx: &Fixture, line: u32| -> Vec<(String, Option<String>)> {
+            fx.store
+                .record(fx.folder.path(), "ep01.ass")
+                .unwrap()
+                .issues
+                .into_iter()
+                .filter(|i| i.line_id == line)
+                .map(|i| (i.issue_type, i.term))
+                .collect()
+        };
+
+        // Still without the name: its meaning issue goes, the name issue stays.
+        save_line(&fx.store, fx.folder.path(), "ep01.ass", 1, "He won't leave.").unwrap();
+        assert_eq!(issues_on(&fx, 1), [("name".to_string(), Some("叶长生".to_string()))]);
+        // With it: nothing left on the line.
+        save_line(&fx.store, fx.folder.path(), "ep01.ass", 1, "Ye Changsheng won't leave.").unwrap();
+        assert!(issues_on(&fx, 1).is_empty());
+        assert_eq!(issues_on(&fx, 3).len(), 1, "other lines keep theirs");
     }
 
     #[test]
