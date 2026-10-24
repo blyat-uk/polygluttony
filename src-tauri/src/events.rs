@@ -55,6 +55,43 @@ pub enum FileStateKind {
     Done,
     Warning,
     Failed,
+    /// The run stopped (by the user or an error) before this file finished.
+    /// Finished batches are kept, so Resume carries on from here.
+    Stopped,
+}
+
+/// What kind of failure an error was, so the UI can say what to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub enum ErrorKind {
+    /// The provider rejected the API key (401/403).
+    Auth,
+    /// Out of credit or over quota.
+    Billing,
+    /// Rate-limited and the retries ran out.
+    RateLimit,
+    /// The provider doesn't know the model.
+    Model,
+    /// Couldn't reach the provider at all.
+    Network,
+    /// The provider's servers failed (5xx).
+    Server,
+    Other,
+}
+
+/// Why a run ended early. Sent once, before `RunFinished`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct StopInfo {
+    /// True when the user pressed Stop.
+    pub by_user: bool,
+    /// One plain sentence for the banner, e.g. "Anthropic rejected the API
+    /// key used for Translate." Empty when `by_user`.
+    pub message: String,
+    pub kind: Option<ErrorKind>,
+    /// The step whose model failed, when known.
+    pub step: Option<crate::config::Step>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -89,6 +126,12 @@ pub struct VerifyIssue {
     pub issue_type: String,
     pub description: String,
     pub severity: String,
+    /// For `name` issues: the glossary source term the line should use.
+    #[serde(default)]
+    pub term: Option<String>,
+    /// For `name` issues: the translation the glossary expects.
+    #[serde(default)]
+    pub expected: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -115,10 +158,23 @@ pub struct FileResult {
 #[ts(export, export_to = "../../src/types/generated/")]
 pub enum RunEvent {
     State { file: String, state: FileStateKind, detail: Option<String> },
-    Progress { file: String, translated: u32, total: u32, batch: u32, total_batches: u32, retries: u32 },
+    Progress {
+        file: String,
+        translated: u32,
+        total: u32,
+        batch: u32,
+        total_batches: u32,
+        retries: u32,
+        /// Why the last retry happened, in plain words ("a reply came back incomplete").
+        retry_reason: Option<String>,
+    },
     Log { file: Option<String>, level: LogLevel, phase: LogPhase, message: String },
     FileDone { file: String, has_warnings: bool, issues: Vec<VerifyIssue> },
-    Error { file: String, message: String },
+    Error { file: String, message: String, error_kind: ErrorKind },
+    /// The run is ending early; sent once, before `RunFinished`.
+    Stopped { info: StopInfo },
+    /// A provider asked us to slow down; requests wait `seconds` first.
+    Throttled { seconds: u32, provider: String },
     RunFinished { results: Vec<FileResult> },
     /// The episode's dialogue lines, once parsed.
     #[ts(skip)]
@@ -148,6 +204,8 @@ impl RunEvent {
             | RunEvent::Log { .. }
             | RunEvent::FileDone { .. }
             | RunEvent::Error { .. }
+            | RunEvent::Stopped { .. }
+            | RunEvent::Throttled { .. }
             | RunEvent::RunFinished { .. } => false,
         }
     }
@@ -249,6 +307,8 @@ pub enum EpisodeView {
     /// In the run, but its source file couldn't be read.
     Unreadable { message: String },
     Live(EpisodeSnapshot),
+    /// A finished episode read back from the stored results, outside any run.
+    Stored(EpisodeSnapshot),
 }
 
 /// Channel for all step-4 glossary events.

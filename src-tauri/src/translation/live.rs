@@ -171,7 +171,10 @@ impl LiveBoard {
         let mut guard = self.lock();
         let Some(board) = guard.as_mut() else { return Change::Nothing };
         match event {
-            RunEvent::Progress { .. } | RunEvent::Log { .. } => Change::Nothing,
+            RunEvent::Progress { .. }
+            | RunEvent::Log { .. }
+            | RunEvent::Stopped { .. }
+            | RunEvent::Throttled { .. } => Change::Nothing,
             RunEvent::RunFinished { .. } => {
                 board.run_active = false;
                 board.episodes.iter_mut().for_each(Episode::settle);
@@ -187,7 +190,7 @@ impl LiveBoard {
             RunEvent::FileDone { file, issues, .. } => {
                 board.update(file, |ep| ep.issues = issues.clone())
             }
-            RunEvent::Error { file, message } => board.update(file, |ep| {
+            RunEvent::Error { file, message, .. } => board.update(file, |ep| {
                 ep.error = Some(message.clone());
                 ep.state = FileStateKind::Failed;
                 ep.settle();
@@ -446,7 +449,11 @@ mod tests {
         let board = board_with_lines(2);
         board.apply(&sending(&[1]));
         board.apply(&landed(&[(2, "Two")]));
-        board.apply(&RunEvent::Error { file: "ep01.ass".into(), message: "dead key".into() });
+        board.apply(&RunEvent::Error {
+            file: "ep01.ass".into(),
+            message: "dead key".into(),
+            error_kind: crate::events::ErrorKind::Auth,
+        });
         let snap = live(board.snapshot("ep01.ass"));
         assert_eq!(snap.state, FileStateKind::Failed);
         assert_eq!(snap.error.as_deref(), Some("dead key"));
@@ -478,6 +485,8 @@ mod tests {
             issue_type: "drift".into(),
             description: "d".into(),
             severity: "warning".into(),
+            term: None,
+            expected: None,
         };
         board.apply(&RunEvent::FileDone {
             file: "ep01.ass".into(),
@@ -497,6 +506,7 @@ mod tests {
             batch: 1,
             total_batches: 1,
             retries: 0,
+            retry_reason: None,
         };
         let log = RunEvent::Log {
             file: Some("ep01.ass".into()),

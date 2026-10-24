@@ -56,6 +56,10 @@ pub struct StartArgs {
     pub tone: Tone,
     pub source_lang: String,
     pub target_lang: String,
+    /// Carry on from the stored partial translations of stopped files.
+    // CONTRACT STUB: read once Resume lands.
+    #[allow(dead_code)]
+    pub resume: bool,
 }
 
 /// Verify on Translate's model with Translate's settings shares Translate's
@@ -251,6 +255,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
                         .send(RunEvent::Error {
                             file: name.clone(),
                             message,
+                            error_kind: events::ErrorKind::Other,
                         })
                         .await;
                     results.push(FileResult {

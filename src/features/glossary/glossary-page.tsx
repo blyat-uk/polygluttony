@@ -35,11 +35,13 @@ export function GlossaryPage() {
   const reviewOpen = useGlossaryRun((s) => s.reviewOpen);
   const updateOpen = useGlossaryRun((s) => s.updateOpen);
   const { data: view } = useProject(workdir ?? "");
-  const { data: doc, isPending } = useQuery({
+  const { data: load, isPending } = useQuery({
     queryKey: glossaryKey(workdir ?? ""),
     queryFn: () => ipc.loadGlossary(workdir ?? ""),
     enabled: !!workdir,
   });
+  // CONTRACT STUB: unreadable is treated as missing until the glossary UI lands.
+  const doc = load === undefined ? undefined : load.status === "ok" ? load.doc : null;
 
   // Run state is global; a run (or its results) belongs to the folder it was
   // started in. Reset only when the state belongs to a DIFFERENT folder —

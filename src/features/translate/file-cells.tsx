@@ -30,6 +30,8 @@ export function stateToCells(
       return reachedVerify
         ? { translated: "check", verified: "fail" }
         : { translated: "fail", verified: "none" };
+    case "stopped":
+      return { translated: "none", verified: "none" };
   }
 }
 

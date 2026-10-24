@@ -11,6 +11,7 @@ export const STATE_LABEL: Record<FileStateKind, string> = {
   done: "Done",
   warning: "Needs a look",
   failed: "Failed",
+  stopped: "Not finished",
 };
 
 export const STATE_COLOR: Record<FileStateKind, string> = {
@@ -22,6 +23,7 @@ export const STATE_COLOR: Record<FileStateKind, string> = {
   done: "var(--color-success)",
   warning: "var(--color-alert)",
   failed: "var(--color-danger)",
+  stopped: "var(--muted-foreground)",
 };
 
 /** Whether the state should pulse to indicate live activity. */

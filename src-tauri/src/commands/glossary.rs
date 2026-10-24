@@ -12,22 +12,50 @@ use crate::glossary::diff::GlossaryDiff;
 use crate::glossary::io::{
     import_glossary_file, load_folder_glossary, save_folder_glossary, GlossaryBackupInfo,
 };
-use crate::glossary::model::GlossaryDoc;
+use crate::glossary::meta::{
+    GlossaryChangeKind, GlossaryLoad, GlossaryMeta, GlossaryScope, GlossarySnapshot,
+};
+use crate::glossary::model::{Glossary, GlossaryDoc};
 use crate::glossary::normalize::{normalize_pass, NormalizeReview};
 use crate::glossary::reference::{self, ReferenceStatus, ReferenceSummary, ReferenceTerminology};
 use crate::glossary::run::{self, GlossaryOpKind, StartArgs};
 use crate::glossary::watch::{self, GlossaryWatchState};
 use crate::glossary::world_detector::WorldType;
 
-/// O9 — None when no glossary.json exists (or it's unreadable: lenient).
+/// O9 — the folder's glossary and its metadata; `missing` when there's no
+/// glossary.json, `unreadable` (with the line, when known) when it isn't valid.
+// CONTRACT STUB: meta is always the default; loading the sidecar is the
+// glossary engine's job.
 #[tauri::command]
-pub fn load_glossary(folder: String) -> Option<GlossaryDoc> {
-    load_folder_glossary(&PathBuf::from(folder)).map(|g| GlossaryDoc::from(&g))
+pub fn load_glossary(folder: String) -> GlossaryLoad {
+    let path = PathBuf::from(&folder).join("glossary.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return GlossaryLoad::Missing;
+    };
+    if let Err(e) = serde_json::from_str::<serde_json::Value>(&text) {
+        return GlossaryLoad::Unreadable { message: e.to_string(), line: Some(e.line() as u32) };
+    }
+    match Glossary::from_json(&text) {
+        Some(g) => GlossaryLoad::Ok { doc: GlossaryDoc::from(&g), meta: GlossaryMeta::default() },
+        None => GlossaryLoad::Unreadable {
+            message: "glossary.json isn't in the expected format".into(),
+            line: None,
+        },
+    }
 }
 
-/// O14 — atomic write; the UI auto-saves every term edit.
+/// O14 — atomic write; the UI auto-saves every term edit. `meta: None` leaves
+/// the sidecar as it is. `snapshot: Some(kind)` first saves the current
+/// glossary to the history, labelled with the change about to happen.
+// CONTRACT STUB: meta and snapshot are ignored until the glossary engine lands.
 #[tauri::command]
-pub fn save_glossary(folder: String, doc: GlossaryDoc) -> AppResult<()> {
+pub fn save_glossary(
+    folder: String,
+    doc: GlossaryDoc,
+    meta: Option<GlossaryMeta>,
+    snapshot: Option<GlossaryChangeKind>,
+) -> AppResult<()> {
+    let _ = (meta, snapshot);
     save_folder_glossary(&PathBuf::from(folder), &doc.into_glossary())
 }
 
@@ -78,7 +106,13 @@ pub async fn cancel_glossary_build(app: AppHandle) -> AppResult<()> {
 /// command still resolves Ok with a no-changes review — the UI must discard
 /// the resolved review after a user-cancel instead of presenting it.
 #[tauri::command]
-pub async fn normalize_glossary(app: AppHandle, folder: String) -> AppResult<NormalizeReview> {
+pub async fn normalize_glossary(
+    app: AppHandle,
+    folder: String,
+    scope: Option<GlossaryScope>,
+) -> AppResult<NormalizeReview> {
+    // CONTRACT STUB: scope (None = all) is ignored until the glossary engine lands.
+    let _ = scope;
     let dir = PathBuf::from(&folder);
     let original = load_folder_glossary(&dir)
         .ok_or_else(|| AppError::Other("no glossary to normalize".into()))?;
@@ -101,6 +135,34 @@ pub async fn normalize_glossary(app: AppHandle, folder: String) -> AppResult<Nor
         diff: GlossaryDiff::compute(Some(&original), &normalized),
         normalized: GlossaryDoc::from(&normalized),
     })
+}
+
+/// Look up names online on the glossary as it is — no subtitle files are
+/// read. Returns a review; nothing is saved. `scope: None` = all terms.
+#[tauri::command]
+pub async fn lookup_glossary_names(
+    app: AppHandle,
+    folder: String,
+    show_name: String,
+    scope: Option<GlossaryScope>,
+) -> AppResult<NormalizeReview> {
+    let _ = (app, folder, show_name, scope);
+    Err(AppError::Other("not implemented yet".into()))
+}
+
+/// The glossary's version history, newest first.
+#[tauri::command]
+pub fn list_glossary_snapshots(folder: String) -> AppResult<Vec<GlossarySnapshot>> {
+    let _ = folder;
+    Ok(Vec::new())
+}
+
+/// Bring back a snapshot. The current glossary is snapshotted first
+/// (reason `restore`), so a restore can itself be undone.
+#[tauri::command]
+pub fn restore_glossary_snapshot(folder: String, id: String) -> AppResult<()> {
+    let _ = (folder, id);
+    Err(AppError::Other("not implemented yet".into()))
 }
 
 /// O11 — extract reference terms from user-picked translated `.ass` files and

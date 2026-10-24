@@ -3,6 +3,10 @@ import type { TermDiff } from "./TermDiff";
 
 export type CategoryDiff = { 
 /**
+ * Category key ("characters"), as used in `GlossaryDoc::terms`.
+ */
+key: string, 
+/**
  * Display label ("Characters", "Cultivation", …).
  */
 name: string, terms: Array<TermDiff>, added: number, removed: number, modified: number, unchanged: number, };

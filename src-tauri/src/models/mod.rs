@@ -74,7 +74,24 @@ pub struct SourceFile {
     pub path: String,
     pub name: String,
     pub dialogue_count: u32,
+    /// Any translation output exists (clean or `.warning`).
     pub has_translation: bool,
+    /// What's on disk for this file.
+    pub translation: TranslationState,
+    /// Both the clean and the `.warning` output exist (an old leftover).
+    pub both_variants: bool,
+}
+
+/// What translation output exists next to a source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub enum TranslationState {
+    None,
+    /// A clean output exists.
+    Done,
+    /// Only a `.warning` output exists.
+    NeedsLook,
 }
 
 /// Result of opening a folder (O6/O7/O8 bundled).

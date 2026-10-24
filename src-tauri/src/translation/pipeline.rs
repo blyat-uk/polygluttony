@@ -92,7 +92,13 @@ pub async fn translate_file(job: FileJob<'_>) -> FileResult {
     match run(job).await {
         Ok(result) => result,
         Err(message) => {
-            let _ = tx.send(RunEvent::Error { file: file.clone(), message }).await;
+            let _ = tx
+                .send(RunEvent::Error {
+                    file: file.clone(),
+                    message,
+                    error_kind: crate::events::ErrorKind::Other,
+                })
+                .await;
             let _ = tx
                 .send(RunEvent::State {
                     file: file.clone(),
@@ -252,6 +258,8 @@ async fn run(job: FileJob<'_>) -> Result<FileResult, String> {
                 issue_type: "untranslated".into(),
                 description: "line was not translated".into(),
                 severity: "warning".into(),
+                term: None,
+                expected: None,
             });
         }
         if missing.len() > MAX_UNTRANSLATED_ISSUES {
@@ -265,6 +273,8 @@ async fn run(job: FileJob<'_>) -> Result<FileResult, String> {
                     missing.len() - MAX_UNTRANSLATED_ISSUES
                 ),
                 severity: "warning".into(),
+                term: None,
+                expected: None,
             });
         }
     }
@@ -382,6 +392,7 @@ impl FileState<'_, '_> {
             batch,
             total_batches,
             retries: self.retries,
+            retry_reason: None,
         })
         .await;
     }

@@ -74,6 +74,8 @@ pub async fn verify_file(
                 issue_type: "drift".into(),
                 description: "the translation starts drifting from the original here".into(),
                 severity: "high".into(),
+                term: None,
+                expected: None,
             }],
             sampled_line_ids: Vec::new(),
             failed_line_ids: d.flagged_line_ids.into_iter().collect(),
@@ -129,6 +131,8 @@ pub async fn verify_file(
                     .unwrap_or("flagged by verifier")
                     .to_string(),
                 severity: "high".into(),
+                term: None,
+                expected: None,
             });
         }
     }

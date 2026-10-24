@@ -12,7 +12,8 @@ use crate::config::store as config_store;
 use crate::error::{AppError, AppResult};
 use crate::glossary::world_detector::detect;
 use crate::models::language_pair::LanguagePair;
-use crate::models::{ProjectView, SourceFile};
+use crate::models::language_pair::{output_filename, warning_filename};
+use crate::models::{ProjectView, SourceFile, TranslationState};
 use crate::utils::discover::{discover_source_files, has_existing_translation};
 
 #[tauri::command]
@@ -165,7 +166,17 @@ fn analyze_folder(dir: &Path, pair: &LanguagePair) -> Analyzed {
             combined.push_str(&strip_for_text(&d.text));
             combined.push('\n');
         }
+        let dir_of = src.parent().unwrap_or_else(|| Path::new("."));
+        let clean = dir_of.join(output_filename(&src, pair)).exists();
+        let warning = dir_of.join(warning_filename(&src, pair)).exists();
+        let translation = match (clean, warning) {
+            (true, _) => TranslationState::Done,
+            (false, true) => TranslationState::NeedsLook,
+            (false, false) => TranslationState::None,
+        };
         files.push(SourceFile {
+            translation,
+            both_variants: clean && warning,
             name: src
                 .file_name()
                 .and_then(|s| s.to_str())
