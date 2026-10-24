@@ -35,8 +35,10 @@ pub fn load_glossary(folder: String) -> GlossaryLoad {
 }
 
 fn load_folder(dir: &Path) -> GlossaryLoad {
-    let Ok(text) = std::fs::read_to_string(dir.join("glossary.json")) else {
-        return GlossaryLoad::Missing;
+    let text = match std::fs::read_to_string(dir.join("glossary.json")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return GlossaryLoad::Missing,
+        Err(e) => return GlossaryLoad::Unreadable { message: read_failure(&e), line: None },
     };
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&text) {
         return GlossaryLoad::Unreadable { message: e.to_string(), line: Some(e.line() as u32) };
@@ -54,18 +56,43 @@ fn load_folder(dir: &Path) -> GlossaryLoad {
     }
 }
 
+/// Why glossary.json is there but couldn't be read, as one plain sentence.
+fn read_failure(e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::InvalidData => {
+            "glossary.json isn't plain text (UTF-8), so it can't be read. Save it as UTF-8 in your editor."
+                .into()
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            "Polygluttony isn't allowed to read glossary.json. Check the file's permissions.".into()
+        }
+        _ => format!("glossary.json couldn't be read ({e})."),
+    }
+}
+
 /// O14 — atomic write; the UI auto-saves every term edit. `meta: None` leaves
 /// the sidecar as it is. `snapshot: Some(kind)` first saves the current
 /// glossary (and meta) to the history, labelled with the change about to
 /// happen; when that fails nothing is written.
+///
+/// Refused while a build or an import is rewriting this glossary: the
+/// build's final save would drop the edit. The op slot stays locked through
+/// the write, so no build can start halfway through it.
 #[tauri::command]
-pub fn save_glossary(
+pub async fn save_glossary(
+    app: AppHandle,
     folder: String,
     doc: GlossaryDoc,
     meta: Option<GlossaryMeta>,
     snapshot: Option<GlossaryChangeKind>,
 ) -> AppResult<()> {
-    save_folder(&PathBuf::from(folder), doc, meta, snapshot)
+    let dir = PathBuf::from(folder);
+    let state = app.state::<run::GlossaryRunState>();
+    let op = state.0.lock().await;
+    run::refuse_while_rewritten(op.as_ref(), &dir)?;
+    let saved = super::blocking(move || save_folder(&dir, doc, meta, snapshot)).await;
+    drop(op);
+    saved
 }
 
 fn save_folder(
@@ -163,7 +190,7 @@ pub async fn normalize_glossary(
     let conn = config_store::step_connection(&cfg, Step::Normalize)?;
     let templates =
         crate::prompts::GlossaryPrompts::resolve_normalize(&crate::prompts::overrides_dir(&app)?)?;
-    let cancel = run::claim_slot(&app, GlossaryOpKind::Normalize).await?;
+    let cancel = run::claim_slot(&app, GlossaryOpKind::Normalize, &dir).await?;
     // RAII: the guard releases the slot on every exit path, including panics.
     // Declared before svc/tx so it drops last (after their senders close).
     let _guard = run::SlotGuard::new(app.clone());
@@ -208,7 +235,7 @@ pub async fn lookup_glossary_names(
         crate::prompts::PromptId::GlossaryPersonalize,
         &crate::prompts::overrides_dir(&app)?,
     )?;
-    let cancel = run::claim_slot(&app, GlossaryOpKind::LookUp).await?;
+    let cancel = run::claim_slot(&app, GlossaryOpKind::LookUp, &dir).await?;
     // Declared before svc/tx so it drops last (after their senders close).
     let _guard = run::SlotGuard::new(app.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -225,10 +252,17 @@ pub fn list_glossary_snapshots(folder: String) -> AppResult<Vec<GlossarySnapshot
 }
 
 /// Bring back a snapshot. The current glossary is snapshotted first
-/// (reason `restore`), so a restore can itself be undone.
+/// (reason `restore`), so a restore can itself be undone. Refused while a
+/// build or an import is rewriting this glossary, as `save_glossary` is.
 #[tauri::command]
-pub fn restore_glossary_snapshot(folder: String, id: String) -> AppResult<()> {
-    history::restore(&PathBuf::from(folder), &id)
+pub async fn restore_glossary_snapshot(app: AppHandle, folder: String, id: String) -> AppResult<()> {
+    let dir = PathBuf::from(folder);
+    let state = app.state::<run::GlossaryRunState>();
+    let op = state.0.lock().await;
+    run::refuse_while_rewritten(op.as_ref(), &dir)?;
+    let restored = super::blocking(move || history::restore(&dir, &id)).await;
+    drop(op);
+    restored
 }
 
 /// O11 — extract reference terms from user-picked translated `.ass` files and
@@ -250,7 +284,7 @@ pub async fn import_reference_files(
         crate::prompts::PromptId::ReferenceExtract,
         &crate::prompts::overrides_dir(&app)?,
     )?;
-    let cancel = run::claim_slot(&app, GlossaryOpKind::Import).await?;
+    let cancel = run::claim_slot(&app, GlossaryOpKind::Reference, &dir).await?;
     // RAII: the guard releases the slot on every exit path, including panics.
     // Declared before svc/tx so it drops last (after their senders close).
     let _guard = run::SlotGuard::new(app.clone());
@@ -305,10 +339,11 @@ pub fn save_reference(folder: String, terms: ReferenceTerminology) -> AppResult<
 /// and reference import.
 #[tauri::command]
 pub async fn import_glossary(app: AppHandle, folder: String, src: String) -> AppResult<u32> {
-    run::claim_slot(&app, GlossaryOpKind::Import).await?;
+    let dir = PathBuf::from(folder);
+    run::claim_slot(&app, GlossaryOpKind::Import, &dir).await?;
     // RAII: the guard releases the slot on every exit path, including panics.
     let _guard = run::SlotGuard::new(app.clone());
-    import_glossary_file(&PathBuf::from(folder), &PathBuf::from(src))
+    import_glossary_file(&dir, &PathBuf::from(src))
 }
 
 /// Plain file copy; the UI supplies `dest` from a save dialog.
@@ -399,6 +434,49 @@ mod tests {
     }
 
     #[test]
+    fn a_glossary_that_is_there_but_cant_be_read_is_unreadable_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not UTF-8 (GBK bytes, as an old Windows editor might save it).
+        std::fs::write(dir.path().join("glossary.json"), [0xC1u8, 0xD6, 0xB6, 0xAF]).unwrap();
+        match load_folder(dir.path()) {
+            GlossaryLoad::Unreadable { message, line } => {
+                assert_eq!(line, None);
+                assert!(message.contains("UTF-8"), "{message}");
+            }
+            other => panic!("expected unreadable, got {other:?}"),
+        }
+        // Something that isn't a file at all.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir(other.path().join("glossary.json")).unwrap();
+        match load_folder(other.path()) {
+            GlossaryLoad::Unreadable { message, line } => {
+                assert_eq!(line, None);
+                assert!(message.starts_with("glossary.json couldn't be read"), "{message}");
+            }
+            other => panic!("expected unreadable, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_glossary_without_read_permission_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glossary.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            return; // running as root: permissions don't apply
+        }
+        match load_folder(dir.path()) {
+            GlossaryLoad::Unreadable { message, .. } => {
+                assert!(message.contains("isn't allowed"), "{message}")
+            }
+            other => panic!("expected unreadable, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn load_returns_the_sidecar_meta() {
         let dir = tempfile::tempdir().unwrap();
         save_folder(dir.path(), doc(&[("林动", "Lin Dong")]), Some(meta_with_origin("林动")), None)
@@ -468,8 +546,7 @@ mod tests {
         assert_eq!(snaps[0].count, 1);
         assert!(load_meta(dir.path()).origins.is_empty(), "the new meta was written");
 
-        restore_glossary_snapshot(dir.path().to_string_lossy().into(), snaps[0].id.clone())
-            .unwrap();
+        history::restore(dir.path(), &snaps[0].id).unwrap();
         assert_eq!(load_meta(dir.path()).origins["characters"]["林动"], TermOrigin::Yours);
         assert_eq!(load_folder_glossary(dir.path()).unwrap().count(), 1);
     }
