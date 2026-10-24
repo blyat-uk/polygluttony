@@ -230,11 +230,19 @@ mod tests {
         for name in [
             "ep01.eng.ass",
             "ep02.warning.eng.ass",
-            "ep04.eng.ass",
             "ep04.warning.eng.ass",
+            "ep04.eng.ass",
         ] {
             fs::write(p.join(name), "x").unwrap();
         }
+        // The leftover warning file is the older one.
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        fs::File::options()
+            .write(true)
+            .open(p.join("ep04.warning.eng.ass"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         dir
     }
 

@@ -61,7 +61,8 @@ use crate::models::language_pair::LanguagePair;
 use crate::prompts::TranslationPrompts;
 use crate::translation::live::LiveBoard;
 use crate::translation::pipeline::{
-    retranslate_episode_lines, translate_file, FileEnd, FileJob, FileOutcome, ReviewJob, Seed,
+    retranslate_episode_lines, translate_file, FileEnd, FileJob, FileOutcome, ReviewJob,
+    ReviewOutcome, Seed,
 };
 use crate::translation::results::{
     now_ms, EpisodeOutcome, EpisodeRecord, ResultsStore, StoredLines,
@@ -283,6 +284,7 @@ pub fn store_outcome(
             source_hash: hash.clone(),
             total_lines: result.total_lines,
             translations: outcome.translations.clone(),
+            output_hash: outcome.output_hash.clone(),
         }),
         _ => None,
     };
@@ -299,11 +301,15 @@ pub fn store_outcome(
     store.put_episode(folder, record, lines.as_ref())
 }
 
-/// Pure: the stored partial translations of the stopped files among `files`.
+/// Pure: the stored partial translations of the stopped files among `files`,
+/// when they were made for this run's languages and tone from the source as
+/// it is now. Any other stopped file is translated from the start. Decodes
+/// the sources: call it off the async threads.
 pub fn resume_seeds(
     store: &ResultsStore,
     folder: &Path,
     files: &[String],
+    meta: &RunMeta,
 ) -> HashMap<String, Seed> {
     let results = store.results(folder);
     files
@@ -316,7 +322,14 @@ pub fn resume_seeds(
         })
         .filter_map(|f| {
             let lines = store.lines(folder, f)?;
-            // Only lines made from the source as it is now.
+            // Only lines made for this language pair and tone…
+            let same_run = lines.source_lang == meta.source_lang
+                && lines.target_lang == meta.target_lang
+                && lines.tone == meta.tone;
+            if !same_run {
+                return None;
+            }
+            // …from the source as it is now.
             let source = crate::ass::decode::decode_file(&folder.join(f)).ok()?;
             if crate::translation::results::fingerprint(&source) != lines.source_hash {
                 return None;
@@ -473,12 +486,6 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     let pair = LanguagePair::from_codes(&args.source_lang, &args.target_lang)?;
     let prompts = prompts(&app, &pair, args.tone)?;
     let store = ResultsStore::for_app(&app)?;
-    let seeds = if args.resume {
-        resume_seeds(&store, &folder, &args.files)
-    } else {
-        HashMap::new()
-    };
-    let seeds = Arc::new(std::sync::Mutex::new(seeds));
     let meta = RunMeta {
         source_lang: pair.source.clone(),
         target_lang: pair.target.clone(),
@@ -489,6 +496,18 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         stop: kit.stop.clone(),
     });
     drop(guard);
+    // Resume reads every stopped file: on a blocking thread, with the run
+    // slot already taken and its lock let go.
+    let seeds = if args.resume {
+        let (store, folder, files, meta) =
+            (store.clone(), folder.clone(), args.files.clone(), meta.clone());
+        tauri::async_runtime::spawn_blocking(move || resume_seeds(&store, &folder, &files, &meta))
+            .await
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let seeds = Arc::new(std::sync::Mutex::new(seeds));
     {
         let seeds = seeds.lock().unwrap_or_else(|e| e.into_inner());
         reset_board(
@@ -626,6 +645,7 @@ fn plan_review(
             "{file} changed since it was translated. Translate it again to review it."
         )));
     }
+    crate::translation::output::check_unchanged(folder, &output_name, lines.output_hash.as_deref())?;
     Ok(ReviewPlan {
         line_ids,
         output_name,
@@ -635,44 +655,102 @@ fn plan_review(
     })
 }
 
+/// Pure: store what a review run did to an episode: its translations and
+/// output fingerprint now, and for the lines it retranslated the issues the
+/// review found (their names, checked again); other lines keep theirs.
+fn store_review(
+    store: &ResultsStore,
+    folder: &Path,
+    file: &str,
+    outcome: &ReviewOutcome,
+) -> AppResult<()> {
+    let fixed: std::collections::BTreeSet<u32> = outcome.retranslated.iter().copied().collect();
+    store.edit_episode(folder, file, |record, lines| {
+        if let Some(lines) = lines {
+            lines.translations = outcome.translations.clone();
+            lines.output_hash = outcome.output_hash.clone();
+        }
+        record.issues.retain(|i| !fixed.contains(&i.line_id));
+        let rechecked: Vec<_> =
+            outcome.result.issues.iter().filter(|i| fixed.contains(&i.line_id)).cloned().collect();
+        crate::translation::verify::insert_by_line(&mut record.issues, rechecked);
+        record.translated_lines = outcome.translations.len() as u32;
+        record.finished_ms = now_ms();
+        Ok(())
+    })
+}
+
+/// Every reviewed episode's plan, with its language pair and prompts.
+type Plans = HashMap<String, (ReviewPlan, LanguagePair, Arc<TranslationPrompts>)>;
+
+/// Check every job against the store (on a blocking thread: it decodes the
+/// sources) and resolve each episode's prompts.
+async fn plan_all(
+    app: &AppHandle,
+    store: &ResultsStore,
+    folder: &Path,
+    jobs: Vec<(String, Vec<u32>)>,
+) -> AppResult<Plans> {
+    let (store, folder) = (store.clone(), folder.to_path_buf());
+    let planned = tauri::async_runtime::spawn_blocking(move || {
+        jobs.into_iter()
+            .map(|(file, ids)| Ok((file.clone(), plan_review(&store, &folder, &file, ids)?)))
+            .collect::<AppResult<Vec<_>>>()
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("Something went wrong inside Polygluttony: {e}")))??;
+    let mut plans = HashMap::new();
+    for (file, plan) in planned {
+        let pair = LanguagePair::from_codes(&plan.lines.source_lang, &plan.lines.target_lang)?;
+        let prompts = prompts(app, &pair, plan.lines.tone)?;
+        plans.insert(file, (plan, pair, prompts));
+    }
+    Ok(plans)
+}
+
 /// A review run: retranslate chosen lines of finished episodes (with their
 /// neighbours as context), rewrite each output and update its stored lines
 /// and issues. `jobs` is file → line ids.
+///
+/// The episodes are marked running on the board BEFORE their stored lines
+/// are read, so a line saved meanwhile is either read here or refused; it
+/// can't land in between and be overwritten by the run.
 pub async fn start_review(
     app: AppHandle,
     folder: String,
     jobs: Vec<(String, Vec<u32>)>,
 ) -> AppResult<()> {
+    if jobs.is_empty() {
+        return Err(AppError::Other("Nothing to retranslate.".into()));
+    }
     let mut guard = claim(&app).await?;
     let folder_path = PathBuf::from(&folder);
     let store = ResultsStore::for_app(&app)?;
-    let mut plans: HashMap<String, (ReviewPlan, LanguagePair, Arc<TranslationPrompts>)> =
-        HashMap::new();
-    let mut files = Vec::new();
-    for (file, ids) in jobs {
-        let plan = plan_review(&store, &folder_path, &file, ids)?;
-        let pair = LanguagePair::from_codes(&plan.lines.source_lang, &plan.lines.target_lang)?;
-        let prompts = prompts(&app, &pair, plan.lines.tone)?;
-        files.push(file.clone());
-        plans.insert(file, (plan, pair, prompts));
-    }
-    if files.is_empty() {
-        return Err(AppError::Other("Nothing to retranslate.".into()));
-    }
     let (kit, rx) = kit(&app, &folder_path)?;
-
     *guard = Some(RunHandle {
         stop: kit.stop.clone(),
     });
     drop(guard);
-    reset_board(
-        &app,
-        &folder_path,
-        &files,
-        plans
-            .iter()
-            .map(|(f, (plan, _, _))| (f, &plan.lines.translations)),
-    );
+
+    let files: Vec<String> = jobs.iter().map(|(file, _)| file.clone()).collect();
+    let board = app.state::<LiveBoard>();
+    let previous = board.replace(&folder_path, &files);
+    let plans = match plan_all(&app, &store, &folder_path, jobs).await {
+        Ok(plans) => plans,
+        Err(e) => {
+            // The run never starts: the last board and a free slot again.
+            board.put_back(previous);
+            *app.state::<RunState>().0.lock().await = None;
+            return Err(e);
+        }
+    };
+    for (file, (plan, _, _)) in &plans {
+        board.prime(
+            file,
+            plan.lines.translations.iter().map(|(id, t)| (*id, strip_for_text(t))),
+        );
+    }
+    let _ = app.emit(EPISODE_CHANGED_EVENT, EpisodeChanged { file: None });
     spawn_forwarder(app.clone(), rx);
 
     let plans = Arc::new(std::sync::Mutex::new(plans));
@@ -719,23 +797,13 @@ pub async fn start_review(
                     },
                     line_ids: plan.line_ids,
                     output_name: plan.output_name,
+                    output_hash: plan.lines.output_hash.clone(),
                     issues: plan.issues,
                     needs_look: plan.needs_look,
                 })
                 .await;
                 if outcome.failed.is_none() && !outcome.retranslated.is_empty() {
-                    let fixed: std::collections::BTreeSet<u32> =
-                        outcome.retranslated.iter().copied().collect();
-                    let stored = store.edit_episode(&folder_path, &name, |record, lines| {
-                        if let Some(lines) = lines {
-                            lines.translations = outcome.translations.clone();
-                        }
-                        record.issues.retain(|i| !fixed.contains(&i.line_id));
-                        record.translated_lines = outcome.translations.len() as u32;
-                        record.finished_ms = now_ms();
-                        Ok(())
-                    });
-                    if let Err(e) = stored {
+                    if let Err(e) = store_review(&store, &folder_path, &name, &outcome) {
                         tracing::warn!("couldn't store {name}'s review: {e}");
                     }
                     results_changed(&app, &folder, &name);
@@ -843,6 +911,7 @@ mod tests {
                 .map(|(id, t)| (*id, t.to_string()))
                 .collect(),
             source_hash: Some(crate::translation::results::fingerprint(SRC)),
+            output_hash: None,
         }
     }
 
@@ -950,7 +1019,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let seeds = resume_seeds(&store, folder.path(), &files);
+        let seeds = resume_seeds(&store, folder.path(), &files, &meta());
         assert_eq!(seeds.keys().collect::<Vec<_>>(), ["stopped.ass"]);
         assert_eq!(
             seeds["stopped.ass"].source_hash,
@@ -959,7 +1028,28 @@ mod tests {
         assert_eq!(seeds["stopped.ass"].translations.len(), 2);
         // A source that changed since keeps nothing: it starts over.
         std::fs::write(folder.path().join("stopped.ass"), "[Events]\n").unwrap();
-        assert!(resume_seeds(&store, folder.path(), &files).is_empty());
+        assert!(resume_seeds(&store, folder.path(), &files, &meta()).is_empty());
+    }
+
+    #[test]
+    fn resume_starts_over_in_another_language_or_tone() {
+        let data = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let store = ResultsStore::at(data.path());
+        let stop = RunStop::default();
+        stop.by_user();
+        let stopped = outcome("stopped.ass", FileEnd::Stopped, &[(1, "a")]);
+        store_outcome(&store, folder.path(), &stopped, &meta(), &stop).unwrap();
+        std::fs::write(folder.path().join("stopped.ass"), SRC).unwrap();
+        let files = vec!["stopped.ass".to_string()];
+        assert_eq!(resume_seeds(&store, folder.path(), &files, &meta()).len(), 1);
+
+        let other_target = RunMeta { target_lang: "fr".into(), ..meta() };
+        let other_source = RunMeta { source_lang: "ja".into(), ..meta() };
+        let other_tone = RunMeta { tone: Tone::Standard, ..meta() };
+        for run in [other_target, other_source, other_tone] {
+            assert!(resume_seeds(&store, folder.path(), &files, &run).is_empty(), "{run:?}");
+        }
     }
 
     #[test]
@@ -1007,6 +1097,68 @@ mod tests {
         assert!(plan.needs_look);
         assert_eq!(plan.output_name, "look.ass.out");
         assert_eq!(plan.issues.len(), 1);
+
+        // The output was edited by hand since it was written: not overwritten.
+        std::fs::write(folder.path().join("look.ass.out"), "fixed by hand").unwrap();
+        store
+            .edit_episode(folder.path(), "look.ass", |_, lines| {
+                lines.as_mut().unwrap().output_hash =
+                    Some(crate::translation::results::fingerprint_bytes(b"as written"));
+                Ok(())
+            })
+            .unwrap();
+        assert!(err(plan_review(&store, folder.path(), "look.ass", vec![3]))
+            .starts_with("look.ass.out was changed outside Polygluttony"));
+    }
+
+    #[test]
+    fn a_stored_review_replaces_only_the_retranslated_lines_issues() {
+        let data = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let store = ResultsStore::at(data.path());
+        let issue = |line_id: u32, issue_type: &str, term: Option<&str>| VerifyIssue {
+            line_id,
+            source: String::new(),
+            translation: String::new(),
+            issue_type: issue_type.into(),
+            description: "d".into(),
+            severity: "high".into(),
+            term: term.map(String::from),
+            expected: None,
+        };
+        let mut look = outcome("look.ass", FileEnd::NeedsLook, &[(1, "a"), (2, "b")]);
+        look.result.issues = vec![
+            issue(1, "name", Some("元清")),
+            issue(1, "meaning", None),
+            issue(2, "meaning", None),
+            issue(3, "untranslated", None),
+        ];
+        store_outcome(&store, folder.path(), &look, &meta(), &RunStop::default()).unwrap();
+
+        let review = ReviewOutcome {
+            result: FileResult {
+                file: "look.ass".into(),
+                success: true,
+                total_lines: 3,
+                translated_lines: 2,
+                has_warnings: true,
+                // Line 1 still misses its name; line 2's issues are gone.
+                issues: vec![issue(1, "name", Some("元清")), issue(3, "untranslated", None)],
+                output_path: None,
+            },
+            translations: [(1, "Listen to me.".to_string()), (2, "Go.".to_string())].into(),
+            retranslated: vec![1, 2],
+            output_hash: Some("h".into()),
+            failed: None,
+        };
+        store_review(&store, folder.path(), "look.ass", &review).unwrap();
+        let record = store.record(folder.path(), "look.ass").unwrap();
+        let left: Vec<(u32, &str)> =
+            record.issues.iter().map(|i| (i.line_id, i.issue_type.as_str())).collect();
+        assert_eq!(left, [(1, "name"), (3, "untranslated")]);
+        let lines = store.lines(folder.path(), "look.ass").unwrap();
+        assert_eq!(lines.translations[&1], "Listen to me.");
+        assert_eq!(lines.output_hash.as_deref(), Some("h"));
     }
 
     #[tokio::test]

@@ -20,6 +20,8 @@ use crate::translation::results::{FolderResults, ResultsStore, TermLines};
 use crate::translation::review;
 use crate::translation::run::{self, StartArgs};
 
+use super::blocking;
+
 // JS-side key casing: Tauri v2's #[tauri::command] macro converts every Rust
 // snake_case parameter name to lowerCamelCase before matching against the
 // JSON payload — see tauri-macros/src/command/wrapper.rs lines 505-508
@@ -84,13 +86,29 @@ pub async fn episode_snapshot(
 /// both build one.
 static OPENING_EPISODE_WINDOW: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// Window label for an episode. Labels allow only a few characters and a file
-/// name may hold anything, so hash it; stable within a process, which is all
-/// "focus the open window" needs.
-fn episode_window_label(file: &str) -> String {
+/// Window label for an episode: its folder (as the window is opened with it;
+/// `None` = the run's) and file name, so `01.ass` of Season 2 doesn't land in
+/// Season 1's window. Labels allow only a few characters and names may hold
+/// anything, so hash them; stable within a process, which is all "focus the
+/// open window" needs. The `episode-` prefix is what the episode capability
+/// matches.
+fn episode_window_label(folder: Option<&str>, file: &str) -> String {
     let mut hasher = DefaultHasher::new();
-    file.hash(&mut hasher);
+    (folder, file).hash(&mut hasher);
     format!("episode-{:016x}", hasher.finish())
+}
+
+/// An episode window's title: the file, and the folder it's from when known
+/// ("01.ass · Season 2 — Polygluttony").
+fn episode_window_title(folder: Option<&str>, file: &str) -> String {
+    let folder_name = folder
+        .and_then(|f| Path::new(f).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty());
+    match folder_name {
+        Some(name) => format!("{file} · {name} — Polygluttony"),
+        None => format!("{file} — Polygluttony"),
+    }
 }
 
 /// Open an episode's window, or bring its open one to the front. `async`
@@ -107,15 +125,17 @@ pub async fn open_episode_window(
 ) -> AppResult<()> {
     let window_err =
         |e: tauri::Error| AppError::Other(format!("couldn't open the episode window: {e}"));
-    let label = episode_window_label(&file);
+    // The episode window reads an empty folder as none; so does its label.
+    let folder = folder.filter(|f| !f.is_empty());
+    let label = episode_window_label(folder.as_deref(), &file);
     let _opening = OPENING_EPISODE_WINDOW.lock().await;
     if let Some(window) = app.get_webview_window(&label) {
         window.unminimize().map_err(window_err)?;
         window.show().map_err(window_err)?;
         window.set_focus().map_err(window_err)?;
         if let Some(line) = line {
-            app.emit_to(label.as_str(), EPISODE_GO_TO_LINE_EVENT, EpisodeGoToLine { file, line })
-                .map_err(window_err)?;
+            let go_to = EpisodeGoToLine { folder, file, line };
+            app.emit_to(label.as_str(), EPISODE_GO_TO_LINE_EVENT, go_to).map_err(window_err)?;
         }
         return Ok(());
     }
@@ -126,7 +146,7 @@ pub async fn open_episode_window(
             serde_json::to_string(&folder)?,
             serde_json::to_string(&line)?
         ))
-        .title(format!("{file} — Polygluttony"))
+        .title(episode_window_title(folder.as_deref(), &file))
         .inner_size(1100.0, 760.0)
         .min_inner_size(720.0, 480.0)
         .build()
@@ -137,10 +157,13 @@ pub async fn open_episode_window(
 /// Every stored episode result for a folder. A missing or damaged store is
 /// empty, never an error.
 #[tauri::command]
-pub fn get_folder_results(app: AppHandle, folder: String) -> AppResult<FolderResults> {
-    Ok(ResultsStore::for_app(&app)
-        .map(|store| store.results(Path::new(&folder)))
-        .unwrap_or_default())
+pub async fn get_folder_results(app: AppHandle, folder: String) -> AppResult<FolderResults> {
+    blocking(move || {
+        Ok(ResultsStore::for_app(&app)
+            .map(|store| store.results(Path::new(&folder)))
+            .unwrap_or_default())
+    })
+    .await
 }
 
 /// Review actions write the episode's output and stored lines; a run that is
@@ -176,67 +199,94 @@ pub async fn retranslate_lines(
     run::start_review(app, folder, vec![(file, line_ids)]).await
 }
 
-/// Save the user's own translation of one line into the output file.
+/// Save the user's own translation of one line into the output file. The
+/// "is a run on it?" check happens under the store's lock (see
+/// `review::save_line_when`).
 #[tauri::command]
-pub fn save_line(
+pub async fn save_line(
     app: AppHandle,
     folder: String,
     file: String,
     line_id: u32,
     text: String,
 ) -> AppResult<()> {
-    let path = PathBuf::from(&folder);
-    not_running(&app, &path, &file)?;
-    review::save_line(&ResultsStore::for_app(&app)?, &path, &file, line_id, &text)?;
-    changed(&app, &folder, &file);
-    Ok(())
+    blocking(move || {
+        let path = PathBuf::from(&folder);
+        let store = ResultsStore::for_app(&app)?;
+        review::save_line_when(&store, &path, &file, line_id, &text, || {
+            not_running(&app, &path, &file)
+        })?;
+        changed(&app, &folder, &file);
+        Ok(())
+    })
+    .await
 }
 
-/// "Looks fine": drop one issue from the stored results.
+/// "Looks fine": drop one issue from the stored results. `term` picks the
+/// name issue about that name; without it, every issue of that type on the
+/// line goes.
 #[tauri::command]
-pub fn dismiss_issue(
+pub async fn dismiss_issue(
     app: AppHandle,
     folder: String,
     file: String,
     line_id: u32,
     issue_type: String,
+    term: Option<String>,
 ) -> AppResult<()> {
-    let path = PathBuf::from(&folder);
-    not_running(&app, &path, &file)?;
-    review::dismiss_issue(&ResultsStore::for_app(&app)?, &path, &file, line_id, &issue_type)?;
-    changed(&app, &folder, &file);
-    Ok(())
+    blocking(move || {
+        let path = PathBuf::from(&folder);
+        not_running(&app, &path, &file)?;
+        let store = ResultsStore::for_app(&app)?;
+        review::dismiss_issue(&store, &path, &file, line_id, &issue_type, term.as_deref())?;
+        changed(&app, &folder, &file);
+        Ok(())
+    })
+    .await
 }
 
 /// "Mark episode done": rename the `.warning` output to the clean name and
 /// record the episode as done.
 #[tauri::command]
-pub fn mark_episode_done(app: AppHandle, folder: String, file: String) -> AppResult<()> {
-    let path = PathBuf::from(&folder);
-    not_running(&app, &path, &file)?;
-    // For an episode translated before results were stored: the folder's languages.
-    let fallback = crate::config::projects::load(&app)
-        .ok()
-        .and_then(|cfg| crate::config::projects::get_prefs(&cfg, &folder))
-        .and_then(|p| LanguagePair::from_codes(&p.source_lang, &p.target_lang).ok());
-    review::mark_episode_done(&ResultsStore::for_app(&app)?, &path, &file, fallback)?;
-    changed(&app, &folder, &file);
-    Ok(())
+pub async fn mark_episode_done(app: AppHandle, folder: String, file: String) -> AppResult<()> {
+    blocking(move || {
+        let path = PathBuf::from(&folder);
+        not_running(&app, &path, &file)?;
+        // For an episode translated before results were stored: the folder's languages.
+        let fallback = crate::config::projects::load(&app)
+            .ok()
+            .and_then(|cfg| crate::config::projects::get_prefs(&cfg, &folder))
+            .and_then(|p| LanguagePair::from_codes(&p.source_lang, &p.target_lang).ok());
+        review::mark_episode_done(&ResultsStore::for_app(&app)?, &path, &file, fallback)?;
+        changed(&app, &folder, &file);
+        Ok(())
+    })
+    .await
+}
+
+/// Lines of finished episodes whose source contains `source` (a glossary
+/// term). Reads every finished episode's source, on a blocking thread.
+async fn term_lines(app: &AppHandle, folder: &str, source: &str) -> AppResult<Vec<TermLines>> {
+    let store = ResultsStore::for_app(app)?;
+    let (folder, source) = (folder.to_string(), source.to_string());
+    blocking(move || Ok(review::find_term_lines(&store, Path::new(&folder), &source))).await
 }
 
 /// Lines of finished episodes whose source contains `source` (a glossary term).
 #[tauri::command]
-pub fn find_term_lines(app: AppHandle, folder: String, source: String) -> AppResult<Vec<TermLines>> {
-    let store = ResultsStore::for_app(&app)?;
-    Ok(review::find_term_lines(&store, Path::new(&folder), &source))
+pub async fn find_term_lines(
+    app: AppHandle,
+    folder: String,
+    source: String,
+) -> AppResult<Vec<TermLines>> {
+    term_lines(&app, &folder, &source).await
 }
 
 /// Retranslate every line of finished episodes that uses a glossary term,
 /// as one review run. Returns how many lines were queued (0: no run).
 #[tauri::command]
 pub async fn retranslate_term(app: AppHandle, folder: String, source: String) -> AppResult<u32> {
-    let store = ResultsStore::for_app(&app)?;
-    let found = review::find_term_lines(&store, Path::new(&folder), &source);
+    let found = term_lines(&app, &folder, &source).await?;
     let count = found.iter().map(|t| t.line_ids.len() as u32).sum();
     if count == 0 {
         return Ok(0);
@@ -248,14 +298,39 @@ pub async fn retranslate_term(app: AppHandle, folder: String, source: String) ->
 
 #[cfg(test)]
 mod tests {
-    use super::episode_window_label;
+    use super::{episode_window_label, episode_window_title};
 
     #[test]
     fn episode_window_label_is_stable_and_label_safe() {
-        let label = episode_window_label("[Group] Show — 01 (1080p).ass");
-        assert_eq!(label, episode_window_label("[Group] Show — 01 (1080p).ass"));
-        assert_ne!(label, episode_window_label("[Group] Show — 02 (1080p).ass"));
+        let s1 = Some("/shows/Martial Universe/Season 1");
+        let label = episode_window_label(s1, "[Group] Show — 01 (1080p).ass");
+        assert_eq!(label, episode_window_label(s1, "[Group] Show — 01 (1080p).ass"));
+        assert_ne!(label, episode_window_label(s1, "[Group] Show — 02 (1080p).ass"));
         assert!(label.starts_with("episode-"));
         assert!(label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn the_same_file_name_in_another_folder_gets_its_own_window() {
+        let s1 = episode_window_label(Some("/shows/MU/Season 1"), "01.ass");
+        let s2 = episode_window_label(Some("/shows/MU/Season 2"), "01.ass");
+        let run = episode_window_label(None, "01.ass");
+        assert_ne!(s1, s2);
+        assert_ne!(s1, run);
+        assert_ne!(s2, run);
+    }
+
+    #[test]
+    fn the_window_title_names_the_folder() {
+        assert_eq!(
+            episode_window_title(Some("/shows/MU/Season 2"), "01.ass"),
+            "01.ass · Season 2 — Polygluttony"
+        );
+        assert_eq!(
+            episode_window_title(Some("/shows/MU/Season 2/"), "01.ass"),
+            "01.ass · Season 2 — Polygluttony"
+        );
+        assert_eq!(episode_window_title(None, "01.ass"), "01.ass — Polygluttony");
+        assert_eq!(episode_window_title(Some("/"), "01.ass"), "01.ass — Polygluttony");
     }
 }

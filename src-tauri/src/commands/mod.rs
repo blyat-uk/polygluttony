@@ -19,7 +19,18 @@ pub use prompts::*;
 pub mod setup;
 pub use setup::*;
 
+use crate::error::{AppError, AppResult};
 use crate::models::AppInfo;
+
+/// Run disk work on a blocking thread: a sync command runs on the main
+/// thread, and an async one must not stall the runtime's.
+pub(crate) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| AppError::Other(format!("Something went wrong inside Polygluttony: {e}")))?
+}
 
 /// Returns app/core metadata. Used by the webview as a startup health check for
 /// the IPC bridge.

@@ -45,7 +45,6 @@ use tokio::sync::mpsc;
 use crate::ass::decode::decode_file;
 use crate::ass::parse::{parse_dialogues, DialogueLine};
 use crate::ass::tags::strip_for_text;
-use crate::ass::writer::write_translated;
 use crate::config::Step;
 use crate::events::{
     EpisodeActivity, ErrorKind, FileResult, FileStateKind, LogLevel, LogPhase, RunEvent,
@@ -61,10 +60,11 @@ use crate::translation::batching::{
 };
 use crate::translation::cleanup::cleanup_pass;
 use crate::translation::live::episode_sources;
+use crate::translation::output;
 use crate::translation::results::fingerprint;
 use crate::translation::source_detect::SourceDetector;
 use crate::translation::stop::{RunStop, StopCause};
-use crate::translation::verify::{verify_file, VerifyReport};
+use crate::translation::verify::{insert_by_line, name_issues, verify_file, VerifyReport};
 use crate::validation::drift;
 use crate::validation::scopes::{compute_scopes, is_full_file, Scope};
 use crate::validation::LinePair;
@@ -135,6 +135,8 @@ pub struct FileOutcome {
     pub source_hash: Option<String>,
     /// The output written next to the source, if any.
     pub output_name: Option<String>,
+    /// Fingerprint of the output's bytes as written.
+    pub output_hash: Option<String>,
 }
 
 /// Why a file didn't get to the end.
@@ -152,6 +154,7 @@ struct Finished {
     issues: Vec<VerifyIssue>,
     output_name: String,
     output_path: PathBuf,
+    output_hash: String,
 }
 
 /// Translate one `.ass` file end-to-end. Never panics outward: every way it
@@ -391,6 +394,12 @@ impl<'j, 'a> FileState<'j, 'a> {
             self.run_cleanup(detector.as_ref()).await?;
         }
 
+        // Names: every line as it ends up, checked against the glossary
+        // whatever Verify decided. Review issues only: they never cause a
+        // retranslation (that already happened, or didn't, above).
+        issues.retain(|i| i.issue_type != "name");
+        insert_by_line(&mut issues, name_issues(&self.stripped_pairs(), &job.glossary.all_terms()));
+
         // 5. Final write.
         let untranslated = self.lines.len() - self.translations.len();
         has_warnings |= untranslated > 0 || !issues.is_empty();
@@ -437,13 +446,15 @@ impl<'j, 'a> FileState<'j, 'a> {
         } else {
             output_filename(&job.input, &job.pair)
         };
-        let output_path = self.write_output(original, &output_name)?;
-        Ok(Finished { has_warnings, issues, output_name, output_path })
+        let (output_path, output_hash) = self.write_output(original, &output_name)?;
+        Ok(Finished { has_warnings, issues, output_name, output_path, output_hash })
     }
 
-    /// Write every translated line next to the source. Untranslated lines are
-    /// dropped, not written back as source text (spec).
-    fn write_output(&self, original: &str, name: &str) -> Result<PathBuf, FileError> {
+    /// Write every translated line next to the source, and remove the other
+    /// variant (clean or `.warning`) of the output. Untranslated lines are
+    /// dropped, not written back as source text (spec). Returns the path and
+    /// the fingerprint of what was written.
+    fn write_output(&self, original: &str, name: &str) -> Result<(PathBuf, String), FileError> {
         let path = match self.job.input.parent() {
             Some(parent) => parent.join(name),
             None => PathBuf::from(name),
@@ -460,11 +471,10 @@ impl<'j, 'a> FileState<'j, 'a> {
                 })
             })
             .collect();
-        write_translated(&path, original, &out_lines).map_err(|e| FileError::Failed {
-            message: format!("Couldn't write {name}: {e}"),
-            kind: ErrorKind::Other,
+        let hash = output::write(&self.job.input, &self.job.pair, name, original, &out_lines).map_err(|e| {
+            FileError::Failed { message: format!("Couldn't write {name}: {e}"), kind: ErrorKind::Other }
         })?;
-        Ok(path)
+        Ok((path, hash))
     }
 
     /// Send the file's last events and say how it ended.
@@ -499,6 +509,7 @@ impl<'j, 'a> FileState<'j, 'a> {
                     translations: self.translations,
                     source_hash,
                     output_name: Some(f.output_name),
+                    output_hash: Some(f.output_hash),
                 }
             }
             Err(FileError::Stopped) => {
@@ -517,6 +528,7 @@ impl<'j, 'a> FileState<'j, 'a> {
                     translations: self.translations,
                     source_hash,
                     output_name: None,
+                    output_hash: None,
                 }
             }
             Err(FileError::Failed { message, kind }) => {
@@ -538,6 +550,7 @@ impl<'j, 'a> FileState<'j, 'a> {
                     translations: BTreeMap::new(),
                     source_hash,
                     output_name: None,
+                    output_hash: None,
                 }
             }
         }
@@ -709,17 +722,13 @@ impl<'j, 'a> FileState<'j, 'a> {
                         self.log(
                             LogLevel::Debug,
                             LogPhase::Batch,
+                            // Plain words: the Logs drawer shows every level.
                             match d.suspected_drift_start_id {
                                 Some(line) => format!(
-                                    "drift suspected from line {line} (score {:.2}, threshold {})",
-                                    d.score,
-                                    drift::THRESHOLD
+                                    "Lines from line {line} on may not match the original. Verify will check them."
                                 ),
-                                None => format!(
-                                    "drift suspected (score {:.2}, threshold {})",
-                                    d.score,
-                                    drift::THRESHOLD
-                                ),
+                                None => "Some lines in this batch may not match the original. Verify will check them."
+                                    .to_string(),
                             },
                         )
                         .await;
@@ -950,6 +959,9 @@ pub struct ReviewJob<'a> {
     pub line_ids: Vec<u32>,
     /// The output to rewrite, next to the source.
     pub output_name: String,
+    /// Fingerprint of the output as Polygluttony last wrote it: the rewrite
+    /// is refused when the file changed since (`None`: not known, rewrite).
+    pub output_hash: Option<String>,
     /// Issues still open before this; those on lines that get new text go.
     pub issues: Vec<VerifyIssue>,
     /// The episode still needs a look (its output is the `.warning` file).
@@ -965,6 +977,8 @@ pub struct ReviewOutcome {
     pub translations: BTreeMap<u32, String>,
     /// Lines that got new text.
     pub retranslated: Vec<u32>,
+    /// Fingerprint of the rewritten output (`None`: nothing was written).
+    pub output_hash: Option<String>,
     /// Why nothing could be done (unreadable or changed source, a write
     /// error), as one plain sentence. Nothing was written or stored.
     pub failed: Option<String>,
@@ -992,6 +1006,7 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
         },
         translations: BTreeMap::new(),
         retranslated: Vec::new(),
+        output_hash: None,
         failed: Some(message),
     };
     // However it goes, the episode ends where it started: its output stays.
@@ -1055,13 +1070,27 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
     retranslated.sort_unstable();
     retranslated.dedup();
 
+    // The retranslated lines lose their issues (the model rewrote them), then
+    // get their names checked again against the glossary as it is now.
     let fixed: BTreeSet<u32> = retranslated.iter().copied().collect();
-    let issues: Vec<VerifyIssue> =
+    let mut issues: Vec<VerifyIssue> =
         review.issues.iter().filter(|i| !fixed.contains(&i.line_id)).cloned().collect();
+    let rechecked: BTreeMap<u32, (String, String)> =
+        st.stripped_pairs().into_iter().filter(|(id, _)| fixed.contains(id)).collect();
+    insert_by_line(&mut issues, name_issues(&rechecked, &job.glossary.all_terms()));
     let mut output_path = None;
+    let mut output_hash = None;
     if !retranslated.is_empty() {
-        match st.write_output(&original, &review.output_name) {
-            Ok(path) => output_path = Some(path.display().to_string()),
+        // Someone may have edited the output while the lines were out.
+        let dir = job.input.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let written = output::check_unchanged(dir, &review.output_name, review.output_hash.as_deref())
+            .map_err(|e| FileError::Failed { message: e.to_string(), kind: ErrorKind::Other })
+            .and_then(|()| st.write_output(&original, &review.output_name));
+        match written {
+            Ok((path, hash)) => {
+                output_path = Some(path.display().to_string());
+                output_hash = Some(hash);
+            }
             Err(FileError::Failed { message, kind }) => {
                 st.emit(RunEvent::Error { file: job.file_name.clone(), message: message.clone(), error_kind: kind })
                     .await;
@@ -1090,6 +1119,7 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
         },
         translations: st.translations,
         retranslated,
+        output_hash,
         failed: None,
     }
 }
@@ -1142,12 +1172,22 @@ mod tests {
         responses: Vec<Result<String, crate::llm::error::LlmError>>,
         seed: Option<Seed>,
     ) -> Ran {
+        run_in(tempfile::tempdir().unwrap(), source, responses, seed, &Glossary::default()).await
+    }
+
+    /// `run_with` in a folder the test prepared, with a glossary.
+    async fn run_in(
+        dir: tempfile::TempDir,
+        source: &str,
+        responses: Vec<Result<String, crate::llm::error::LlmError>>,
+        seed: Option<Seed>,
+        glossary: &Glossary,
+    ) -> Ran {
         let driver = ScriptedDriver::new(responses);
         let (tx, mut rx) = mpsc::channel(256);
         let stop = RunStop::default();
         let svc = LlmService::new(driver.clone(), 2, stop.token().clone(), tx.clone())
             .with_provider("Anthropic");
-        let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("ep01.ass");
         std::fs::write(&input, source).unwrap();
         let prompts = crate::prompts::TranslationPrompts::defaults(
@@ -1161,7 +1201,7 @@ mod tests {
             file_name: "ep01.ass".into(),
             svc: &svc,
             verify_svc: &svc,
-            glossary: &Glossary::default(),
+            glossary,
             pair: LanguagePair::from_codes("zh", "en").unwrap(),
             prompts: &prompts,
             batch_limit: Some(100),
@@ -2038,6 +2078,13 @@ mod tests {
         assert_eq!(spans, [(3, 4, 3), (9, 9, 9), (12, 12, 12)]);
     }
 
+    /// The output as it is on disk before a review, and as Polygluttony last
+    /// wrote it.
+    struct OnDisk {
+        now: &'static str,
+        written: &'static str,
+    }
+
     async fn review(
         src: &str,
         stored: &[(u32, &str)],
@@ -2045,12 +2092,27 @@ mod tests {
         ids: Vec<u32>,
         responses: Vec<Result<String, crate::llm::error::LlmError>>,
     ) -> (ReviewOutcome, Vec<RunEvent>, std::sync::Arc<ScriptedDriver>, tempfile::TempDir) {
+        review_over(src, stored, hash, ids, responses, None).await
+    }
+
+    async fn review_over(
+        src: &str,
+        stored: &[(u32, &str)],
+        hash: String,
+        ids: Vec<u32>,
+        responses: Vec<Result<String, crate::llm::error::LlmError>>,
+        on_disk: Option<OnDisk>,
+    ) -> (ReviewOutcome, Vec<RunEvent>, std::sync::Arc<ScriptedDriver>, tempfile::TempDir) {
         let driver = ScriptedDriver::new(responses);
         let (tx, mut rx) = mpsc::channel(256);
         let stop = RunStop::default();
         let svc = LlmService::new(driver.clone(), 2, stop.token().clone(), tx.clone());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("ep01.ass"), src).unwrap();
+        let output_hash = on_disk.map(|o| {
+            std::fs::write(dir.path().join("ep01.warning.eng.ass"), o.now).unwrap();
+            crate::translation::results::fingerprint_bytes(o.written.as_bytes())
+        });
         let pair = LanguagePair::from_codes("zh", "en").unwrap();
         let prompts =
             crate::prompts::TranslationPrompts::defaults(&pair, crate::config::projects::Tone::Standard);
@@ -2083,6 +2145,7 @@ mod tests {
             },
             line_ids: ids,
             output_name: "ep01.warning.eng.ass".into(),
+            output_hash,
             issues: vec![issue(2, "name"), issue(4, "untranslated"), issue(1, "meaning")],
             needs_look: true,
         })
@@ -2137,5 +2200,176 @@ mod tests {
         assert_eq!(driver.call_count(), 0);
         assert!(!dir.path().join("ep01.warning.eng.ass").exists());
         assert!(events.iter().any(|e| matches!(e, RunEvent::Error { .. })));
+    }
+
+    #[tokio::test]
+    async fn review_rewrites_an_unchanged_output_and_drops_the_other_variant() {
+        let src = ass_source(&["你好", "走吧"]);
+        let before = "what Polygluttony wrote";
+        let (outcome, _events, _driver, dir) = review_over(
+            &src,
+            &[(1, "Hello"), (2, "Go.")],
+            fingerprint(&src),
+            vec![2],
+            vec![Ok(ok_batch(&[(2, "Let's go.")]))],
+            Some(OnDisk { now: before, written: before }),
+        )
+        .await;
+        assert!(outcome.failed.is_none());
+        let bytes = std::fs::read(dir.path().join("ep01.warning.eng.ass")).unwrap();
+        assert_eq!(outcome.output_hash, Some(crate::translation::results::fingerprint_bytes(&bytes)));
+        assert!(String::from_utf8(bytes).unwrap().contains("Let's go."));
+    }
+
+    #[tokio::test]
+    async fn review_wont_overwrite_an_output_changed_since_it_was_written() {
+        let src = ass_source(&["你好", "走吧"]);
+        let (outcome, events, _driver, dir) = review_over(
+            &src,
+            &[(1, "Hello"), (2, "Go.")],
+            fingerprint(&src),
+            vec![2],
+            vec![Ok(ok_batch(&[(2, "Let's go.")]))],
+            Some(OnDisk { now: "fixed by hand", written: "what Polygluttony wrote" }),
+        )
+        .await;
+        let failed = outcome.failed.unwrap();
+        assert!(failed.starts_with("ep01.warning.eng.ass was changed outside Polygluttony"), "{failed}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ep01.warning.eng.ass")).unwrap(),
+            "fixed by hand"
+        );
+        assert!(outcome.output_hash.is_none());
+        assert!(events.iter().any(|e| matches!(e, RunEvent::Error { .. })));
+        // It ends where it started.
+        assert!(matches!(events.last(), Some(RunEvent::State { state: FileStateKind::Warning, .. })));
+    }
+
+    #[tokio::test]
+    async fn a_finished_file_replaces_the_other_output_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = ass_source(&["你好"]);
+        std::fs::write(dir.path().join("ep01.warning.eng.ass"), "an older run's").unwrap();
+        let script = vec![Ok(ok_batch(&[(1, "Hello there")])), Ok(r#"{"issues":[]}"#.into())];
+        let Ran { outcome, dir, .. } = run_in(dir, &src, script, None, &Glossary::default()).await;
+        assert_eq!(outcome.output_name.as_deref(), Some("ep01.eng.ass"));
+        assert!(!dir.path().join("ep01.warning.eng.ass").exists());
+        let bytes = std::fs::read(dir.path().join("ep01.eng.ass")).unwrap();
+        assert_eq!(outcome.output_hash, Some(crate::translation::results::fingerprint_bytes(&bytes)));
+    }
+
+    fn glossary_of(terms: &[(&str, &str)]) -> Glossary {
+        let mut g = Glossary::new("xianxia");
+        for (s, t) in terms {
+            g.characters.insert(s.to_string(), t.to_string());
+        }
+        g
+    }
+
+    #[tokio::test]
+    async fn a_missing_name_is_flagged_without_a_retranslation() {
+        let src = ass_source(&["元清，我不信。", "走吧。"]);
+        let glossary = glossary_of(&[("元清", "Yuan Qing")]);
+        let script = vec![
+            Ok(ok_batch(&[(1, "Follow them."), (2, "Let's go.")])),
+            Ok(r#"{"issues":[]}"#.into()),
+        ];
+        let Ran { outcome, events, driver, dir, .. } =
+            run_in(tempfile::tempdir().unwrap(), &src, script, None, &glossary).await;
+        assert_eq!(driver.call_count(), 2, "one batch and one check: nothing translated again");
+        assert_eq!(outcome.end, FileEnd::NeedsLook);
+        let names: Vec<(u32, Option<&str>, Option<&str>)> = outcome
+            .result
+            .issues
+            .iter()
+            .map(|i| (i.line_id, i.term.as_deref(), i.expected.as_deref()))
+            .collect();
+        assert_eq!(names, [(1, Some("元清"), Some("Yuan Qing"))]);
+        assert_eq!(outcome.output_name.as_deref(), Some("ep01.warning.eng.ass"));
+        assert!(dir.path().join("ep01.warning.eng.ass").exists());
+        assert!(events.iter().any(|e| matches!(e, RunEvent::FileDone { has_warnings: true, issues, .. } if issues.len() == 1)));
+    }
+
+    #[tokio::test]
+    async fn a_name_written_in_any_case_is_fine() {
+        let src = ass_source(&["{\\an8}元清，我不信。"]);
+        let glossary = glossary_of(&[("元清", "Yuan Qing")]);
+        let script = vec![Ok(ok_batch(&[(1, "YUAN QING, I don't believe it.")])), Ok(r#"{"issues":[]}"#.into())];
+        let Ran { outcome, .. } = run_in(tempfile::tempdir().unwrap(), &src, script, None, &glossary).await;
+        assert_eq!(outcome.end, FileEnd::Done, "{:?}", outcome.result.issues);
+    }
+
+    #[tokio::test]
+    async fn a_review_checks_the_names_of_the_lines_it_retranslated() {
+        let src = ass_source(&["元清，我不信。", "林动，走吧。", "好。"]);
+        let driver =
+            ScriptedDriver::new(vec![Ok(ok_batch(&[(1, "Listen to me."), (2, "Lin Dong, let's go.")]))]);
+        let (tx, mut rx) = mpsc::channel(256);
+        let stop = RunStop::default();
+        let svc = LlmService::new(driver.clone(), 1, stop.token().clone(), tx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ep01.ass"), &src).unwrap();
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+        let prompts =
+            crate::prompts::TranslationPrompts::defaults(&pair, crate::config::projects::Tone::Standard);
+        let glossary = glossary_of(&[("元清", "Yuan Qing"), ("林动", "Lin Dong")]);
+        let issue = |line_id: u32, issue_type: &str, term: Option<&str>| VerifyIssue {
+            line_id,
+            source: String::new(),
+            translation: String::new(),
+            issue_type: issue_type.into(),
+            description: "d".into(),
+            severity: "high".into(),
+            term: term.map(String::from),
+            expected: None,
+        };
+        let outcome = retranslate_episode_lines(ReviewJob {
+            job: FileJob {
+                input: dir.path().join("ep01.ass"),
+                file_name: "ep01.ass".into(),
+                svc: &svc,
+                verify_svc: &svc,
+                glossary: &glossary,
+                pair,
+                prompts: &prompts,
+                batch_limit: Some(100),
+                stop,
+                tx,
+                seed: Some(Seed {
+                    source_hash: fingerprint(&src),
+                    translations: [(1, "Listen.".to_string()), (2, "Go.".to_string())].into(),
+                }),
+            },
+            line_ids: vec![1, 2],
+            output_name: "ep01.warning.eng.ass".into(),
+            output_hash: None,
+            issues: vec![
+                issue(1, "name", Some("元清")),
+                issue(1, "meaning", None),
+                issue(2, "name", Some("林动")),
+                issue(3, "untranslated", None),
+            ],
+            needs_look: true,
+        })
+        .await;
+        drop(svc);
+        while rx.recv().await.is_some() {}
+        assert_eq!(outcome.retranslated, [1, 2]);
+        let left: Vec<(u32, String, Option<String>)> = outcome
+            .result
+            .issues
+            .iter()
+            .map(|i| (i.line_id, i.issue_type.clone(), i.term.clone()))
+            .collect();
+        assert_eq!(
+            left,
+            [
+                // Still without the name: flagged again. Its meaning issue went.
+                (1, "name".to_string(), Some("元清".to_string())),
+                // Line 3 wasn't retranslated: still untranslated.
+                (3, "untranslated".to_string(), None),
+            ],
+            "line 2 has its name now"
+        );
     }
 }

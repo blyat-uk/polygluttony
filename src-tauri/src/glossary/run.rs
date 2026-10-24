@@ -3,7 +3,7 @@
 //! `translation/run.rs` with a simpler forwarder (the slot is released by a
 //! `SlotGuard` held by the op, not by channel close).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -25,8 +25,9 @@ use crate::models::language_pair::LanguagePair;
 pub struct GlossaryRunState(pub Mutex<Option<GlossaryOpHandle>>);
 
 pub struct GlossaryOpHandle {
-    #[allow(dead_code)] // surfaced to the UI in a later step; cancel is the point
     pub kind: GlossaryOpKind,
+    /// The subtitle folder whose glossary the op works on.
+    pub folder: PathBuf,
     pub cancel: CancellationToken,
 }
 
@@ -37,7 +38,36 @@ pub enum GlossaryOpKind {
     Normalize,
     /// Look up names online on the glossary as it is.
     LookUp,
+    /// Install a picked glossary.json in place of the folder's.
     Import,
+    /// Import from translated episodes: reads them into the reference cache,
+    /// never writes glossary.json.
+    Reference,
+}
+
+impl GlossaryOpKind {
+    /// The op writes glossary.json itself, so nothing else may meanwhile.
+    pub fn writes_glossary(self) -> bool {
+        matches!(self, GlossaryOpKind::Build | GlossaryOpKind::Import)
+    }
+}
+
+/// Why a direct write to the glossary (an edit, a restore) is refused.
+pub const GLOSSARY_BUSY: &str = "The glossary is being rebuilt right now. Try again when it's done.";
+
+/// Pure: refuse a direct write to `folder`'s glossary while `op` (the op
+/// holding the slot, if any) is rewriting that same glossary. A build's
+/// final save would drop what the write added.
+pub fn refuse_while_rewritten(op: Option<&GlossaryOpHandle>, folder: &Path) -> AppResult<()> {
+    match op {
+        Some(op)
+            if op.kind.writes_glossary()
+                && crate::translation::live::same_folder(&op.folder, folder) =>
+        {
+            Err(AppError::Other(GLOSSARY_BUSY.into()))
+        }
+        _ => Ok(()),
+    }
 }
 
 pub struct StartArgs {
@@ -55,7 +85,11 @@ pub struct StartArgs {
 /// Claim the single glossary-op slot. LOCK ORDERING: translation `RunState`
 /// FIRST, then `GlossaryRunState` — `translation::run::start` uses the same
 /// order; reversing it deadlocks.
-pub async fn claim_slot(app: &AppHandle, kind: GlossaryOpKind) -> AppResult<CancellationToken> {
+pub async fn claim_slot(
+    app: &AppHandle,
+    kind: GlossaryOpKind,
+    folder: &Path,
+) -> AppResult<CancellationToken> {
     let t_state = app.state::<crate::translation::run::RunState>();
     let t_guard = t_state.0.lock().await;
     if t_guard.is_some() {
@@ -67,7 +101,7 @@ pub async fn claim_slot(app: &AppHandle, kind: GlossaryOpKind) -> AppResult<Canc
         return Err(AppError::RunAlreadyActive);
     }
     let cancel = CancellationToken::new();
-    *g_guard = Some(GlossaryOpHandle { kind, cancel: cancel.clone() });
+    *g_guard = Some(GlossaryOpHandle { kind, folder: folder.to_path_buf(), cancel: cancel.clone() });
     Ok(cancel)
 }
 
@@ -159,7 +193,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     let prompt_pack =
         crate::prompts::GlossaryPrompts::resolve(&crate::prompts::overrides_dir(&app)?)?;
 
-    let cancel = claim_slot(&app, GlossaryOpKind::Build).await?;
+    let cancel = claim_slot(&app, GlossaryOpKind::Build, Path::new(&args.folder)).await?;
 
     // No backup here: the build snapshots the current glossary to the history
     // right before its FIRST write (build.rs `BuildWriter`), so a run that
@@ -225,5 +259,34 @@ pub async fn cancel(app: AppHandle) -> AppResult<()> {
             Ok(())
         }
         None => Err(AppError::NoActiveRun),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(kind: GlossaryOpKind, folder: &Path) -> GlossaryOpHandle {
+        GlossaryOpHandle { kind, folder: folder.to_path_buf(), cancel: CancellationToken::new() }
+    }
+
+    #[test]
+    fn direct_writes_wait_for_a_build_or_import_of_the_same_glossary() {
+        let here = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(refuse_while_rewritten(None, here.path()).is_ok());
+        for kind in [GlossaryOpKind::Build, GlossaryOpKind::Import] {
+            let err = refuse_while_rewritten(Some(&op(kind, here.path())), here.path()).unwrap_err();
+            assert_eq!(err.to_string(), GLOSSARY_BUSY);
+            // However the folder is spelled.
+            let slashed = PathBuf::from(format!("{}/", here.path().display()));
+            assert!(refuse_while_rewritten(Some(&op(kind, here.path())), &slashed).is_err());
+            // Another folder's glossary is free.
+            assert!(refuse_while_rewritten(Some(&op(kind, elsewhere.path())), here.path()).is_ok());
+        }
+        // Ops that leave glossary.json alone (or save through the UI) don't block.
+        for kind in [GlossaryOpKind::Normalize, GlossaryOpKind::LookUp, GlossaryOpKind::Reference] {
+            assert!(refuse_while_rewritten(Some(&op(kind, here.path())), here.path()).is_ok());
+        }
     }
 }

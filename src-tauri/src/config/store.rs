@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use tauri::{AppHandle, Runtime};
@@ -937,6 +937,11 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppResult<AppConfig> {
         Err(e) => tracing::warn!("couldn't back up the v1 config ({e}); not replacing it yet"),
     }
     Ok(cfg)
+}
+
+/// Where the store plugin keeps the config (`<app-data>/config.json`).
+pub fn config_file<R: Runtime>(app: &AppHandle<R>) -> AppResult<PathBuf> {
+    tauri_plugin_store::resolve_store_path(app, STORE_FILE).map_err(|e| AppError::Other(e.to_string()))
 }
 
 /// Persist the whole config — refused while a v1 config without a backup is

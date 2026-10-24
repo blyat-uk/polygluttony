@@ -9,15 +9,16 @@ use std::path::Path;
 
 use crate::ass::decode::decode_file;
 use crate::ass::parse::{parse_dialogues, DialogueLine};
-use crate::ass::tags::{reapply, strip_for_text, strip_positional};
-use crate::ass::writer::render_translated;
+use crate::ass::tags::{reapply, reapply_missing, strip_for_text, strip_positional};
 use crate::error::{AppError, AppResult};
 use crate::events::{EpisodeLine, EpisodeSnapshot, EpisodeView, FileStateKind, LineStatus};
 use crate::models::language_pair::{output_filename, warning_filename, LanguagePair};
 use crate::translation::live::episode_sources;
+use crate::glossary::io::load_folder_glossary;
+use crate::translation::output;
+use crate::translation::verify::{insert_by_line, name_issues};
 use crate::translation::results::{
-    fingerprint, now_ms, write_atomic, EpisodeOutcome, EpisodeRecord, ResultsStore, StoredLines,
-    TermLines,
+    fingerprint, now_ms, EpisodeOutcome, EpisodeRecord, ResultsStore, StoredLines, TermLines,
 };
 
 /// Shown (as the snapshot's `detail`) when the source changed under its
@@ -111,13 +112,17 @@ pub fn stored_snapshot(store: &ResultsStore, folder: &Path, file: &str) -> Optio
 }
 
 /// Rewrite an episode's output from its source and translations, keeping
-/// the writer's header and event handling. Untranslated lines stay out.
+/// the writer's header and event handling, and remove the other variant
+/// (clean or `.warning`). Untranslated lines stay out. Returns the
+/// fingerprint of what was written.
 fn write_output(
     folder: &Path,
+    file: &str,
+    pair: &LanguagePair,
     output_name: &str,
     source: &Source,
     translations: &BTreeMap<u32, String>,
-) -> AppResult<()> {
+) -> AppResult<String> {
     let out: Vec<DialogueLine> = source
         .lines
         .iter()
@@ -129,11 +134,8 @@ fn write_output(
             })
         })
         .collect();
-    write_atomic(
-        &folder.join(output_name),
-        render_translated(&source.text, &out).as_bytes(),
-    )
-    .map_err(|e| other(format!("Couldn't write {output_name}: {e}")))
+    output::write(&folder.join(file), pair, output_name, &source.text, &out)
+        .map_err(|e| other(format!("Couldn't write {output_name}: {e}")))
 }
 
 /// The output of a finished episode, and its stored lines checked against
@@ -163,15 +165,22 @@ fn finished<'a>(
 }
 
 /// The user's own translation of one line, override tags kept: the source
-/// line's tags go back where they were, as the pipeline does, unless the
-/// user typed tags of their own. Rewrites the output and clears the line's
-/// issues.
-pub fn save_line(
+/// line's tags go back where they were, as the pipeline does; when the user
+/// typed tags of their own, those the typed text doesn't set already. Rewrites
+/// the output; the line's issues go, except the names it still misses (checked
+/// against the folder's glossary as it is now). Refused when the output
+/// changed on disk since Polygluttony wrote it.
+///
+/// `free` says whether the episode may be edited now (no run has it). It is
+/// asked under the store's lock, so a review run that marks the episode
+/// before reading its lines can't miss this edit or overwrite it.
+pub fn save_line_when(
     store: &ResultsStore,
     folder: &Path,
     file: &str,
     line_id: u32,
     text: &str,
+    free: impl FnOnce() -> AppResult<()>,
 ) -> AppResult<()> {
     let text = text.trim().replace("\r\n", "\\N").replace('\n', "\\N");
     if text.is_empty() {
@@ -179,36 +188,65 @@ pub fn save_line(
     }
     let source = read_source(folder, file)?;
     store.edit_episode(folder, file, |record, lines| {
+        free()?;
         let (output_name, lines) = finished(record, lines, &source)?;
         let raw = line_id
             .checked_sub(1)
             .and_then(|i| source.lines.get(i as usize))
             .ok_or_else(|| other(format!("Line {line_id} isn't in this episode.")))?;
         let tagged = if text.contains("{\\") {
-            text.clone()
+            reapply_missing(&strip_positional(&raw.text), &text)
         } else {
             reapply(&strip_positional(&raw.text), &text)
         };
+        output::check_unchanged(folder, &output_name, lines.output_hash.as_deref())?;
+        let pair = LanguagePair::from_codes(&lines.source_lang, &lines.target_lang)?;
         lines.translations.insert(line_id, tagged);
-        write_output(folder, &output_name, &source, &lines.translations)?;
+        let hash =
+            write_output(folder, file, &pair, &output_name, &source, &lines.translations)?;
+        lines.output_hash = Some(hash);
         record.issues.retain(|i| i.line_id != line_id);
+        let terms = load_folder_glossary(folder).map(|g| g.all_terms()).unwrap_or_default();
+        let line = BTreeMap::from([(
+            line_id,
+            (strip_for_text(&raw.text), strip_for_text(&lines.translations[&line_id])),
+        )]);
+        insert_by_line(&mut record.issues, name_issues(&line, &terms));
         record.translated_lines = lines.translations.len() as u32;
         Ok(())
     })
 }
 
-/// "Looks fine": drop that issue from the line. Already gone is fine.
+/// [`save_line_when`] with nothing else to wait for.
+#[cfg(test)]
+pub fn save_line(
+    store: &ResultsStore,
+    folder: &Path,
+    file: &str,
+    line_id: u32,
+    text: &str,
+) -> AppResult<()> {
+    save_line_when(store, folder, file, line_id, text, || Ok(()))
+}
+
+/// "Looks fine": drop that issue from the line. With `term`, only the issue
+/// about that name (a line can have one per name); without, every issue of
+/// that type on the line. Already gone is fine.
 pub fn dismiss_issue(
     store: &ResultsStore,
     folder: &Path,
     file: &str,
     line_id: u32,
     issue_type: &str,
+    term: Option<&str>,
 ) -> AppResult<()> {
     store.edit_episode(folder, file, |record, _| {
-        record
-            .issues
-            .retain(|i| !(i.line_id == line_id && i.issue_type == issue_type));
+        record.issues.retain(|i| {
+            let this = i.line_id == line_id
+                && i.issue_type == issue_type
+                && term.is_none_or(|t| i.term.as_deref() == Some(t));
+            !this
+        });
         Ok(())
     })
 }
@@ -370,7 +408,9 @@ mod tests {
         .into();
         let output = "ep01.warning.eng.ass";
         let source = read_source(folder.path(), "ep01.ass").unwrap();
-        write_output(folder.path(), output, &source, &translations).unwrap();
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+        let output_hash =
+            write_output(folder.path(), "ep01.ass", &pair, output, &source, &translations).unwrap();
         let record = EpisodeRecord {
             file: "ep01.ass".into(),
             outcome,
@@ -393,6 +433,7 @@ mod tests {
             source_hash: fingerprint(&src),
             total_lines: 3,
             translations,
+            output_hash: Some(output_hash),
         };
         store
             .put_episode(folder.path(), record, Some(&lines))
@@ -516,8 +557,8 @@ mod tests {
     #[test]
     fn dismiss_drops_only_that_issue() {
         let fx = fixture(EpisodeOutcome::NeedsLook);
-        dismiss_issue(&fx.store, fx.folder.path(), "ep01.ass", 1, "name").unwrap();
-        dismiss_issue(&fx.store, fx.folder.path(), "ep01.ass", 1, "name").unwrap();
+        dismiss_issue(&fx.store, fx.folder.path(), "ep01.ass", 1, "name", None).unwrap();
+        dismiss_issue(&fx.store, fx.folder.path(), "ep01.ass", 1, "name", None).unwrap();
         let types: Vec<(u32, String)> = fx
             .store
             .record(fx.folder.path(), "ep01.ass")
@@ -530,6 +571,114 @@ mod tests {
             types,
             [(1, "meaning".to_string()), (3, "untranslated".to_string())]
         );
+    }
+
+    #[test]
+    fn looks_fine_on_one_name_leaves_the_lines_other_names() {
+        let fx = fixture(EpisodeOutcome::NeedsLook);
+        let named = |term: &str| VerifyIssue { term: Some(term.into()), ..issue(2, "name") };
+        fx.store
+            .edit_episode(fx.folder.path(), "ep01.ass", |record, _| {
+                record.issues = vec![named("叶长生"), named("林动"), issue(2, "meaning")];
+                Ok(())
+            })
+            .unwrap();
+        dismiss_issue(&fx.store, fx.folder.path(), "ep01.ass", 2, "name", Some("林动")).unwrap();
+        let left: Vec<(String, Option<String>)> = fx
+            .store
+            .record(fx.folder.path(), "ep01.ass")
+            .unwrap()
+            .issues
+            .into_iter()
+            .map(|i| (i.issue_type, i.term))
+            .collect();
+        assert_eq!(
+            left,
+            [("name".to_string(), Some("叶长生".to_string())), ("meaning".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn typed_tags_keep_the_lines_hidden_positioning() {
+        let fx = fixture(EpisodeOutcome::NeedsLook);
+        save_line(&fx.store, fx.folder.path(), "ep01.ass", 1, "{\\i1}Ye Changsheng{\\i0} won't leave.")
+            .unwrap();
+        let lines = fx.store.lines(fx.folder.path(), "ep01.ass").unwrap();
+        assert_eq!(lines.translations[&1], "{\\an8}{\\i1}Ye Changsheng{\\i0} won't leave.");
+    }
+
+    #[test]
+    fn save_line_wont_overwrite_an_output_changed_on_disk() {
+        let fx = fixture(EpisodeOutcome::NeedsLook);
+        let out = fx.folder.path().join("ep01.warning.eng.ass");
+        std::fs::write(&out, "fixed by hand").unwrap();
+        let err = save_line(&fx.store, fx.folder.path(), "ep01.ass", 2, "Go on.").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ep01.warning.eng.ass was changed outside Polygluttony since it was written. Open it \
+             in your editor, or translate the episode again."
+        );
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "fixed by hand");
+        let lines = fx.store.lines(fx.folder.path(), "ep01.ass").unwrap();
+        assert_eq!(lines.translations[&2], "You go first.", "nothing stored either");
+
+        // A result stored before fingerprints were kept: rewritten, as before.
+        fx.store
+            .edit_episode(fx.folder.path(), "ep01.ass", |_, lines| {
+                lines.as_mut().unwrap().output_hash = None;
+                Ok(())
+            })
+            .unwrap();
+        save_line(&fx.store, fx.folder.path(), "ep01.ass", 2, "Go on.").unwrap();
+        assert!(std::fs::read_to_string(&out).unwrap().contains("Go on."));
+        // …and from then on it is fingerprinted.
+        assert!(fx.store.lines(fx.folder.path(), "ep01.ass").unwrap().output_hash.is_some());
+    }
+
+    #[test]
+    fn save_line_asks_whether_the_episode_is_free_under_the_lock() {
+        let fx = fixture(EpisodeOutcome::NeedsLook);
+        let busy = || Err(other("This episode is being translated right now."));
+        let err = save_line_when(&fx.store, fx.folder.path(), "ep01.ass", 2, "Go on.", busy);
+        assert!(err.unwrap_err().to_string().contains("being translated"));
+        let lines = fx.store.lines(fx.folder.path(), "ep01.ass").unwrap();
+        assert_eq!(lines.translations[&2], "You go first.", "nothing written");
+    }
+
+    #[test]
+    fn a_saved_line_is_checked_for_its_names_again() {
+        let fx = fixture(EpisodeOutcome::NeedsLook);
+        let mut g = crate::glossary::model::Glossary::new("xianxia");
+        g.characters.insert("叶长生".into(), "Ye Changsheng".into());
+        crate::glossary::io::save_folder_glossary(fx.folder.path(), &g).unwrap();
+        let issues_on = |fx: &Fixture, line: u32| -> Vec<(String, Option<String>)> {
+            fx.store
+                .record(fx.folder.path(), "ep01.ass")
+                .unwrap()
+                .issues
+                .into_iter()
+                .filter(|i| i.line_id == line)
+                .map(|i| (i.issue_type, i.term))
+                .collect()
+        };
+
+        // Still without the name: its meaning issue goes, the name issue stays.
+        save_line(&fx.store, fx.folder.path(), "ep01.ass", 1, "He won't leave.").unwrap();
+        assert_eq!(issues_on(&fx, 1), [("name".to_string(), Some("叶长生".to_string()))]);
+        // With it: nothing left on the line.
+        save_line(&fx.store, fx.folder.path(), "ep01.ass", 1, "Ye Changsheng won't leave.").unwrap();
+        assert!(issues_on(&fx, 1).is_empty());
+        assert_eq!(issues_on(&fx, 3).len(), 1, "other lines keep theirs");
+    }
+
+    #[test]
+    fn save_line_removes_a_stale_clean_output() {
+        let fx = fixture(EpisodeOutcome::NeedsLook);
+        let clean = fx.folder.path().join("ep01.eng.ass");
+        std::fs::write(&clean, "an older translation").unwrap();
+        save_line(&fx.store, fx.folder.path(), "ep01.ass", 2, "Go on.").unwrap();
+        assert!(!clean.exists());
+        assert!(fx.folder.path().join("ep01.warning.eng.ass").exists());
     }
 
     #[test]
@@ -625,6 +774,7 @@ mod tests {
                     (2, "Ye Changshen is here.".to_string()),
                 ]
                 .into(),
+                output_hash: None,
             };
             fx.store
                 .put_episode(fx.folder.path(), record, Some(&lines))

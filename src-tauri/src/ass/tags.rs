@@ -106,9 +106,156 @@ pub fn reapply(strip: &TagStrip, translated: &str) -> String {
     out.into_iter().collect()
 }
 
+/// The overrides in one `{...}` block, each with its leading `\`
+/// (`{\an8\fad(200,0)}` → `\an8`, `\fad(200,0)`). A `\` inside
+/// parentheses belongs to its tag (`\t(0,500,\fs30)` is one).
+fn overrides(block: &str) -> Vec<&str> {
+    let inner = block.strip_prefix('{').and_then(|b| b.strip_suffix('}')).unwrap_or(block);
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = None;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '\\' if depth == 0 => {
+                if let Some(s) = start {
+                    out.push(&inner[s..i]);
+                }
+                start = Some(i);
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push(&inner[s..]);
+    }
+    out
+}
+
+/// What an override sets, so two spellings of one setting match: `\an8`
+/// and `\a5` both align the line, `\pos` and `\move` both place it,
+/// `\fad` and `\fade` both fade it, `\c` is `\1c`.
+fn setting(tag: &str) -> String {
+    let body = tag.trim_start_matches('\\');
+    let digits: String = body.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let letters: String =
+        body[digits.len()..].chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    let name = format!("{digits}{letters}").to_ascii_lowercase();
+    match name.as_str() {
+        "a" | "an" => "align".into(),
+        "pos" | "move" => "position".into(),
+        "fad" | "fade" => "fade".into(),
+        "clip" | "iclip" => "clip".into(),
+        "c" => "1c".into(),
+        _ => name,
+    }
+}
+
+/// The user's own text for a line that may hold tags they typed, with the
+/// source line's tags put back where the typed text doesn't set the same
+/// thing: a hidden `\an8`, `\pos`, `\fad` or `\move` (or any other
+/// override) survives the edit, a typed `\an2` wins over the source's
+/// `\an8`. Source tags go where [`reapply`] would put them on the typed
+/// words; typed tags stay where they were typed, after source ones at the
+/// same spot.
+pub fn reapply_missing(source: &TagStrip, typed: &str) -> String {
+    let typed_strip = strip_positional(typed);
+    let typed_settings: std::collections::HashSet<String> = typed_strip
+        .tags
+        .iter()
+        .flat_map(|t| overrides(&t.content))
+        .map(setting)
+        .collect();
+    let missing: Vec<PlacedTag> = source
+        .tags
+        .iter()
+        .filter_map(|t| {
+            let kept: String = overrides(&t.content)
+                .into_iter()
+                .filter(|o| !typed_settings.contains(&setting(o)))
+                .collect();
+            (!kept.is_empty()).then(|| PlacedTag { content: format!("{{{kept}}}"), ..t.clone() })
+        })
+        .collect();
+    if missing.is_empty() {
+        return typed.to_string();
+    }
+    let missing = TagStrip { tags: missing, ..source.clone() };
+    // Source tags placed on the typed words, then the typed tags back at
+    // their own spots.
+    let placed = reapply(&missing, &typed_strip.stripped);
+    let mut typed_tags = typed_strip.tags.iter().peekable();
+    let mut out = String::with_capacity(placed.len() + typed.len());
+    let mut plain = 0usize;
+    let mut last = 0usize;
+    let mut text = |out: &mut String, from: &str, plain: &mut usize| {
+        for ch in from.chars() {
+            while let Some(t) = typed_tags.next_if(|t| t.stripped_position <= *plain) {
+                out.push_str(&t.content);
+            }
+            out.push(ch);
+            *plain += 1;
+        }
+    };
+    for m in TAG.find_iter(&placed) {
+        text(&mut out, &placed[last..m.start()], &mut plain);
+        out.push_str(m.as_str());
+        last = m.end();
+    }
+    text(&mut out, &placed[last..], &mut plain);
+    for t in typed_tags {
+        out.push_str(&t.content);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overrides_split_a_block_and_keep_transform_arguments_whole() {
+        assert_eq!(overrides(r"{\an8\fad(200,0)}"), [r"\an8", r"\fad(200,0)"]);
+        assert_eq!(overrides(r"{\t(0,500,\fs30)\i1}"), [r"\t(0,500,\fs30)", r"\i1"]);
+        assert_eq!(setting(r"\an8"), setting(r"\a5"));
+        assert_eq!(setting(r"\pos(1,2)"), setting(r"\move(1,2,3,4)"));
+        assert_eq!(setting(r"\1c&H00FFFF&"), setting(r"\c&HFFFFFF&"));
+        assert_ne!(setting(r"\i1"), setting(r"\an8"));
+    }
+
+    #[test]
+    fn typed_tags_keep_the_sources_hidden_ones() {
+        let src = strip_positional(r"{\an8\fad(200,200)}叶长生不会走的");
+        // Typed styling: the hidden positioning comes back in front of it.
+        assert_eq!(
+            reapply_missing(&src, r"{\i1}Ye Changsheng{\i0} won't leave."),
+            r"{\an8\fad(200,200)}{\i1}Ye Changsheng{\i0} won't leave."
+        );
+        // A typed alignment wins; the fade is still put back.
+        assert_eq!(
+            reapply_missing(&src, r"{\an2}Ye Changsheng won't leave."),
+            r"{\fad(200,200)}{\an2}Ye Changsheng won't leave."
+        );
+        // Typed text that sets everything the source did stays as typed.
+        assert_eq!(
+            reapply_missing(&src, r"{\an7\fade(0,100)}Hi"),
+            r"{\an7\fade(0,100)}Hi"
+        );
+        // Placement and positions: \move counts as positioning.
+        let sign = strip_positional(r"{\pos(320,40)}青阳镇");
+        assert_eq!(
+            reapply_missing(&sign, r"{\move(0,0,320,40)}Qingyang Town"),
+            r"{\move(0,0,320,40)}Qingyang Town"
+        );
+        // Mid-line source tags go where `reapply` puts them; typed ones stay put.
+        let mid = strip_positional(r"你好{\c&H00FFFF&}世界");
+        let out = reapply_missing(&mid, r"Hello {\b1}world{\b0}");
+        assert_eq!(strip_for_text(&out), "Hello world");
+        assert!(out.contains(r"{\c&H00FFFF&}") && out.contains(r"{\b1}world{\b0}"), "{out}");
+        // No source tags: as typed.
+        assert_eq!(reapply_missing(&strip_positional("你好"), r"{\i1}Hi"), r"{\i1}Hi");
+    }
 
     #[test]
     fn strips_override_blocks() {

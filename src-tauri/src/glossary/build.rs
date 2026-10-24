@@ -109,17 +109,85 @@ pub(crate) fn lookup_input(existing: Option<&Glossary>, new_terms: &Glossary) ->
     out
 }
 
+/// Changes someone else made to glossary.json while a build ran (an edit in
+/// a text editor, say). The build carries them into every later write, so
+/// its saves never undo them: a term set or changed outside wins over the
+/// build's, a term removed outside stays removed.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct OutsideEdits {
+    /// source → (category, translation) as set outside.
+    set: std::collections::BTreeMap<String, (&'static str, String)>,
+    removed: std::collections::BTreeSet<String>,
+    world_type: Option<String>,
+}
+
+impl OutsideEdits {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.set.is_empty() && self.removed.is_empty() && self.world_type.is_none()
+    }
+
+    /// Fold in what changed between `base` (the glossary as the build last
+    /// wrote or read it) and `current` (the file as it is now).
+    pub(crate) fn absorb(&mut self, base: Option<&Glossary>, current: &Glossary) {
+        let in_base = |c: &str, source: &str| base.and_then(|b| b.category(c).get(source));
+        for c in crate::glossary::model::CATEGORIES {
+            for (source, target) in current.category(c) {
+                if in_base(c, source) != Some(target) {
+                    self.removed.remove(source);
+                    self.set.insert(source.clone(), (c, target.clone()));
+                }
+            }
+            if let Some(base) = base {
+                for source in base.category(c).keys() {
+                    if !current.has_key(source) {
+                        self.set.remove(source);
+                        self.removed.insert(source.clone());
+                    }
+                }
+            }
+        }
+        if base.is_some_and(|b| b.world_type != current.world_type) {
+            self.world_type = Some(current.world_type.clone());
+        }
+    }
+
+    /// `g` with these edits on top.
+    pub(crate) fn apply(&self, g: &Glossary) -> Glossary {
+        let mut out = g.clone();
+        let drop_everywhere = |out: &mut Glossary, source: &str| {
+            for c in crate::glossary::model::CATEGORIES {
+                out.category_mut(c).remove(source);
+            }
+        };
+        for source in &self.removed {
+            drop_everywhere(&mut out, source);
+        }
+        for (source, (c, target)) in &self.set {
+            drop_everywhere(&mut out, source);
+            out.category_mut(c).insert(source.clone(), target.clone());
+        }
+        if let Some(world) = &self.world_type {
+            out.world_type = world.clone();
+        }
+        out
+    }
+}
+
 /// Writes the build's glossary. Before the FIRST write it saves the glossary
 /// on disk to the history (reason `scan` or `rebuild`), so the version the
 /// build started from can be restored. A save of the terms already on disk is
 /// skipped, so a build that changes nothing leaves no history entry. When the
 /// snapshot fails the write doesn't happen (and the next write tries the
 /// snapshot again): no undo, no overwrite.
+///
+/// Every save first rereads glossary.json: what someone else changed since
+/// the build last wrote or read it is kept (see [`OutsideEdits`]).
 struct BuildWriter<'a> {
     folder: &'a Path,
     snapshot: Option<GlossaryChangeKind>,
     /// What glossary.json holds, as far as this build knows.
     on_disk: Option<Glossary>,
+    outside: OutsideEdits,
     wrote: bool,
 }
 
@@ -129,12 +197,28 @@ impl<'a> BuildWriter<'a> {
             BuildMode::Append => GlossaryChangeKind::Scan,
             BuildMode::Regenerate => GlossaryChangeKind::Rebuild,
         };
-        BuildWriter { folder, snapshot: Some(reason), on_disk, wrote: false }
+        BuildWriter {
+            folder,
+            snapshot: Some(reason),
+            on_disk,
+            outside: OutsideEdits::default(),
+            wrote: false,
+        }
     }
 
-    fn save(&mut self, g: &Glossary) -> AppResult<()> {
-        if self.on_disk.as_ref() == Some(g) {
-            return Ok(());
+    /// Save `g`, merged into glossary.json as it is now. Returns what the
+    /// file holds afterwards.
+    fn save(&mut self, g: &Glossary) -> AppResult<Glossary> {
+        // A file that's gone or doesn't parse says nothing about edits.
+        if let Some(current) = load_folder_glossary(self.folder) {
+            if self.on_disk.as_ref() != Some(&current) {
+                self.outside.absorb(self.on_disk.as_ref(), &current);
+                self.on_disk = Some(current);
+            }
+        }
+        let next = self.outside.apply(g);
+        if self.on_disk.as_ref() == Some(&next) {
+            return Ok(next);
         }
         if let Some(reason) = self.snapshot {
             history::snapshot(self.folder, reason).map_err(|e| {
@@ -142,10 +226,10 @@ impl<'a> BuildWriter<'a> {
             })?;
             self.snapshot = None;
         }
-        save_folder_glossary(self.folder, g)?;
-        self.on_disk = Some(g.clone());
+        save_folder_glossary(self.folder, &next)?;
+        self.on_disk = Some(next.clone());
         self.wrote = true;
-        Ok(())
+        Ok(next)
     }
 }
 
@@ -485,20 +569,25 @@ pub async fn build_glossary(
     }
 
     // ── Merge: existing terms win (build step 8) ────────────────────────────
-    let result = merged_with_existing(existing.as_ref(), &new_terms);
+    let mut result = merged_with_existing(existing.as_ref(), &new_terms);
 
     // ── Saving: final write; empty result writes nothing, ever ──────────────
+    // The writer merges into the file as it is now, so edits made elsewhere
+    // during the build survive; `result` becomes what the file holds.
     phase(&tx, GlossaryPhase::Saving, None).await;
     if !result.is_empty() {
-        if let Err(e) = writer.save(&result) {
-            // The ONLY Error event in the build. The last incremental save
-            // remains on disk.
-            let _ = tx
-                .send(GlossaryEvent::Error {
-                    message: format!("Couldn't save {}: {e}", glossary_path.display()),
-                })
-                .await;
-            return;
+        match writer.save(&result) {
+            Ok(saved) => result = saved,
+            Err(e) => {
+                // The ONLY Error event in the build. The last incremental save
+                // remains on disk.
+                let _ = tx
+                    .send(GlossaryEvent::Error {
+                        message: format!("Couldn't save {}: {e}", glossary_path.display()),
+                    })
+                    .await;
+                return;
+            }
         }
     }
 
@@ -510,7 +599,15 @@ pub async fn build_glossary(
     } else {
         result.clone()
     };
-    let diff = GlossaryDiff::compute(diff_base.as_ref(), &persisted);
+    // What changed by this build: edits made elsewhere meanwhile are kept in
+    // the file, but they aren't the build's (nor its NEW terms).
+    let before = if writer.outside.is_empty() || result.is_empty() {
+        diff_base.clone()
+    } else {
+        let base = diff_base.clone().unwrap_or_else(|| Glossary::new(&job.world_type));
+        Some(writer.outside.apply(&base))
+    };
+    let diff = GlossaryDiff::compute(before.as_ref(), &persisted);
 
     // ── Meta: what this build changed ───────────────────────────────────────
     // Files count as scanned only when every batch made it: batches span
@@ -522,7 +619,7 @@ pub async fn build_glossary(
     if !result.is_empty() && (writer.wrote || complete) {
         let scanned: &[String] = if complete { &loaded_files } else { &[] };
         if let Err(e) =
-            record_build(&job.folder, job.mode, diff_base.as_ref(), &result, scanned, diff.clone())
+            record_build(&job.folder, job.mode, before.as_ref(), &result, scanned, diff.clone())
         {
             log(&tx, LogLevel::Warning, format!("couldn't update the glossary's notes: {e}")).await;
         }
@@ -1513,5 +1610,121 @@ mod tests {
         run_and_collect(job(dir.path(), vec!["e2.ass".into()], cancel), &svc, None).await;
         assert!(history::list(dir.path()).is_empty());
         assert!(crate::glossary::meta::read_meta(dir.path()).is_none(), "no sidecar written");
+    }
+
+    // ── edits made elsewhere while a build runs ─────────────────────────────
+
+    #[test]
+    fn outside_edits_are_what_changed_since_the_build_last_looked() {
+        let base = chars(&[("林动", "Lin Dong"), ("应欢欢", "Ying Huanhuan"), ("小貂", "Little Marten")]);
+        let mut current = chars(&[("林动", "Lin Dong (yours)"), ("小炎", "Little Flame")]);
+        current.locations.insert("小貂".into(), "Little Marten".into()); // moved category
+        let mut edits = OutsideEdits::default();
+        edits.absorb(Some(&base), &current);
+        assert!(!edits.is_empty());
+
+        // The build's own version: it never saw any of that.
+        let mut build = base.clone();
+        build.characters.insert("青檀".into(), "Qing Tan".into());
+        let merged = edits.apply(&build);
+        assert_eq!(merged.characters.get("林动").map(String::as_str), Some("Lin Dong (yours)"));
+        assert_eq!(merged.characters.get("小炎").map(String::as_str), Some("Little Flame"));
+        assert!(!merged.has_key("应欢欢"), "removed elsewhere stays removed");
+        assert_eq!(merged.locations.get("小貂").map(String::as_str), Some("Little Marten"));
+        assert!(!merged.characters.contains_key("小貂"));
+        assert_eq!(merged.characters.get("青檀").map(String::as_str), Some("Qing Tan"), "the build's term lands");
+
+        // Nothing changed: nothing to carry.
+        let mut none = OutsideEdits::default();
+        none.absorb(Some(&base), &base);
+        assert!(none.is_empty());
+        assert_eq!(none.apply(&build), build);
+    }
+
+    #[test]
+    fn the_build_writer_keeps_edits_made_since_its_last_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = chars(&[("林动", "Lin Dong")]);
+        crate::glossary::io::save_folder_glossary(dir.path(), &start).unwrap();
+        let mut writer = BuildWriter::new(dir.path(), BuildMode::Append, Some(start.clone()));
+
+        // Someone adds a term while the build works.
+        let mut edited = start.clone();
+        edited.characters.insert("应欢欢".into(), "Ying Huanhuan".into());
+        crate::glossary::io::save_folder_glossary(dir.path(), &edited).unwrap();
+
+        let mut found = start.clone();
+        found.locations.insert("青阳镇".into(), "Qingyang Town".into());
+        let saved = writer.save(&found).unwrap();
+        assert!(saved.has_key("应欢欢") && saved.has_key("青阳镇"));
+        assert_eq!(load_folder_glossary(dir.path()).as_ref(), Some(&saved));
+
+        // A later save of the build's own result (which never had it) keeps it too.
+        let mut more = found.clone();
+        more.items.insert("祖石".into(), "Ancestral Stone".into());
+        let saved = writer.save(&more).unwrap();
+        assert!(saved.has_key("应欢欢") && saved.has_key("祖石"));
+        assert_eq!(load_folder_glossary(dir.path()).as_ref(), Some(&saved));
+    }
+
+    /// Edits glossary.json (as a text editor would) on its `at`-th request.
+    struct EditOnCall {
+        inner: Arc<ScriptedDriver>,
+        at: u32,
+        calls: std::sync::atomic::AtomicU32,
+        folder: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmDriver for EditOnCall {
+        async fn complete(&self, _s: &str, _u: &str) -> Result<String, LlmError> {
+            unreachable!()
+        }
+        async fn stream(&self, req: &crate::llm::LlmRequest) -> Result<crate::llm::LlmResponse, LlmError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.at {
+                let mut g = load_folder_glossary(&self.folder).unwrap();
+                g.characters.insert("应欢欢".into(), "Ying Huanhuan".into());
+                crate::glossary::io::save_folder_glossary(&self.folder, &g).unwrap();
+            }
+            self.inner.stream(req).await
+        }
+        async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+            Ok(vec![])
+        }
+        fn model(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_term_added_during_a_build_survives_its_final_save() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("林动", "Lin Dong")])).unwrap();
+        write_ass(dir.path(), "e2.ass", &["一", "二"]); // 2 batches
+        let cancel = CancellationToken::new();
+        let driver = Arc::new(EditOnCall {
+            inner: ScriptedDriver::new(vec![
+                Ok(r#"{"locations":{"青阳镇":"Qingyang Town"}}"#.into()),
+                Ok(r#"{"characters":{"应笑笑":"Ying Xiaoxiao"}}"#.into()),
+            ]),
+            at: 2,
+            calls: Default::default(),
+            folder: dir.path().to_path_buf(),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let svc = LlmService::new(driver, 1, cancel.clone(), tx);
+        let (_events, s) =
+            run_and_collect(job(dir.path(), vec!["e2.ass".into()], cancel), &svc, None).await;
+
+        let saved = load_folder_glossary(dir.path()).unwrap();
+        for term in ["林动", "青阳镇", "应笑笑", "应欢欢"] {
+            assert!(saved.has_key(term), "{term} missing from {saved:?}");
+        }
+        assert_eq!(s.terms_final, 4);
+        // The build reports (and marks NEW) only what it found itself.
+        assert_eq!(s.diff.total_added, 2);
+        let unreviewed = load_meta(dir.path()).unreviewed;
+        assert!(!unreviewed.values().flatten().any(|t| t == "应欢欢"), "{unreviewed:?}");
     }
 }
