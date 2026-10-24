@@ -1,12 +1,8 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
-import { ProjectPage } from "@/features/project/project-page";
-import { useAppStore } from "@/stores/app-store";
 
+/** Project and Translate became Episodes; old links land there. */
 export const Route = createFileRoute("/project")({
   beforeLoad: () => {
-    // Without a folder, "Project" means Welcome: anything navigating here lands
-    // on "/" instead of a dead-end view.
-    if (!useAppStore.getState().workdir) throw redirect({ to: "/" });
+    throw redirect({ to: "/episodes" });
   },
-  component: ProjectPage,
 });
