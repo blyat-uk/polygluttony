@@ -67,7 +67,10 @@ function Episodes({ folder }: { folder: string }) {
   });
   const { data: stored } = useFolderResults(folder);
   const hasGlossary = !!view?.supports_glossary && view.glossary_terms != null;
-  const { data: glossary } = useGlossaryLoad(folder, hasGlossary);
+  // Read whenever the folder can have one: a glossary.json that can't be read
+  // counts no terms, and the page says so instead of "No glossary yet".
+  const { data: glossary } = useGlossaryLoad(folder, !!view?.supports_glossary);
+  const glossaryBroken = !!view?.supports_glossary && glossary?.status === "unreadable";
 
   const translationLabel = useAppStore((s) => s.translationLabel);
   const hasUsableConnection = useAppStore((s) => s.hasUsableConnection);
@@ -256,6 +259,7 @@ function Episodes({ folder }: { folder: string }) {
         <FolderSettings
           view={view}
           languages={languages}
+          glossaryBroken={glossaryBroken}
           locked={runningHere}
           onChange={(next) => void persist(next)}
         />
@@ -305,6 +309,7 @@ function Episodes({ folder }: { folder: string }) {
         blocked={blocked}
         estimate={estimateLine(lines, translationLabel, view.glossary_terms)}
         addToGlossary={addToGlossary}
+        note={glossaryBroken ? "The glossary can't be read, so this run won't use it." : null}
         logs={ours ? run.logs : []}
         logsOpen={logsOpen}
         onToggleLogs={() => setLogsOpen((o) => !o)}

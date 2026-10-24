@@ -27,7 +27,12 @@ export const languageName = (languages: Language[] | undefined, code: string) =>
 /** "Chinese → English · World type: Xianxia · Tone: Xianxia · Glossary 232 terms".
  *  World only shows when the source language detects one; the glossary part
  *  only when the source language supports a glossary. */
-export function settingsSummary(view: ProjectView, languages: Language[] | undefined): string {
+export function settingsSummary(
+  view: ProjectView,
+  languages: Language[] | undefined,
+  /** glossary.json is there but can't be read: the caller says so itself. */
+  glossaryBroken = false,
+): string {
   const { prefs } = view;
   const source = languages?.find((l) => l.code === prefs.source_lang);
   const parts = [
@@ -37,7 +42,7 @@ export function settingsSummary(view: ProjectView, languages: Language[] | undef
     parts.push(`World type: ${titleCase(prefs.world_override ?? view.detected_world)}`);
   }
   parts.push(`Tone: ${titleCase(prefs.tone)}`);
-  if (view.supports_glossary) {
+  if (view.supports_glossary && !glossaryBroken) {
     parts.push(
       view.glossary_terms == null ? "No glossary yet" : `Glossary ${plural(view.glossary_terms, "term")}`,
     );
