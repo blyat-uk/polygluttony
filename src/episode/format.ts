@@ -86,8 +86,13 @@ export function issuesByLine(issues: readonly VerifyIssue[]): Map<number, Verify
 export type ActivityTone = "live" | "idle" | "done" | "warn" | "failed";
 
 /** One line under the file name. `since` (epoch ms) asks the header to append a
- *  ticking ` · 34s`. */
-export type ActivityLine = { text: string; tone: ActivityTone; since: number | null };
+ *  ticking ` · 34s`; `until` (epoch ms) a countdown ` · 18s` instead. */
+export type ActivityLine = {
+  text: string;
+  tone: ActivityTone;
+  since: number | null;
+  until?: number | null;
+};
 
 const BUSY_LABEL: Partial<Record<EpisodeSnapshot["state"], string>> = {
   translating: "Translating",
@@ -105,6 +110,13 @@ export function describeActivity(
     const why = s.error ?? s.detail;
     return { text: why ? `Failed: ${why}` : "Failed", tone: "failed", since: null };
   }
+  if (s.state === "stopped") {
+    return {
+      text: s.error ? `Not finished · ${s.error}` : "Not finished · the run stopped",
+      tone: "idle",
+      since: null,
+    };
+  }
   if (s.state === "done" || s.state === "warning") {
     if (flaggedLines > 0) {
       return {
@@ -113,13 +125,27 @@ export function describeActivity(
         since: null,
       };
     }
-    // A warning whose issues name no line still needs a look.
+    // Every flagged line is settled; the file keeps its .warning name until
+    // it's marked done.
     return s.state === "warning"
-      ? { text: "Done · needs a look", tone: "warn", since: null }
+      ? { text: "Done · nothing left to look at", tone: "done", since: null }
       : { text: "Done", tone: "done", since: null };
   }
 
   const a = s.activity;
+  if (a && s.throttle) {
+    // A wait the provider asked for: never model time.
+    return {
+      text: `Waiting — ${s.throttle.provider} asked us to slow down`,
+      tone: "idle",
+      since: null,
+      until: s.throttle.until_ms,
+    };
+  }
+  if (a && s.activity_since_ms === null) {
+    // Announced, not out yet: waiting for a free slot or a retry.
+    return { text: `${withLines("Waiting to send", liveIds)}${part(a)}`, tone: "idle", since: null };
+  }
   if (a) {
     const since = s.activity_since_ms;
     switch (a.kind) {
@@ -136,11 +162,7 @@ export function describeActivity(
           since,
         };
       case "retranslate":
-        return {
-          text: `${withLines("Retranslating", liveIds)} · attempt ${a.attempt} of ${a.max_attempts}`,
-          tone: "live",
-          since,
-        };
+        return { text: `${withLines("Retranslating", liveIds)}${part(a)}`, tone: "live", since };
     }
   }
 
@@ -156,6 +178,24 @@ export function describeActivity(
   }
   const label = BUSY_LABEL[s.state] ?? "Working";
   return { text: s.detail ? `${label} · ${s.detail}` : label, tone: "live", since: null };
+}
+
+/** ` · batch 2 of 3`, ` · attempt 1 of 3`; nothing for a single retranslation
+ *  (a reviewer's own request) or the cleanup pass. */
+function part(a: NonNullable<EpisodeSnapshot["activity"]>): string {
+  switch (a.kind) {
+    case "batch":
+      return ` · batch ${a.batch} of ${a.total_batches}`;
+    case "retranslate":
+      return a.max_attempts > 1 ? ` · attempt ${a.attempt} of ${a.max_attempts}` : "";
+    case "cleanup":
+      return "";
+  }
+}
+
+/** Seconds left until `until` (epoch ms), never below zero. */
+export function secondsLeft(until: number, now: number): number {
+  return Math.max(0, Math.ceil((until - now) / 1000));
 }
 
 /** `Sending lines 261–388`, `Sending line 7`, or just `Sending` with no ids. */

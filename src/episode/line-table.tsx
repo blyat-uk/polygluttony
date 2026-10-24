@@ -3,9 +3,9 @@ import { elementScroll, useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDownIcon, ArrowUpIcon } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import type { EpisodeLine } from "@/types/generated/EpisodeLine";
-import type { VerifyIssue } from "@/types/generated/VerifyIssue";
 import { estimateRowHeight } from "./format";
 import { CELL_PAD, LineRow, ROW_GRID } from "./line-row";
+import type { LineFlag } from "./review";
 import { usePrefersReducedMotion } from "./use-reduced-motion";
 
 /** How long after landing a translation keeps its fade: at least the
@@ -32,18 +32,26 @@ const COLUMNS = ["#", "Time", "Original", "Translation"] as const;
 
 type ExpectedScroll = { target: number; smooth: boolean; at: number };
 
+/** A request to scroll to a line and select it; a new `seq` asks again. */
+export type GoTo = { id: number; seq: number };
+
 export function LineTable({
   lines,
   live,
-  issues,
+  flags,
   landed,
+  selectedId,
+  goTo,
 }: {
   lines: EpisodeLine[];
   /** Indices of the lines being sent or re-sent, ascending. */
   live: number[];
-  issues: Map<number, VerifyIssue[]>;
+  /** Lines that need a look. */
+  flags: ReadonlyMap<number, LineFlag>;
   /** Line id → when its translation landed (`performance.now()`). */
   landed: ReadonlyMap<number, number>;
+  selectedId: number | null;
+  goTo: GoTo | null;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const reducedMotion = usePrefersReducedMotion();
@@ -128,6 +136,25 @@ export function LineTable({
     if (isNew && followRef.current) scrollToLive(live[0]);
   }, [live, lines, scrollToLive]);
 
+  // Go to a line (on open, from the navigator, from another window): it
+  // wins over following the live batch. A frame later, so it lands after the
+  // virtualizer has set itself up (it scrolls to its initial offset then).
+  const doneGoTo = useRef(0);
+  useLayoutEffect(() => {
+    if (!goTo || goTo.seq === doneGoTo.current || lines.length === 0) return;
+    const index = lines.findIndex((l) => l.id === goTo.id);
+    if (index < 0) return;
+    setFollow(false);
+    virtualizer.cancelScroll();
+    const frame = requestAnimationFrame(() => {
+      doneGoTo.current = goTo.seq;
+      followPad.current = 0;
+      virtualizer.options.scrollPaddingStart = 0;
+      virtualizer.scrollToIndex(index, { align: "center", behavior: "auto" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [goTo, lines, virtualizer, setFollow]);
+
   // User scrolls turn follow off. Input that scrolls (wheel, touch drag, scroll
   // keys) counts at once; any other scroll event counts unless it lines up with
   // one of the virtualizer's own scroll writes. That catches scrollbar drags
@@ -147,7 +174,7 @@ export function LineTable({
     const onKey = (e: KeyboardEvent) => {
       if (!SCROLL_KEYS.has(e.key)) return;
       const t = e.target as HTMLElement | null;
-      // Space or arrows on the issue marker don't scroll.
+      // Space or arrows in a button or the line editor don’t scroll.
       if (t && t !== el && t.closest("button, a, input, textarea, select")) return;
       userScrolled();
     };
@@ -245,7 +272,7 @@ export function LineTable({
         ref={scrollRef}
         role="rowgroup"
         tabIndex={0}
-        className="min-h-0 flex-1 overflow-y-auto outline-none [overflow-anchor:none] focus-visible:shadow-[inset_0_0_0_1px_color-mix(in_oklch,var(--color-gold)_35%,transparent)]"
+        className="min-h-0 flex-1 overflow-y-auto outline-none [overflow-anchor:none] selection:bg-[color:color-mix(in_oklch,var(--color-gold)_32%,transparent)] selection:text-[color:var(--color-ink-emphasis)] focus-visible:shadow-[inset_0_0_0_1px_color-mix(in_oklch,var(--color-gold)_35%,transparent)]"
       >
         <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
           {items.map((item) => {
@@ -257,7 +284,8 @@ export function LineTable({
                 line={line}
                 index={item.index}
                 start={item.start}
-                issues={issues.get(line.id)}
+                flag={flags.get(line.id)}
+                selected={line.id === selectedId}
                 fresh={now - (landed.get(line.id) ?? -Infinity) < LAND_WINDOW_MS}
                 measure={virtualizer.measureElement}
               />
