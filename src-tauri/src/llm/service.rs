@@ -15,6 +15,14 @@ use crate::events::{LogLevel, LogPhase, RunEvent};
 use crate::llm::error::{LlmError, CANCELLED_MSG};
 use crate::llm::{LlmDriver, LlmRequest, LlmResponse};
 
+tokio::task_local! {
+    /// The episode the current task translates. Set around a translation
+    /// file task (`pipeline::translate_file`); the service then tells the
+    /// live board when each of that episode's requests really goes out, so a
+    /// wait for a slot or a rate-limit pause never reads as model time.
+    pub static REQUEST_FILE: String;
+}
+
 const MAX_ATTEMPTS: u32 = 3;
 const SUCCESS_STREAK_FOR_RAISE: u32 = 5;
 const BASE_BACKOFF_MS: u64 = 1_000;
@@ -28,6 +36,8 @@ struct PermitState {
 
 pub struct LlmService {
     driver: Arc<dyn LlmDriver>,
+    /// Who answers, for messages: "Anthropic", or "The server" for a custom URL.
+    who: String,
     cap: u32,
     state: Mutex<PermitState>,
     notify: Notify,
@@ -45,6 +55,7 @@ impl LlmService {
         let cap = cap.max(1);
         LlmService {
             driver,
+            who: "The provider".into(),
             cap,
             state: Mutex::new(PermitState {
                 limit: cap,
@@ -55,6 +66,28 @@ impl LlmService {
             notify: Notify::new(),
             cancel,
             tx,
+        }
+    }
+
+    /// Name who answers, for the run's messages ("Anthropic asked us to slow down").
+    pub fn with_provider(mut self, who: impl Into<String>) -> Self {
+        self.who = who.into();
+        self
+    }
+
+    pub fn who(&self) -> &str {
+        &self.who
+    }
+
+    /// The model id requests go to.
+    pub fn model(&self) -> &str {
+        self.driver.model()
+    }
+
+    /// Internal live-board event for the episode this task translates, if any.
+    async fn tell_board(&self, event: impl FnOnce(String) -> RunEvent) {
+        if let Ok(file) = REQUEST_FILE.try_with(Clone::clone) {
+            let _ = self.tx.send(event(file)).await;
         }
     }
 
@@ -104,11 +137,14 @@ impl LlmService {
         }
     }
 
+    /// Returns how long every request now waits when this outcome started or
+    /// lengthened a rate-limit pause.
     async fn release(
         &self,
         outcome: &Result<LlmResponse, LlmError>,
         retry_after: Option<Duration>,
-    ) {
+    ) -> Option<Duration> {
+        let mut paused = None;
         let mut s = self.state.lock().await;
         s.in_flight -= 1;
         match outcome {
@@ -130,12 +166,16 @@ impl LlmService {
                 let until = now + retry_after.unwrap_or(Duration::from_millis(BASE_BACKOFF_MS));
                 // Clamp to the max: a shorter retry_after must never shorten an
                 // existing pause window.
+                if s.pause_until.is_none_or(|t| until > t) {
+                    paused = Some(until - now);
+                }
                 s.pause_until = Some(s.pause_until.map_or(until, |t| t.max(until)));
             }
             Err(_) => s.streak = 0,
         }
         drop(s);
         self.notify.notify_waiters();
+        paused
     }
 
     /// Acquire → stream → classify; transport-retryable errors retried with
@@ -148,6 +188,7 @@ impl LlmService {
                 return Err(LlmError::Transport(CANCELLED_MSG.into()));
             }
             self.acquire().await?;
+            self.tell_board(|file| RunEvent::RequestSent { file }).await;
             let started = Instant::now();
             let outcome = tokio::select! {
                 _ = self.cancel.cancelled() => Err(LlmError::Transport(CANCELLED_MSG.into())),
@@ -159,7 +200,11 @@ impl LlmService {
                 ))),
                 _ => None,
             };
-            self.release(&outcome, retry_after).await;
+            if let Some(wait) = self.release(&outcome, retry_after).await {
+                let seconds = wait.as_secs_f64().ceil().max(1.0) as u32;
+                let provider = self.who.clone();
+                let _ = self.tx.send(RunEvent::Throttled { seconds, provider }).await;
+            }
 
             match outcome {
                 Ok(resp) => {
@@ -179,10 +224,11 @@ impl LlmService {
                         .await;
                     return Ok(resp);
                 }
-                Err(e) if e.is_auth() => return Err(e),
+                Err(e) if e.is_auth() || e.is_fatal() => return Err(e),
                 Err(e) if !e.is_retryable() => return Err(e),
                 Err(e) => {
                     if attempt < MAX_ATTEMPTS {
+                        self.tell_board(|file| RunEvent::RequestWaiting { file }).await;
                         let jitter = rand::rng().random::<u64>() % 250;
                         let backoff = Duration::from_millis(
                             BASE_BACKOFF_MS * 2u64.pow(attempt - 1) + jitter,
@@ -202,8 +248,11 @@ impl LlmService {
     }
 }
 
+/// The provider asking us to slow down. An account out of credit can also
+/// answer 429, but no pause fixes that.
 fn is_throttle(e: &LlmError) -> bool {
     matches!(e, LlmError::Http { status: 429 | 529, .. })
+        && e.kind() != crate::events::ErrorKind::Billing
 }
 
 #[cfg(test)]
@@ -317,6 +366,64 @@ mod tests {
         // The retry's acquire must wait out the server-mandated 7s pause window;
         // computed backoff alone would be ~1s.
         assert!(t0.elapsed() >= Duration::from_secs(7), "elapsed {:?}", t0.elapsed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_tells_the_run_who_and_how_long() {
+        let d = ScriptedDriver::new(vec![
+            Err(LlmError::Http { status: 429, body: "slow".into(), retry_after: Some(18) }),
+            Ok("ok".into()),
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let s = LlmService::new(d, 2, CancellationToken::new(), tx).with_provider("Anthropic");
+        s.request(req()).await.unwrap();
+        drop(s);
+        let mut throttled = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            if let RunEvent::Throttled { seconds, provider } = ev {
+                throttled.push((seconds, provider));
+            }
+        }
+        assert_eq!(throttled, vec![(18, "Anthropic".to_string())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_tell_the_board_when_they_go_out_and_when_they_wait() {
+        let d = ScriptedDriver::new(vec![Err(LlmError::Transport("reset".into())), Ok("ok".into())]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let s = LlmService::new(d, 2, CancellationToken::new(), tx);
+        REQUEST_FILE.scope("ep01.ass".to_string(), s.request(req())).await.unwrap();
+        // Outside a file task nothing is told.
+        let d2 = ScriptedDriver::new(vec![Ok("ok".into())]);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(64);
+        LlmService::new(d2, 2, CancellationToken::new(), tx2).request(req()).await.unwrap();
+        drop(s);
+        let mut seen = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                RunEvent::RequestSent { file } => seen.push(format!("sent {file}")),
+                RunEvent::RequestWaiting { file } => seen.push(format!("waiting {file}")),
+                _ => {}
+            }
+        }
+        assert_eq!(seen, ["sent ep01.ass", "waiting ep01.ass", "sent ep01.ass"]);
+        while let Some(ev) = rx2.recv().await {
+            assert!(!ev.is_internal(), "no board events outside a file task: {ev:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn out_of_credit_is_not_retried_or_paused_for() {
+        let d = ScriptedDriver::new(vec![Err(LlmError::Http {
+            status: 429,
+            body: r#"{"error":{"code":"insufficient_quota"}}"#.into(),
+            retry_after: None,
+        })]);
+        let s = service(d.clone(), 4);
+        let err = s.request(req()).await.unwrap_err();
+        assert_eq!(err.kind(), crate::events::ErrorKind::Billing);
+        assert_eq!(d.call_count(), 1);
+        assert_eq!(s.current_limit(), 4);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
