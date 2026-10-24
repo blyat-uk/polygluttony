@@ -80,6 +80,9 @@ pub struct SourceFile {
     pub translation: TranslationState,
     /// Both the clean and the `.warning` output exist (an old leftover).
     pub both_variants: bool,
+    /// Path of the output that stands for this episode (the clean one when it
+    /// exists, else the `.warning` one); `None` when nothing is on disk.
+    pub output_path: Option<String>,
 }
 
 /// What translation output exists next to a source file.
@@ -107,4 +110,7 @@ pub struct ProjectView {
     pub supports_glossary: bool,
     /// Number of glossary terms in `glossary.json`, or `None` if no glossary exists.
     pub glossary_terms: Option<u32>,
+    /// No preferences were saved for this folder yet: the detected settings
+    /// are worth a look, so the Episodes page opens them.
+    pub first_visit: bool,
 }

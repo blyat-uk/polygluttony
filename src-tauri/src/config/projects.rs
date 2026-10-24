@@ -37,8 +37,9 @@ pub struct FolderPrefs {
     pub target_lang: String,
     pub world_override: Option<WorldType>,
     pub tone: Tone,
-    /// Explicit list of selected file names (empty = none selected). A freshly
-    /// opened folder is seeded with all files selected; see `open_folder`.
+    /// Explicit list of ticked file names (empty = none ticked). Kept here
+    /// during a session, but never restored: every open ticks the episodes
+    /// that have no translation yet; see `open_folder`.
     #[serde(default)]
     pub selected_files: Vec<String>,
 }
@@ -98,10 +99,8 @@ pub fn set_prefs(cfg: &mut ProjectsConfig, path: &str, prefs: FolderPrefs) {
     cfg.folders.insert(path.to_string(), prefs);
 }
 
-/// Resolve effective prefs for a freshly opened folder: saved prefs win; otherwise
-/// seed source from detection → global default, target from global default.
 /// Tone implied by a detected/overridden world type. Keep in sync with
-/// `toneForWorld` in `src/features/project/project-page.tsx`.
+/// `toneForWorld` in `src/features/episodes/folder-labels.ts`.
 pub fn tone_for_world(world: crate::glossary::world_detector::WorldType) -> Tone {
     use crate::glossary::world_detector::WorldType;
     match world {
@@ -111,6 +110,8 @@ pub fn tone_for_world(world: crate::glossary::world_detector::WorldType) -> Tone
     }
 }
 
+/// Resolve effective prefs for a freshly opened folder: saved prefs win; otherwise
+/// seed source from detection → global default, target from global default.
 pub fn resolve_prefs(
     saved: Option<FolderPrefs>,
     detected_source: Option<&str>,

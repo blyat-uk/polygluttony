@@ -1,4 +1,4 @@
-//! Discover source `.ass` files in a folder and detect existing translations.
+//! Discover source `.ass` files in a folder and read their translation output.
 //! Ported from `utils/file_utils.py`.
 
 use std::collections::HashSet;
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::models::language_pair::{
     output_filename, strip_language_suffix, warning_filename, LanguagePair,
 };
+use crate::models::TranslationState;
 
 /// All `.ass` files in `dir` (non-recursive) that are *source* files — not
 /// themselves translation outputs. A file tagged with the target language
@@ -65,11 +66,34 @@ pub fn discover_source_files(dir: &Path, pair: &LanguagePair) -> Vec<PathBuf> {
     files
 }
 
-/// Whether `source` already has a translation (output or warning file present).
-pub fn has_existing_translation(source: &Path, pair: &LanguagePair) -> bool {
+/// The translation output next to a source file, as it is on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputOnDisk {
+    pub state: TranslationState,
+    /// Both the clean and the `.warning` output exist (an old leftover).
+    pub both_variants: bool,
+    /// The output that stands for the episode: the clean one when it exists,
+    /// else the `.warning` one; `None` when there's neither.
+    pub path: Option<PathBuf>,
+}
+
+/// What translation output exists next to `source`. A clean output wins over a
+/// `.warning` one: the episode is done, the warning file is a leftover.
+pub fn output_on_disk(source: &Path, pair: &LanguagePair) -> OutputOnDisk {
     let dir = source.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(output_filename(source, pair)).exists()
-        || dir.join(warning_filename(source, pair)).exists()
+    let clean = dir.join(output_filename(source, pair));
+    let warning = dir.join(warning_filename(source, pair));
+    let (has_clean, has_warning) = (clean.is_file(), warning.is_file());
+    let (state, path) = match (has_clean, has_warning) {
+        (true, _) => (TranslationState::Done, Some(clean)),
+        (false, true) => (TranslationState::NeedsLook, Some(warning)),
+        (false, false) => (TranslationState::None, None),
+    };
+    OutputOnDisk {
+        state,
+        both_variants: has_clean && has_warning,
+        path,
+    }
 }
 
 #[cfg(test)]
@@ -100,9 +124,10 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["ep01.ass", "ep02.ass", "ep03.ass"]);
 
-        assert!(has_existing_translation(&p.join("ep01.ass"), &pair));
-        assert!(has_existing_translation(&p.join("ep03.ass"), &pair));
-        assert!(!has_existing_translation(&p.join("ep02.ass"), &pair));
+        let state = |n: &str| output_on_disk(&p.join(n), &pair).state;
+        assert_eq!(state("ep01.ass"), TranslationState::Done);
+        assert_eq!(state("ep03.ass"), TranslationState::NeedsLook);
+        assert_eq!(state("ep02.ass"), TranslationState::None);
     }
 
     #[test]
@@ -128,5 +153,54 @@ mod tests {
             .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["ep01.ass", "ep02.chi.ass", "movie.en.ass"]);
+    }
+
+    #[test]
+    fn output_on_disk_reads_clean_warning_and_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        for name in [
+            "ep01.ass",
+            "ep01.eng.ass",
+            "ep02.ass",
+            "ep02.warning.eng.ass",
+            "ep03.ass",
+            "ep04.ass",
+            "ep04.eng.ass",
+            "ep04.warning.eng.ass",
+        ] {
+            fs::write(p.join(name), "x").unwrap();
+        }
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+
+        let done = output_on_disk(&p.join("ep01.ass"), &pair);
+        assert_eq!(done.state, TranslationState::Done);
+        assert!(!done.both_variants);
+        assert_eq!(done.path, Some(p.join("ep01.eng.ass")));
+
+        let look = output_on_disk(&p.join("ep02.ass"), &pair);
+        assert_eq!(look.state, TranslationState::NeedsLook);
+        assert!(!look.both_variants);
+        assert_eq!(look.path, Some(p.join("ep02.warning.eng.ass")));
+
+        let none = output_on_disk(&p.join("ep03.ass"), &pair);
+        assert_eq!(none.state, TranslationState::None);
+        assert_eq!(none.path, None);
+
+        // Clean wins; the warning file is an old leftover.
+        let both = output_on_disk(&p.join("ep04.ass"), &pair);
+        assert_eq!(both.state, TranslationState::Done);
+        assert!(both.both_variants);
+        assert_eq!(both.path, Some(p.join("ep04.eng.ass")));
+    }
+
+    #[test]
+    fn a_folder_named_like_an_output_is_not_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        fs::write(p.join("ep01.ass"), "x").unwrap();
+        fs::create_dir(p.join("ep01.eng.ass")).unwrap();
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+        assert_eq!(output_on_disk(&p.join("ep01.ass"), &pair).state, TranslationState::None);
     }
 }
