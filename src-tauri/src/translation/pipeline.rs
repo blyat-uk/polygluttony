@@ -722,17 +722,13 @@ impl<'j, 'a> FileState<'j, 'a> {
                         self.log(
                             LogLevel::Debug,
                             LogPhase::Batch,
+                            // Plain words: the Logs drawer shows every level.
                             match d.suspected_drift_start_id {
                                 Some(line) => format!(
-                                    "drift suspected from line {line} (score {:.2}, threshold {})",
-                                    d.score,
-                                    drift::THRESHOLD
+                                    "Lines from line {line} on may not match the original. Verify will check them."
                                 ),
-                                None => format!(
-                                    "drift suspected (score {:.2}, threshold {})",
-                                    d.score,
-                                    drift::THRESHOLD
-                                ),
+                                None => "Some lines in this batch may not match the original. Verify will check them."
+                                    .to_string(),
                             },
                         )
                         .await;
