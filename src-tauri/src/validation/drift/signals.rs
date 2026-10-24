@@ -109,41 +109,67 @@ pub fn punctuation(pairs: &[LinePair]) -> Signal {
 ///
 /// Score = min(1.0, violations / max(1, checks * 0.5))
 pub fn glossary_position(pairs: &[LinePair], terms: &BTreeMap<String, String>) -> Signal {
-    if terms.is_empty() {
+    let (checks, misses) = glossary_checks(pairs, terms);
+    if checks == 0 {
         return (0.0, None, BTreeSet::new());
+    }
+    let violations = misses.len();
+    let first = misses.first().map(|m| m.line_id);
+    let flagged: BTreeSet<u32> = misses.iter().map(|m| m.line_id).collect();
+
+    let score = (violations as f64 / (1.0f64).max(checks as f64 * 0.5)).min(1.0);
+    (score, first, flagged)
+}
+
+/// A glossary term whose source is in a line but whose translation isn't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlossaryMiss {
+    pub line_id: u32,
+    pub term: String,
+    pub expected: String,
+}
+
+/// Every glossary miss, in line order (terms in glossary order within a
+/// line): exactly the violations [`glossary_position`] scores.
+pub fn glossary_misses(pairs: &[LinePair], terms: &BTreeMap<String, String>) -> Vec<GlossaryMiss> {
+    glossary_checks(pairs, terms).1
+}
+
+/// (checks made, misses found) — the one walk both the score and the
+/// per-line name issues come from, so they can never disagree.
+fn glossary_checks(
+    pairs: &[LinePair],
+    terms: &BTreeMap<String, String>,
+) -> (usize, Vec<GlossaryMiss>) {
+    if terms.is_empty() {
+        return (0, Vec::new());
     }
 
     // Precompute lowercased translations once — avoids repeated allocation inside the inner loop.
-    let terms_lower: Vec<(&String, String)> = terms
+    let terms_lower: Vec<(&String, &String, String)> = terms
         .iter()
-        .map(|(term, tr)| (term, tr.to_lowercase()))
+        .map(|(term, tr)| (term, tr, tr.to_lowercase()))
         .collect();
 
-    let mut violations = 0usize;
     let mut checks = 0usize;
-    let mut first: Option<u32> = None;
-    let mut flagged = BTreeSet::new();
+    let mut misses = Vec::new();
 
     for p in pairs {
         let tgt_lower = p.tgt.to_lowercase();
-        for (term, tr_lower) in &terms_lower {
+        for (term, tr, tr_lower) in &terms_lower {
             if p.src.contains(term.as_str()) {
                 checks += 1;
                 if !tgt_lower.contains(tr_lower.as_str()) {
-                    violations += 1;
-                    first.get_or_insert(p.id);
-                    flagged.insert(p.id);
+                    misses.push(GlossaryMiss {
+                        line_id: p.id,
+                        term: (*term).clone(),
+                        expected: (*tr).clone(),
+                    });
                 }
             }
         }
     }
-
-    if checks == 0 {
-        return (0.0, None, BTreeSet::new());
-    }
-
-    let score = (violations as f64 / (1.0f64).max(checks as f64 * 0.5)).min(1.0);
-    (score, first, flagged)
+    (checks, misses)
 }
 
 // ── sentence type ────────────────────────────────────────────────────────────

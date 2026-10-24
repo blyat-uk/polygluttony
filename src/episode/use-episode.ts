@@ -21,12 +21,13 @@ const NONE_LANDED: ReadonlyMap<number, number> = new Map();
 const LANDED_KEEP_MS = 5000;
 
 /**
- * One episode's live board. Fetches a full snapshot once the change listener is
- * attached (so no nudge can fall between the two), then again on every
+ * One episode: the run's live board while it's in a run, its stored result
+ * otherwise (with `folder`). Fetches a full snapshot once the change listener
+ * is attached (so no nudge can fall between the two), then again on every
  * `episode://changed` for this file or for every file. At most one fetch is in
  * flight; nudges that arrive meanwhile collapse into exactly one more fetch.
  */
-export function useEpisode(file: string): EpisodeData {
+export function useEpisode(file: string, folder: string | null): EpisodeData {
   const [data, setData] = useState<EpisodeData>({ view: null, error: null, landed: NONE_LANDED });
   // The previous live snapshot's translations, keyed by line id. Null before the
   // first live snapshot, so the first load doesn't fade every row in.
@@ -39,7 +40,8 @@ export function useEpisode(file: string): EpisodeData {
     let unlisten: UnlistenFn | undefined;
 
     const apply = (view: EpisodeView) => {
-      if (view.kind !== "live") {
+      // Stored views fade a changed line in too (a saved or retranslated line).
+      if (view.kind !== "live" && view.kind !== "stored") {
         seen.current = null;
         setData({ view, error: null, landed: NONE_LANDED });
         return;
@@ -48,7 +50,13 @@ export function useEpisode(file: string): EpisodeData {
       const next = new Map<number, string>();
       const fresh: number[] = [];
       for (const line of view.lines) {
-        if (line.translation === null) continue;
+        if (line.translation === null) {
+          // A moment without text (a new run's board before its lines come
+          // back) isn't a change: the same text returning doesn't fade in.
+          const before = prev?.get(line.id);
+          if (before !== undefined) next.set(line.id, before);
+          continue;
+        }
         next.set(line.id, line.translation);
         if (prev && prev.get(line.id) !== line.translation) fresh.push(line.id);
       }
@@ -77,7 +85,7 @@ export function useEpisode(file: string): EpisodeData {
         do {
           again = false;
           try {
-            const view = await ipc.episodeSnapshot(file);
+            const view = await ipc.episodeSnapshot(file, folder ?? undefined);
             if (disposed) return;
             apply(view);
           } catch (err) {
@@ -108,7 +116,7 @@ export function useEpisode(file: string): EpisodeData {
       disposed = true;
       unlisten?.();
     };
-  }, [file]);
+  }, [file, folder]);
 
   return data;
 }

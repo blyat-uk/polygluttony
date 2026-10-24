@@ -17,8 +17,8 @@ use crate::ass::decode::decode_file;
 use crate::ass::parse::{parse_dialogues, DialogueLine};
 use crate::ass::tags::strip_for_text;
 use crate::events::{
-    EpisodeActivity, EpisodeChanged, EpisodeLine, EpisodeSnapshot, EpisodeSource, EpisodeView,
-    FileStateKind, LineStatus, RunEvent, VerifyIssue,
+    EpisodeActivity, EpisodeChanged, EpisodeLine, EpisodeSnapshot, EpisodeSource, EpisodeThrottle,
+    EpisodeView, FileStateKind, LineStatus, RunEvent, VerifyIssue,
 };
 
 /// Managed Tauri state. `None` until the first run of the session starts.
@@ -49,6 +49,9 @@ struct Board {
     run_active: bool,
     /// The run's episodes, in run order. Linear lookup: a run is tens of files.
     episodes: Vec<Episode>,
+    /// The latest rate-limit pause a provider asked for. Requests still
+    /// queued behind it read as waiting, not as model time.
+    throttle: Option<EpisodeThrottle>,
 }
 
 impl Board {
@@ -74,6 +77,8 @@ struct Episode {
     translations: BTreeMap<u32, String>,
     in_flight: BTreeSet<u32>,
     activity: Option<EpisodeActivity>,
+    /// When the announced request actually went out; `None` while it waits
+    /// for a free slot, a retry or a rate-limit pause.
     activity_since_ms: Option<u64>,
     state: FileStateKind,
     detail: Option<String>,
@@ -104,12 +109,19 @@ impl Episode {
         self.activity_since_ms = None;
     }
 
+    /// Nothing more will happen to it in this run.
     fn finished(&self) -> bool {
+        self.complete() || self.state == FileStateKind::Stopped
+    }
+
+    /// It ran to the end; whatever has no translation now never got one. A
+    /// stopped episode's missing lines are still to come (Resume).
+    fn complete(&self) -> bool {
         matches!(self.state, FileStateKind::Done | FileStateKind::Warning | FileStateKind::Failed)
     }
 
-    fn snapshot(&self, run_active: bool) -> EpisodeSnapshot {
-        let finished = self.finished();
+    fn snapshot(&self, run_active: bool, throttle: Option<&EpisodeThrottle>) -> EpisodeSnapshot {
+        let finished = self.complete();
         let lines: Vec<EpisodeLine> = self
             .lines
             .as_deref()
@@ -146,6 +158,11 @@ impl Episode {
             total: lines.len() as u32,
             lines,
             issues: self.issues.clone(),
+            // Only a request that hasn't gone out yet sits out the pause.
+            throttle: match (&self.activity, self.activity_since_ms, throttle) {
+                (Some(_), None, Some(t)) if t.until_ms > now_ms() => Some(t.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -163,18 +180,50 @@ impl LiveBoard {
             folder: folder.to_path_buf(),
             run_active: true,
             episodes: files.iter().map(|f| Episode::new(f.clone())).collect(),
+            throttle: None,
         });
+    }
+
+    /// Translations an episode starts the run with (Resume's kept lines, a
+    /// review's whole episode), tags stripped. Call right after `reset`, so a
+    /// window that looks before the pipeline gets going already sees them.
+    pub fn prime(&self, file: &str, translations: impl IntoIterator<Item = (u32, String)>) {
+        let mut guard = self.lock();
+        let Some(board) = guard.as_mut() else { return };
+        board.update(file, |ep| ep.translations.extend(translations));
     }
 
     /// Fold one run event into the board.
     pub fn apply(&self, event: &RunEvent) -> Change {
         let mut guard = self.lock();
+        if let RunEvent::RunStarted { folder, files, .. } = event {
+            // The run's command already reset the board (so a window sees the
+            // new run at once); this only covers a board that isn't this run's.
+            let folder = Path::new(folder);
+            let current = guard.as_ref().is_some_and(|b| {
+                b.run_active
+                    && b.folder == folder
+                    && b.episodes.iter().map(|e| &e.file).eq(files.iter())
+            });
+            if !current {
+                drop(guard);
+                self.reset(folder, files);
+            }
+            return Change::All;
+        }
         let Some(board) = guard.as_mut() else { return Change::Nothing };
         match event {
-            RunEvent::Progress { .. }
-            | RunEvent::Log { .. }
-            | RunEvent::Stopped { .. }
-            | RunEvent::Throttled { .. } => Change::Nothing,
+            RunEvent::RunStarted { .. } => unreachable!("handled above"),
+            RunEvent::Progress { .. } | RunEvent::Log { .. } | RunEvent::Stopped { .. } => {
+                Change::Nothing
+            }
+            RunEvent::Throttled { seconds, provider } => {
+                board.throttle = Some(EpisodeThrottle {
+                    provider: provider.clone(),
+                    until_ms: now_ms() + u64::from(*seconds) * 1000,
+                });
+                Change::All
+            }
             RunEvent::RunFinished { .. } => {
                 board.run_active = false;
                 board.episodes.iter_mut().for_each(Episode::settle);
@@ -201,8 +250,17 @@ impl LiveBoard {
             RunEvent::Sending { file, ids, activity } => board.update(file, |ep| {
                 ep.in_flight = ids.iter().copied().collect();
                 ep.activity = Some(activity.clone());
-                ep.activity_since_ms = Some(now_ms());
+                // The clock starts when the request really goes out.
+                ep.activity_since_ms = None;
             }),
+            RunEvent::RequestSent { file } => board.update(file, |ep| {
+                if ep.activity.is_some() {
+                    ep.activity_since_ms = Some(now_ms());
+                }
+            }),
+            RunEvent::RequestWaiting { file } => {
+                board.update(file, |ep| ep.activity_since_ms = None)
+            }
             RunEvent::Landed { file, lines } => board.update(file, |ep| {
                 for (id, text) in lines {
                     ep.in_flight.remove(id);
@@ -224,7 +282,7 @@ impl LiveBoard {
                 return EpisodeView::NotInRun;
             };
             if ep.lines.is_some() {
-                return EpisodeView::Live(ep.snapshot(board.run_active));
+                return EpisodeView::Live(ep.snapshot(board.run_active, board.throttle.as_ref()));
             }
             board.folder.clone()
         };
@@ -243,12 +301,51 @@ impl LiveBoard {
             return self.snapshot(file);
         }
         let run_active = board.run_active;
+        let throttle = board.throttle.clone();
         let Some(ep) = board.episodes.iter_mut().find(|e| e.file == file) else {
             return EpisodeView::NotInRun;
         };
         // The pipeline may have parsed it meanwhile; its lines win.
         ep.lines.get_or_insert(lines);
-        EpisodeView::Live(ep.snapshot(run_active))
+        EpisodeView::Live(ep.snapshot(run_active, throttle.as_ref()))
+    }
+
+    /// Where this episode stands on the board, for `episode_snapshot`: is it
+    /// one of this run's (or the last run's) episodes from `folder`, and is
+    /// that run still going?
+    pub fn standing(&self, folder: &Path, file: &str) -> Standing {
+        let guard = self.lock();
+        let Some(board) = guard.as_ref() else { return Standing::Absent };
+        if !same_folder(&board.folder, folder) || !board.episodes.iter().any(|e| e.file == file) {
+            return Standing::Absent;
+        }
+        if board.run_active {
+            Standing::Running
+        } else {
+            Standing::Finished
+        }
+    }
+}
+
+/// See [`LiveBoard::standing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// Not on the board, or on it for another folder.
+    Absent,
+    /// In the run that is going now.
+    Running,
+    /// In the last run, which has ended.
+    Finished,
+}
+
+/// The same folder, however it was spelled (a trailing slash, a symlink).
+pub fn same_folder(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -385,6 +482,10 @@ mod tests {
         );
         assert_eq!(snap.lines[0].translation.as_deref(), Some("One"));
         assert_eq!((snap.translated, snap.total), (1, 4));
+        // Announced but not out yet: no model time.
+        assert!(snap.activity_since_ms.is_none());
+        board.apply(&RunEvent::RequestSent { file: "ep01.ass".into() });
+        let snap = live(board.snapshot("ep01.ass"));
         assert!(snap.activity_since_ms.is_some());
         assert_eq!(snap.activity, Some(EpisodeActivity::Batch { batch: 1, total_batches: 1 }));
 
@@ -442,6 +543,64 @@ mod tests {
             );
             assert_eq!(snap.activity, None);
         }
+    }
+
+    #[test]
+    fn a_stopped_episode_keeps_its_missing_lines_waiting() {
+        let board = board_with_lines(3);
+        board.apply(&sending(&[1, 2, 3]));
+        board.apply(&landed(&[(1, "One")]));
+        board.apply(&state("ep01.ass", FileStateKind::Stopped));
+        let snap = live(board.snapshot("ep01.ass"));
+        assert_eq!(snap.state, FileStateKind::Stopped);
+        assert_eq!(
+            snap.lines.iter().map(|l| l.status).collect::<Vec<_>>(),
+            vec![LineStatus::Translated, LineStatus::Waiting, LineStatus::Waiting]
+        );
+        assert_eq!(snap.activity, None);
+    }
+
+    #[test]
+    fn a_queued_request_sits_out_the_throttle_and_a_sent_one_does_not() {
+        let board = board_with_lines(2);
+        board.apply(&RunEvent::EpisodeLines { file: "ep02.ass".into(), lines: vec![src(1, "a")] });
+        board.apply(&sending(&[1]));
+        board.apply(&RunEvent::Sending {
+            file: "ep02.ass".into(),
+            ids: vec![1],
+            activity: EpisodeActivity::Batch { batch: 1, total_batches: 1 },
+        });
+        board.apply(&RunEvent::RequestSent { file: "ep02.ass".into() });
+        let change = board.apply(&RunEvent::Throttled { seconds: 18, provider: "Anthropic".into() });
+        assert_eq!(change, Change::All);
+
+        let waiting = live(board.snapshot("ep01.ass"));
+        let t = waiting.throttle.expect("queued request waits out the pause");
+        assert_eq!(t.provider, "Anthropic");
+        assert!(t.until_ms > now_ms() + 17_000);
+        assert_eq!(waiting.activity_since_ms, None);
+        assert!(live(board.snapshot("ep02.ass")).throttle.is_none(), "already out");
+
+        // Retrying: back to waiting, and the clock stops.
+        board.apply(&RunEvent::RequestWaiting { file: "ep02.ass".into() });
+        let snap = live(board.snapshot("ep02.ass"));
+        assert_eq!(snap.activity_since_ms, None);
+        assert!(snap.throttle.is_some());
+    }
+
+    #[test]
+    fn standing_knows_the_folder_and_whether_the_run_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = LiveBoard::default();
+        assert_eq!(board.standing(dir.path(), "ep01.ass"), Standing::Absent);
+        board.reset(dir.path(), &["ep01.ass".into()]);
+        assert_eq!(board.standing(dir.path(), "ep01.ass"), Standing::Running);
+        assert_eq!(board.standing(dir.path(), "ep02.ass"), Standing::Absent);
+        assert_eq!(board.standing(Path::new("/elsewhere"), "ep01.ass"), Standing::Absent);
+        let spelled = PathBuf::from(format!("{}/", dir.path().display()));
+        assert_eq!(board.standing(&spelled, "ep01.ass"), Standing::Running);
+        board.apply(&RunEvent::RunFinished { results: vec![] });
+        assert_eq!(board.standing(dir.path(), "ep01.ass"), Standing::Finished);
     }
 
     #[test]
@@ -559,6 +718,45 @@ mod tests {
         assert_eq!(snap.state, FileStateKind::Pending);
         assert_eq!(snap.lines[0].translation, None);
         assert_eq!(snap.lines[0].status, LineStatus::Waiting);
+    }
+
+    #[test]
+    fn run_started_resets_only_a_board_that_isnt_this_runs() {
+        let board = board_with_lines(2);
+        board.apply(&landed(&[(1, "One")]));
+        let started = |files: &[&str]| RunEvent::RunStarted {
+            folder: "/nowhere".into(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            resume: false,
+        };
+        // The command reset it already: nothing is lost.
+        assert_eq!(board.apply(&started(&["ep01.ass", "ep02.ass"])), Change::All);
+        assert_eq!(live(board.snapshot("ep01.ass")).lines[0].translation.as_deref(), Some("One"));
+        // Another run's board, or none: a fresh one.
+        board.apply(&started(&["ep03.ass"]));
+        assert!(matches!(board.snapshot("ep01.ass"), EpisodeView::NotInRun));
+        assert!(live_or_unreadable(board.snapshot("ep03.ass")));
+        let empty = LiveBoard::default();
+        assert_eq!(empty.apply(&started(&["ep01.ass"])), Change::All);
+        assert_eq!(empty.standing(Path::new("/nowhere"), "ep01.ass"), Standing::Running);
+    }
+
+    fn live_or_unreadable(view: EpisodeView) -> bool {
+        matches!(view, EpisodeView::Live(_) | EpisodeView::Unreadable { .. })
+    }
+
+    #[test]
+    fn primed_translations_show_before_the_pipeline_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ep01.ass"), ass_source(&["你好", "再见"])).unwrap();
+        let board = LiveBoard::default();
+        board.reset(dir.path(), &["ep01.ass".into()]);
+        board.prime("ep01.ass", [(1, "Hello".to_string())]);
+        board.prime("other.ass", [(1, "ignored".to_string())]);
+        let snap = live(board.snapshot("ep01.ass"));
+        assert_eq!(snap.lines[0].translation.as_deref(), Some("Hello"));
+        assert_eq!(snap.lines[0].status, LineStatus::Translated);
+        assert_eq!(snap.lines[1].status, LineStatus::Waiting);
     }
 
     #[test]

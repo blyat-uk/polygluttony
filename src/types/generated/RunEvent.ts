@@ -15,7 +15,7 @@ import type { VerifyIssue } from "./VerifyIssue";
  * them into the live board (`translation::live`) and never emits them to the
  * webview. Episode windows read the board through `episode_snapshot`.
  */
-export type RunEvent = { "kind": "state", file: string, state: FileStateKind, detail: string | null, } | { "kind": "progress", file: string, translated: number, total: number, batch: number, total_batches: number, retries: number, 
+export type RunEvent = { "kind": "run_started", folder: string, files: Array<string>, resume: boolean, } | { "kind": "state", file: string, state: FileStateKind, detail: string | null, } | { "kind": "progress", file: string, translated: number, total: number, batch: number, total_batches: number, retries: number, 
 /**
  * Why the last retry happened, in plain words ("a reply came back incomplete").
  */

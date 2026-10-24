@@ -2,16 +2,22 @@
 //! the live episode board in `translation::live`.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 
 use crate::config::projects::Tone;
 use crate::error::{AppError, AppResult};
-use crate::events::EpisodeView;
-use crate::translation::live::LiveBoard;
-use crate::translation::results::{FolderResults, TermLines};
+use crate::events::{
+    EpisodeChanged, EpisodeGoToLine, EpisodeView, ResultsChanged, EPISODE_CHANGED_EVENT,
+    EPISODE_GO_TO_LINE_EVENT, RESULTS_CHANGED_EVENT,
+};
+use crate::models::language_pair::LanguagePair;
+use crate::translation::live::{LiveBoard, Standing};
+use crate::translation::results::{FolderResults, ResultsStore, TermLines};
+use crate::translation::review;
 use crate::translation::run::{self, StartArgs};
 
 // JS-side key casing: Tauri v2's #[tauri::command] macro converts every Rust
@@ -40,21 +46,37 @@ pub async fn cancel_translation(app: AppHandle) -> AppResult<()> {
     run::cancel(app).await
 }
 
-/// One episode of the current or last run, for its live window. A waiting
-/// episode's source is read from disk, so that happens on a blocking thread.
-/// With `folder`, an episode that isn't in the run comes back `stored`, read
-/// from the stored results.
-// CONTRACT STUB: `folder` is ignored until stored results land.
+/// One episode for its window. Without `folder`, the current or last run's
+/// live board, as before. With `folder`: `live` while the episode is in the
+/// run that is going now; otherwise `stored`, read from the stored results
+/// (so Review edits show at once), falling back to the last run's board for
+/// an episode with nothing stored; `not_in_run` when there's neither. Disk
+/// reads happen on a blocking thread.
 #[tauri::command]
 pub async fn episode_snapshot(
     app: AppHandle,
     file: String,
     folder: Option<String>,
 ) -> AppResult<EpisodeView> {
-    let _ = folder;
-    tauri::async_runtime::spawn_blocking(move || app.state::<LiveBoard>().snapshot(&file))
-        .await
-        .map_err(|e| AppError::Other(e.to_string()))
+    tauri::async_runtime::spawn_blocking(move || {
+        let board = app.state::<LiveBoard>();
+        let Some(folder) = folder else { return board.snapshot(&file) };
+        let folder = PathBuf::from(folder);
+        let standing = board.standing(&folder, &file);
+        if standing == Standing::Running {
+            return board.snapshot(&file);
+        }
+        let stored = ResultsStore::for_app(&app)
+            .ok()
+            .and_then(|store| review::stored_snapshot(&store, &folder, &file));
+        match (stored, standing) {
+            (Some(view), _) => view,
+            (None, Standing::Finished) => board.snapshot(&file),
+            (None, _) => EpisodeView::NotInRun,
+        }
+    })
+    .await
+    .map_err(|e| AppError::Other(e.to_string()))
 }
 
 /// Held from "is it open?" to "it's built": the label only registers once the
@@ -71,11 +93,11 @@ fn episode_window_label(file: &str) -> String {
     format!("episode-{:016x}", hasher.finish())
 }
 
-/// Open an episode's live window, or bring its open one to the front. `async`
+/// Open an episode's window, or bring its open one to the front. `async`
 /// because building a window from a sync command deadlocks on Windows.
 /// `folder` lets it open a stored episode outside a run; `line` scrolls to
-/// (and selects) that line.
-// CONTRACT STUB: `line` on an already-open window is ignored for now.
+/// (and selects) that line — an open window gets it as
+/// `EPISODE_GO_TO_LINE_EVENT`.
 #[tauri::command]
 pub async fn open_episode_window(
     app: AppHandle,
@@ -91,6 +113,10 @@ pub async fn open_episode_window(
         window.unminimize().map_err(window_err)?;
         window.show().map_err(window_err)?;
         window.set_focus().map_err(window_err)?;
+        if let Some(line) = line {
+            app.emit_to(label.as_str(), EPISODE_GO_TO_LINE_EVENT, EpisodeGoToLine { file, line })
+                .map_err(window_err)?;
+        }
         return Ok(());
     }
     tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::App("episode.html".into()))
@@ -108,11 +134,33 @@ pub async fn open_episode_window(
     Ok(())
 }
 
-/// Every stored episode result for a folder.
+/// Every stored episode result for a folder. A missing or damaged store is
+/// empty, never an error.
 #[tauri::command]
 pub fn get_folder_results(app: AppHandle, folder: String) -> AppResult<FolderResults> {
-    let _ = (app, folder);
-    Ok(FolderResults::default())
+    Ok(ResultsStore::for_app(&app)
+        .map(|store| store.results(Path::new(&folder)))
+        .unwrap_or_default())
+}
+
+/// Review actions write the episode's output and stored lines; a run that is
+/// translating the same episode would write over them.
+fn not_running(app: &AppHandle, folder: &Path, file: &str) -> AppResult<()> {
+    if app.state::<LiveBoard>().standing(folder, file) == Standing::Running {
+        return Err(AppError::Other(
+            "This episode is being translated right now. Wait for it to finish.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// After a review action: windows refetch, and the episode list rereads the results.
+fn changed(app: &AppHandle, folder: &str, file: &str) {
+    let _ = app.emit(
+        RESULTS_CHANGED_EVENT,
+        ResultsChanged { folder: folder.to_string(), file: file.to_string() },
+    );
+    let _ = app.emit(EPISODE_CHANGED_EVENT, EpisodeChanged { file: Some(file.to_string()) });
 }
 
 /// Retranslate just these lines of a finished episode (with their
@@ -125,8 +173,7 @@ pub async fn retranslate_lines(
     file: String,
     line_ids: Vec<u32>,
 ) -> AppResult<()> {
-    let _ = (app, folder, file, line_ids);
-    Err(AppError::Other("not implemented yet".into()))
+    run::start_review(app, folder, vec![(file, line_ids)]).await
 }
 
 /// Save the user's own translation of one line into the output file.
@@ -138,8 +185,11 @@ pub fn save_line(
     line_id: u32,
     text: String,
 ) -> AppResult<()> {
-    let _ = (app, folder, file, line_id, text);
-    Err(AppError::Other("not implemented yet".into()))
+    let path = PathBuf::from(&folder);
+    not_running(&app, &path, &file)?;
+    review::save_line(&ResultsStore::for_app(&app)?, &path, &file, line_id, &text)?;
+    changed(&app, &folder, &file);
+    Ok(())
 }
 
 /// "Looks fine": drop one issue from the stored results.
@@ -151,31 +201,49 @@ pub fn dismiss_issue(
     line_id: u32,
     issue_type: String,
 ) -> AppResult<()> {
-    let _ = (app, folder, file, line_id, issue_type);
-    Err(AppError::Other("not implemented yet".into()))
+    let path = PathBuf::from(&folder);
+    not_running(&app, &path, &file)?;
+    review::dismiss_issue(&ResultsStore::for_app(&app)?, &path, &file, line_id, &issue_type)?;
+    changed(&app, &folder, &file);
+    Ok(())
 }
 
 /// "Mark episode done": rename the `.warning` output to the clean name and
 /// record the episode as done.
 #[tauri::command]
 pub fn mark_episode_done(app: AppHandle, folder: String, file: String) -> AppResult<()> {
-    let _ = (app, folder, file);
-    Err(AppError::Other("not implemented yet".into()))
+    let path = PathBuf::from(&folder);
+    not_running(&app, &path, &file)?;
+    // For an episode translated before results were stored: the folder's languages.
+    let fallback = crate::config::projects::load(&app)
+        .ok()
+        .and_then(|cfg| crate::config::projects::get_prefs(&cfg, &folder))
+        .and_then(|p| LanguagePair::from_codes(&p.source_lang, &p.target_lang).ok());
+    review::mark_episode_done(&ResultsStore::for_app(&app)?, &path, &file, fallback)?;
+    changed(&app, &folder, &file);
+    Ok(())
 }
 
 /// Lines of finished episodes whose source contains `source` (a glossary term).
 #[tauri::command]
 pub fn find_term_lines(app: AppHandle, folder: String, source: String) -> AppResult<Vec<TermLines>> {
-    let _ = (app, folder, source);
-    Ok(Vec::new())
+    let store = ResultsStore::for_app(&app)?;
+    Ok(review::find_term_lines(&store, Path::new(&folder), &source))
 }
 
-/// Retranslate every line of finished episodes that uses a glossary term.
-/// Returns how many lines were queued.
+/// Retranslate every line of finished episodes that uses a glossary term,
+/// as one review run. Returns how many lines were queued (0: no run).
 #[tauri::command]
 pub async fn retranslate_term(app: AppHandle, folder: String, source: String) -> AppResult<u32> {
-    let _ = (app, folder, source);
-    Err(AppError::Other("not implemented yet".into()))
+    let store = ResultsStore::for_app(&app)?;
+    let found = review::find_term_lines(&store, Path::new(&folder), &source);
+    let count = found.iter().map(|t| t.line_ids.len() as u32).sum();
+    if count == 0 {
+        return Ok(0);
+    }
+    let jobs = found.into_iter().map(|t| (t.file, t.line_ids)).collect();
+    run::start_review(app, folder, jobs).await?;
+    Ok(count)
 }
 
 #[cfg(test)]
