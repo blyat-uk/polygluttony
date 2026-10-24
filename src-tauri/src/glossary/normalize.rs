@@ -46,7 +46,7 @@ pub struct NormalizeReview {
 fn parse_category_response(text: &str) -> Result<BTreeMap<String, String>, String> {
     // extract_object guarantees the returned Value is an object.
     let v = parse_response::extract_object(text)
-        .map_err(|e| format!("unparseable response ({e})"))?;
+        .map_err(|e| format!("the answer couldn't be read ({e})"))?;
     let obj = v.as_object().expect("extract_object guarantees object");
     let mut out = BTreeMap::new();
     for (k, val) in obj {
@@ -97,7 +97,7 @@ pub async fn normalize_pass(
                 let _ = tx
                     .send(GlossaryEvent::Log {
                         level: LogLevel::Warning,
-                        message: format!("normalize {c}: request failed, keeping original ({e})"),
+                        message: format!("Tidy up, {c}: the request failed, so they stay as they were ({e})"),
                     })
                     .await;
                 continue; // original kept; one log only
@@ -108,7 +108,7 @@ pub async fn normalize_pass(
                         .send(GlossaryEvent::Log {
                             level: LogLevel::Warning,
                             message: format!(
-                                "normalize {c}: {reason}, keeping original"
+                                "Tidy up, {c}: {reason}, so they stay as they were"
                             ),
                         })
                         .await;
@@ -128,7 +128,7 @@ pub async fn normalize_pass(
                 .send(GlossaryEvent::Log {
                     level: LogLevel::Warning,
                     message: format!(
-                        "normalize {c}: response yielded no valid terms, keeping original"
+                        "Tidy up, {c}: the answer had no usable terms, so they stay as they were"
                     ),
                 })
                 .await;

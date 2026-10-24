@@ -8,35 +8,45 @@ use crate::config::store as config_store;
 use crate::config::Step;
 use crate::error::{AppError, AppResult};
 use crate::glossary::build::BuildMode;
-use crate::glossary::diff::GlossaryDiff;
+use crate::glossary::history;
 use crate::glossary::io::{
     import_glossary_file, load_folder_glossary, save_folder_glossary, GlossaryBackupInfo,
 };
 use crate::glossary::meta::{
-    GlossaryChangeKind, GlossaryLoad, GlossaryMeta, GlossaryScope, GlossarySnapshot,
+    load_meta, save_meta, GlossaryChangeKind, GlossaryLoad, GlossaryMeta, GlossaryScope,
+    GlossarySnapshot,
 };
 use crate::glossary::model::{Glossary, GlossaryDoc};
-use crate::glossary::normalize::{normalize_pass, NormalizeReview};
+use crate::glossary::normalize::NormalizeReview;
 use crate::glossary::reference::{self, ReferenceStatus, ReferenceSummary, ReferenceTerminology};
 use crate::glossary::run::{self, GlossaryOpKind, StartArgs};
 use crate::glossary::watch::{self, GlossaryWatchState};
 use crate::glossary::world_detector::WorldType;
+use crate::glossary::{improve, scope};
 
 /// O9 — the folder's glossary and its metadata; `missing` when there's no
 /// glossary.json, `unreadable` (with the line, when known) when it isn't valid.
-// CONTRACT STUB: meta is always the default; loading the sidecar is the
-// glossary engine's job.
+/// A missing or corrupt sidecar gives the default meta, never a failed load.
+/// Meta entries for terms that are no longer in the glossary (removed by hand
+/// in a text editor, say) are left out.
 #[tauri::command]
 pub fn load_glossary(folder: String) -> GlossaryLoad {
-    let path = PathBuf::from(&folder).join("glossary.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    load_folder(&PathBuf::from(&folder))
+}
+
+fn load_folder(dir: &Path) -> GlossaryLoad {
+    let Ok(text) = std::fs::read_to_string(dir.join("glossary.json")) else {
         return GlossaryLoad::Missing;
     };
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&text) {
         return GlossaryLoad::Unreadable { message: e.to_string(), line: Some(e.line() as u32) };
     }
     match Glossary::from_json(&text) {
-        Some(g) => GlossaryLoad::Ok { doc: GlossaryDoc::from(&g), meta: GlossaryMeta::default() },
+        Some(g) => {
+            let mut meta = load_meta(dir);
+            meta.retain_terms(&g);
+            GlossaryLoad::Ok { doc: GlossaryDoc::from(&g), meta }
+        }
         None => GlossaryLoad::Unreadable {
             message: "glossary.json isn't in the expected format".into(),
             line: None,
@@ -46,8 +56,8 @@ pub fn load_glossary(folder: String) -> GlossaryLoad {
 
 /// O14 — atomic write; the UI auto-saves every term edit. `meta: None` leaves
 /// the sidecar as it is. `snapshot: Some(kind)` first saves the current
-/// glossary to the history, labelled with the change about to happen.
-// CONTRACT STUB: meta and snapshot are ignored until the glossary engine lands.
+/// glossary (and meta) to the history, labelled with the change about to
+/// happen; when that fails nothing is written.
 #[tauri::command]
 pub fn save_glossary(
     folder: String,
@@ -55,8 +65,23 @@ pub fn save_glossary(
     meta: Option<GlossaryMeta>,
     snapshot: Option<GlossaryChangeKind>,
 ) -> AppResult<()> {
-    let _ = (meta, snapshot);
-    save_folder_glossary(&PathBuf::from(folder), &doc.into_glossary())
+    save_folder(&PathBuf::from(folder), doc, meta, snapshot)
+}
+
+fn save_folder(
+    dir: &Path,
+    doc: GlossaryDoc,
+    meta: Option<GlossaryMeta>,
+    snapshot: Option<GlossaryChangeKind>,
+) -> AppResult<()> {
+    if let Some(reason) = snapshot {
+        history::snapshot(dir, reason)?;
+    }
+    save_folder_glossary(dir, &doc.into_glossary())?;
+    if let Some(meta) = meta {
+        save_meta(dir, &meta)?;
+    }
+    Ok(())
 }
 
 // JS sends camelCase keys (worldType, sourceLang, …) — the macro converts; see
@@ -92,32 +117,47 @@ pub async fn start_glossary_build(
     .await
 }
 
-/// Cancels the active glossary op (build / normalize / import).
+/// Cancels the active glossary op (build / Tidy up / Look up names online /
+/// import).
 #[tauri::command]
 pub async fn cancel_glossary_build(app: AppHandle) -> AppResult<()> {
     run::cancel(app).await
 }
 
-/// O12 — returns the review WITHOUT saving; the UI saves on accept via
-/// `save_glossary`. Claims the op slot (exclusive with build/translation).
+/// The glossary a Tidy up or Look up works on, with plain errors for "there
+/// isn't one" and "it's empty". `what` finishes "…so there's nothing to …".
+fn glossary_to_improve(dir: &Path, what: &str) -> AppResult<Glossary> {
+    let g = load_folder_glossary(dir).ok_or_else(|| AppError::Other(NO_GLOSSARY.into()))?;
+    if g.is_empty() {
+        return Err(AppError::Other(format!("The glossary is empty, so there's nothing to {what}.")));
+    }
+    Ok(g)
+}
+
+const NO_GLOSSARY: &str = "There's no glossary in this folder yet.";
+
+/// Shown when Look up names online has no model to run on.
+const NO_WEB_SEARCH: &str =
+    "No model that can search the web is set up. Turn on Look up names online on the Models page.";
+
+/// O12 — Tidy up, scoped (`scope: None` = all terms). Returns the review
+/// WITHOUT saving; the UI saves on accept via `save_glossary`. Claims the op
+/// slot (exclusive with builds, Look up and translation).
 ///
-/// Cancel semantics (for the UI task): a user cancel mid-normalize makes the
-/// in-flight category requests fail, so the originals are kept and this
-/// command still resolves Ok with a no-changes review — the UI must discard
-/// the resolved review after a user-cancel instead of presenting it.
+/// Cancel semantics: a user cancel resolves Ok with a no-changes review (the
+/// glossary as it is) — the UI must discard a review that resolves after the
+/// user stopped the op instead of presenting it.
 #[tauri::command]
 pub async fn normalize_glossary(
     app: AppHandle,
     folder: String,
     scope: Option<GlossaryScope>,
 ) -> AppResult<NormalizeReview> {
-    // CONTRACT STUB: scope (None = all) is ignored until the glossary engine lands.
-    let _ = scope;
     let dir = PathBuf::from(&folder);
-    let original = load_folder_glossary(&dir)
-        .ok_or_else(|| AppError::Other("no glossary to normalize".into()))?;
-    if original.is_empty() {
-        return Err(AppError::Other("glossary is empty".into()));
+    let original = glossary_to_improve(&dir, "tidy up")?;
+    let sub = scope::resolve(&original, scope.as_ref())?;
+    if sub.is_empty() {
+        return Err(AppError::Other("None of the chosen terms are in the glossary.".into()));
     }
     let cfg = config_store::load(&app)?;
     let conn = config_store::step_connection(&cfg, Step::Normalize)?;
@@ -130,15 +170,18 @@ pub async fn normalize_glossary(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     run::spawn_forwarder(app.clone(), rx);
     let svc = run::service_for(&conn, cancel.clone(), tx.clone());
-    let normalized = normalize_pass(&svc, &original, &tx, &templates).await;
-    Ok(NormalizeReview {
-        diff: GlossaryDiff::compute(Some(&original), &normalized),
-        normalized: GlossaryDoc::from(&normalized),
-    })
+    Ok(improve::tidy_up(&svc, &original, &sub, &templates, &tx, &cancel).await)
 }
 
 /// Look up names online on the glossary as it is — no subtitle files are
-/// read. Returns a review; nothing is saved. `scope: None` = all terms.
+/// read. Scoped like Tidy up (`scope: None` = all terms); `show_name` is what
+/// the model searches for. Returns a review; nothing is saved (the UI saves
+/// the show name in the meta). Runs on the same web-search model a build
+/// would use, claims the op slot (cancel with `cancel_glossary_build`), and
+/// sends a `personalizing` phase event when the request goes out.
+///
+/// Cancel semantics: as `normalize_glossary` — a user cancel resolves Ok with
+/// a no-changes review, which the UI discards.
 #[tauri::command]
 pub async fn lookup_glossary_names(
     app: AppHandle,
@@ -146,23 +189,46 @@ pub async fn lookup_glossary_names(
     show_name: String,
     scope: Option<GlossaryScope>,
 ) -> AppResult<NormalizeReview> {
-    let _ = (app, folder, show_name, scope);
-    Err(AppError::Other("not implemented yet".into()))
+    let dir = PathBuf::from(&folder);
+    let show_name = show_name.trim();
+    if show_name.is_empty() {
+        return Err(AppError::Other(
+            "Type the show's name first, so the lookup knows what to search for.".into(),
+        ));
+    }
+    let original = glossary_to_improve(&dir, "look up")?;
+    let sub = scope::resolve(&original, scope.as_ref())?;
+    if sub.is_empty() {
+        return Err(AppError::Other("None of the chosen terms are in the glossary.".into()));
+    }
+    let cfg = config_store::load(&app)?;
+    let conn =
+        config_store::resolve_web_search(&cfg).ok_or_else(|| AppError::Other(NO_WEB_SEARCH.into()))?;
+    let template = crate::prompts::resolve(
+        crate::prompts::PromptId::GlossaryPersonalize,
+        &crate::prompts::overrides_dir(&app)?,
+    )?;
+    let cancel = run::claim_slot(&app, GlossaryOpKind::LookUp).await?;
+    // Declared before svc/tx so it drops last (after their senders close).
+    let _guard = run::SlotGuard::new(app.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    run::spawn_forwarder(app.clone(), rx);
+    let svc = run::service_for(&conn, cancel.clone(), tx.clone());
+    improve::look_up(&svc, &original, &sub, show_name, &template, &tx, &cancel).await
 }
 
-/// The glossary's version history, newest first.
+/// The glossary's version history, newest first: up to ten snapshots, plus
+/// the legacy `glossary.prev.json` (id `prev`) when the folder has one.
 #[tauri::command]
 pub fn list_glossary_snapshots(folder: String) -> AppResult<Vec<GlossarySnapshot>> {
-    let _ = folder;
-    Ok(Vec::new())
+    Ok(history::list(&PathBuf::from(folder)))
 }
 
 /// Bring back a snapshot. The current glossary is snapshotted first
 /// (reason `restore`), so a restore can itself be undone.
 #[tauri::command]
 pub fn restore_glossary_snapshot(folder: String, id: String) -> AppResult<()> {
-    let _ = (folder, id);
-    Err(AppError::Other("not implemented yet".into()))
+    history::restore(&PathBuf::from(folder), &id)
 }
 
 /// O11 — extract reference terms from user-picked translated `.ass` files and
@@ -174,7 +240,7 @@ pub async fn import_reference_files(
     paths: Vec<String>,
 ) -> AppResult<ReferenceSummary> {
     if paths.is_empty() {
-        return Err(AppError::Other("no files selected".into()));
+        return Err(AppError::Other("Pick at least one file first.".into()));
     }
     let dir = PathBuf::from(&folder);
     let cfg = config_store::load(&app)?;
@@ -206,9 +272,9 @@ pub fn reference_status(folder: String) -> ReferenceStatus {
     reference::reference_status(&PathBuf::from(folder))
 }
 
-/// What `glossary.prev.json` holds right now (None = no backup yet). Powers
-/// the "you are about to replace this backup" disclosure on the destructive
-/// paths. A read — no slot claim.
+/// The newest earlier version with terms (a history snapshot, or the legacy
+/// `glossary.prev.json`); None = nothing to go back to yet. Kept for the old
+/// confirm dialogs; the history list replaces it. A read — no slot claim.
 #[tauri::command]
 pub fn glossary_backup_status(folder: String) -> Option<GlossaryBackupInfo> {
     crate::glossary::io::backup_status(&PathBuf::from(folder))
@@ -232,8 +298,9 @@ pub fn save_reference(folder: String, terms: ReferenceTerminology) -> AppResult<
     reference::save_cache(&PathBuf::from(folder), &terms)
 }
 
-/// Install a picked `glossary.json` as this folder's glossary, backing up any
-/// existing one to `glossary.prev.json`. Returns the imported term count.
+/// Install a picked `glossary.json` as this folder's glossary. The current one
+/// goes to the history first (reason `import`); every imported term is marked
+/// as yours. Returns the imported term count.
 /// Claims the glossary-op slot — mutually exclusive with build, normalize,
 /// and reference import.
 #[tauri::command]
@@ -249,14 +316,16 @@ pub async fn import_glossary(app: AppHandle, folder: String, src: String) -> App
 pub fn export_glossary(folder: String, dest: String) -> AppResult<()> {
     let src = PathBuf::from(folder).join("glossary.json");
     if !src.is_file() {
-        return Err(AppError::Other("no glossary.json to export".into()));
+        return Err(AppError::Other(NO_GLOSSARY.into()));
     }
     // fs::copy truncates dest before reading, so dest == src would zero the
     // glossary. canonicalize fails for a non-existent dest — fine: a
     // non-existent dest can't be src.
     if let (Ok(d), Ok(s)) = (Path::new(&dest).canonicalize(), src.canonicalize()) {
         if d == s {
-            return Err(AppError::Other("export destination is the glossary itself".into()));
+            return Err(AppError::Other(
+                "That's the glossary itself. Pick another place to export to.".into(),
+            ));
         }
     }
     std::fs::copy(src, dest)?;
@@ -269,7 +338,7 @@ pub fn open_glossary_editor(app: AppHandle, folder: String) -> AppResult<()> {
     use tauri_plugin_opener::OpenerExt;
     let path = PathBuf::from(folder).join("glossary.json");
     if !path.is_file() {
-        return Err(AppError::Other("no glossary.json yet".into()));
+        return Err(AppError::Other(NO_GLOSSARY.into()));
     }
     app.opener()
         .open_path(path.to_string_lossy().into_owned(), None::<String>)
@@ -290,8 +359,140 @@ pub fn unwatch_glossary(app: AppHandle) -> AppResult<()> {
 
 /// Label of the model that answers web searches ("Claude Sonnet 5.5") — the
 /// Web search step's, when it is on, usable and can search — else None.
-/// Powers the "Look up established names online" checkbox gating.
+/// Powers the Look up names online gating.
 #[tauri::command]
 pub fn web_search_status(app: AppHandle) -> AppResult<Option<String>> {
     Ok(config_store::web_search_label(&config_store::load(&app)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::glossary::meta::TermOrigin;
+
+    fn doc(terms: &[(&str, &str)]) -> GlossaryDoc {
+        let mut g = Glossary::new("xianxia");
+        for (s, t) in terms {
+            g.characters.insert(s.to_string(), t.to_string());
+        }
+        GlossaryDoc::from(&g)
+    }
+
+    fn meta_with_origin(source: &str) -> GlossaryMeta {
+        let mut m = GlossaryMeta { show_name: Some("Martial Universe".into()), ..Default::default() };
+        m.origins.entry("characters".into()).or_default().insert(source.into(), TermOrigin::Yours);
+        m
+    }
+
+    #[test]
+    fn load_missing_and_unreadable_with_line() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(load_folder(dir.path()), GlossaryLoad::Missing));
+        std::fs::write(dir.path().join("glossary.json"), "{\n  \"terms\": {\n    oops\n}").unwrap();
+        match load_folder(dir.path()) {
+            GlossaryLoad::Unreadable { line, message } => {
+                assert_eq!(line, Some(3));
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected unreadable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_returns_the_sidecar_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        save_folder(dir.path(), doc(&[("林动", "Lin Dong")]), Some(meta_with_origin("林动")), None)
+            .unwrap();
+        match load_folder(dir.path()) {
+            GlossaryLoad::Ok { doc, meta } => {
+                assert_eq!(doc.count, 1);
+                assert_eq!(meta.origins["characters"]["林动"], TermOrigin::Yours);
+                assert_eq!(meta.show_name.as_deref(), Some("Martial Universe"));
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_with_corrupt_meta_still_loads_with_default_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        save_folder(dir.path(), doc(&[("林动", "Lin Dong")]), None, None).unwrap();
+        let meta_dir = dir.path().join(".polygluttony");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        std::fs::write(meta_dir.join("glossary-meta.json"), "{{{ not json").unwrap();
+        match load_folder(dir.path()) {
+            GlossaryLoad::Ok { doc, meta } => {
+                assert_eq!(doc.count, 1);
+                assert!(meta.origins.is_empty() && meta.show_name.is_none());
+            }
+            other => panic!("expected ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_leaves_out_meta_for_terms_no_longer_there() {
+        let dir = tempfile::tempdir().unwrap();
+        save_folder(dir.path(), doc(&[("林动", "Lin Dong")]), Some(meta_with_origin("gone")), None)
+            .unwrap();
+        let GlossaryLoad::Ok { meta, .. } = load_folder(dir.path()) else { panic!() };
+        assert!(meta.origins.is_empty());
+        assert_eq!(meta.show_name.as_deref(), Some("Martial Universe"));
+    }
+
+    #[test]
+    fn save_without_meta_leaves_the_sidecar_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        save_folder(dir.path(), doc(&[("林动", "Lin Dong")]), Some(meta_with_origin("林动")), None)
+            .unwrap();
+        save_folder(dir.path(), doc(&[("林动", "Lin Dong (edited)")]), None, None).unwrap();
+        let m = load_meta(dir.path());
+        assert_eq!(m.origins["characters"]["林动"], TermOrigin::Yours);
+        assert!(history::list(dir.path()).is_empty(), "no snapshot unless asked");
+    }
+
+    #[test]
+    fn save_with_snapshot_keeps_the_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        save_folder(dir.path(), doc(&[("林动", "Lin Dong")]), Some(meta_with_origin("林动")), None)
+            .unwrap();
+        save_folder(
+            dir.path(),
+            doc(&[("林动", "Lin Dong"), ("应欢欢", "Ying Huanhuan")]),
+            Some(GlossaryMeta::default()),
+            Some(GlossaryChangeKind::TidyUp),
+        )
+        .unwrap();
+        let snaps = history::list(dir.path());
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].reason, GlossaryChangeKind::TidyUp);
+        assert_eq!(snaps[0].count, 1);
+        assert!(load_meta(dir.path()).origins.is_empty(), "the new meta was written");
+
+        restore_glossary_snapshot(dir.path().to_string_lossy().into(), snaps[0].id.clone())
+            .unwrap();
+        assert_eq!(load_meta(dir.path()).origins["characters"]["林动"], TermOrigin::Yours);
+        assert_eq!(load_folder_glossary(dir.path()).unwrap().count(), 1);
+    }
+
+    /// The first save in a folder has nothing to snapshot — that's not an error.
+    #[test]
+    fn save_with_snapshot_and_no_glossary_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        save_folder(dir.path(), doc(&[("林动", "Lin Dong")]), None, Some(GlossaryChangeKind::BulkEdit))
+            .unwrap();
+        assert!(history::list(dir.path()).is_empty());
+        assert_eq!(load_folder_glossary(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn improve_errors_are_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = glossary_to_improve(dir.path(), "tidy up").unwrap_err().to_string();
+        assert_eq!(err, "There's no glossary in this folder yet.");
+        save_folder(dir.path(), doc(&[]), None, None).unwrap();
+        let err = glossary_to_improve(dir.path(), "look up").unwrap_err().to_string();
+        assert_eq!(err, "The glossary is empty, so there's nothing to look up.");
+        save_folder(dir.path(), doc(&[("林动", "Lin Dong")]), None, None).unwrap();
+        assert_eq!(glossary_to_improve(dir.path(), "tidy up").unwrap().count(), 1);
+    }
 }
