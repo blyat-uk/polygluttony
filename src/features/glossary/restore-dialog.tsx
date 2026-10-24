@@ -29,6 +29,12 @@ export const SNAPSHOT_REASON: Record<GlossaryChangeKind, string> = {
   bulk_edit: "Before a bulk edit",
 };
 
+/** A copy kept before restoring over a glossary.json that couldn't be read:
+ *  it holds the broken file, which counts no terms. */
+export function isBrokenCopy(snap: Pick<GlossarySnapshot, "reason" | "count">): boolean {
+  return snap.reason === "restore" && snap.count === 0;
+}
+
 function when(atMs: number): { relative: string; exact: string } {
   const d = new Date(atMs);
   return {
@@ -64,7 +70,9 @@ export function RestoreDialog({
       void qc.invalidateQueries({ queryKey: snapshotsKey(folder) });
       onOpenChange(false);
       toast.success(
-        `Restored the version from ${when(snap.at_ms).exact} (${plural(snap.count, "term")}). The one it replaced is in the list too.`,
+        isBrokenCopy(snap)
+          ? `Restored the broken file from ${when(snap.at_ms).exact}. The one it replaced is in the list too.`
+          : `Restored the version from ${when(snap.at_ms).exact} (${plural(snap.count, "term")}). The one it replaced is in the list too.`,
       );
     } catch (e: unknown) {
       toast.error(`Couldn't restore that version. ${String(e)}`);
@@ -99,12 +107,16 @@ export function RestoreDialog({
             <ul className="divide-y divide-border/60">
               {data.map((snap) => {
                 const t = when(snap.at_ms);
+                const broken = isBrokenCopy(snap);
                 return (
                   <li key={snap.id} className="flex items-center gap-3 px-4 py-2.5">
                     <div className="min-w-0 flex-1">
-                      <div className="text-[13px] text-foreground">{SNAPSHOT_REASON[snap.reason]}</div>
+                      <div className="text-[13px] text-foreground">
+                        {broken ? "Broken file (kept before a restore)" : SNAPSHOT_REASON[snap.reason]}
+                      </div>
                       <div className="text-[11.5px] tabular-nums text-muted-foreground" title={t.exact}>
-                        {t.relative} · {t.exact} · {plural(snap.count, "term")}
+                        {t.relative} · {t.exact}
+                        {broken ? null : ` · ${plural(snap.count, "term")}`}
                       </div>
                     </div>
                     <Button
