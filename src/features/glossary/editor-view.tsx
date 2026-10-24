@@ -52,7 +52,7 @@ import { WorkspaceHeader } from "./workspace-header";
 import { TermToolbar } from "./term-toolbar";
 import { TermTable, type AddDraft, type Highlight } from "./term-table";
 import type { EditField } from "./term-row";
-import { BULK_BAR_LIFT, BulkBar, useToastsShowing } from "./bulk-bar";
+import { BulkBar, useBulkBarLift } from "./bulk-bar";
 import { ReplaceDialog } from "./replace-dialog";
 import { RestoreDialog } from "./restore-dialog";
 import { RebuildDialog } from "./rebuild-dialog";
@@ -160,7 +160,8 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
         const lines = hits.reduce((n, h) => n + h.line_ids.length, 0);
         if (lines === 0) return;
         toast(`Retranslate ${plural(lines, "line")} that use ${source} in ${episodes(hits.length)}`, {
-          id: `term-lines:${source}`,
+          // One at a time: a newer offer replaces the last one.
+          id: "term-lines",
           duration: 12000,
           action: {
             label: "Retranslate",
@@ -444,7 +445,7 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
         }
       : null;
   const barShown = (selected.size > 0 || markAll !== null) && !panel;
-  const toastsShowing = useToastsShowing();
+  const barLift = useBulkBarLift();
 
   const world = state.doc.world_type || view.prefs.world_override || view.detected_world;
   const canLookup = !!searchModel;
@@ -500,7 +501,7 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
           onAdd={add}
           addSourceRef={addSourceRef}
           highlight={highlight}
-          bottomPad={barShown ? 72 + (toastsShowing ? BULK_BAR_LIFT : 0) : 0}
+          bottomPad={barShown ? 72 + barLift : 0}
           actions={{
             onCommitEdit: commitEdit,
             onMove: (row, to) => moveRows([row], to, false),

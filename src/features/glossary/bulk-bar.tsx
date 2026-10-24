@@ -10,12 +10,11 @@ import {
 import { CATEGORIES, CATEGORY_LABEL, type Category } from "./model";
 
 /** How far the bar rises while toasts show in the bottom-right corner, so
- *  they don't cover its right end. */
-export const BULK_BAR_LIFT = 84;
-
-/** Toasts are showing (the bulk bar rises above them). */
-export function useToastsShowing(): boolean {
-  return useSonner().toasts.length > 0;
+ *  they don't cover its right end: about one toast's height each (up to the
+ *  three sonner shows), plus the gap. */
+export function useBulkBarLift(): number {
+  const n = Math.min(useSonner().toasts.length, 3);
+  return n === 0 ? 0 : 20 + 64 * n;
 }
 
 /** Floating bar for ticked rows. With the "New, not reviewed yet" filter on,
@@ -50,7 +49,7 @@ export function BulkBar({
   onDelete: () => void;
   onClear: () => void;
 }) {
-  const lifted = useToastsShowing();
+  const lift = useBulkBarLift();
   const markAllButton = markAll ? (
     <Button variant="outline" size="xs" disabled={disabled} onClick={markAll.onClick}>
       Mark all {markAll.count.toLocaleString()} reviewed
@@ -59,7 +58,7 @@ export function BulkBar({
   return (
     <div
       className="pointer-events-none absolute inset-x-0 z-10 flex justify-center px-4 transition-[bottom] duration-200"
-      style={{ bottom: 16 + (lifted ? BULK_BAR_LIFT : 0) }}
+      style={{ bottom: 16 + lift }}
     >
       <div
         role="toolbar"

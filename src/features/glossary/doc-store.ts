@@ -43,6 +43,8 @@ interface DocStore {
 
 const MAX_HISTORY = 100;
 const CHANGE_TOAST = "glossary-change";
+/** Long enough to read the toast and reach for its Undo. */
+const UNDO_TOAST_MS = 8000;
 const SAVE_TOAST = "glossary-save";
 
 export const useGlossaryDoc = create<DocStore>(() => ({
@@ -188,6 +190,7 @@ export function commit(folder: string, next: GlossaryState, opts: CommitOptions)
     if (opts.toast !== false) {
       toast(opts.toast ?? opts.label, {
         id: CHANGE_TOAST,
+        duration: UNDO_TOAST_MS,
         action: { label: "Undo", onClick: () => undoEntry(folder, entry.id) },
       });
     }
@@ -271,6 +274,7 @@ export function undo(folder: string): boolean {
   enqueueSave(folder, next, mySeq, null, `Undo: ${e.label}`);
   toast(`Undone: ${e.label}`, {
     id: CHANGE_TOAST,
+    duration: UNDO_TOAST_MS,
     action: { label: "Redo", onClick: () => void redo(folder) },
   });
   return true;
@@ -288,6 +292,7 @@ export function redo(folder: string): boolean {
   enqueueSave(folder, next, mySeq, null, e.label);
   toast(e.label, {
     id: CHANGE_TOAST,
+    duration: UNDO_TOAST_MS,
     action: { label: "Undo", onClick: () => undoEntry(folder, e.id) },
   });
   return true;
