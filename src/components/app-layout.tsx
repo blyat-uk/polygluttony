@@ -22,6 +22,7 @@ import { folderTitle } from "@/lib/folder-title"
 import { queryClient } from "@/lib/query-client"
 import { folderResultsKey } from "@/features/episodes/queries"
 import { glossaryKey } from "@/features/glossary/keys"
+import { projectKey } from "@/features/project/use-project"
 import { useAppStore } from "@/stores/app-store"
 import { useTranslationRun } from "@/stores/translation-store"
 import { useGlossaryRun } from "@/stores/glossary-store"
@@ -103,10 +104,12 @@ export function AppLayout({ children }: { children: ReactNode }) {
   }, [applyEvent])
 
   // A review edit in an episode window (or a run) stored a result: the
-  // Episodes list refetches that folder's results.
+  // Episodes list refetches that folder's results, and the folder view (which
+  // output files exist), so Mark done shows Done at once.
   useEffect(() => {
     const un = onBackendEvent<ResultsChanged>(RESULTS_CHANGED_EVENT, (e) => {
       void queryClient.invalidateQueries({ queryKey: folderResultsKey(e.payload.folder) })
+      void queryClient.invalidateQueries({ queryKey: projectKey(e.payload.folder) })
     })
     return () => {
       un.then((f) => f())
