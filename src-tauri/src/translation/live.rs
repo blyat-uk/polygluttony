@@ -187,8 +187,24 @@ impl LiveBoard {
     /// Fold one run event into the board.
     pub fn apply(&self, event: &RunEvent) -> Change {
         let mut guard = self.lock();
+        if let RunEvent::RunStarted { folder, files, .. } = event {
+            // The run's command already reset the board (so a window sees the
+            // new run at once); this only covers a board that isn't this run's.
+            let folder = Path::new(folder);
+            let current = guard.as_ref().is_some_and(|b| {
+                b.run_active
+                    && b.folder == folder
+                    && b.episodes.iter().map(|e| &e.file).eq(files.iter())
+            });
+            if !current {
+                drop(guard);
+                self.reset(folder, files);
+            }
+            return Change::All;
+        }
         let Some(board) = guard.as_mut() else { return Change::Nothing };
         match event {
+            RunEvent::RunStarted { .. } => unreachable!("handled above"),
             RunEvent::Progress { .. } | RunEvent::Log { .. } | RunEvent::Stopped { .. } => {
                 Change::Nothing
             }
@@ -693,6 +709,31 @@ mod tests {
         assert_eq!(snap.state, FileStateKind::Pending);
         assert_eq!(snap.lines[0].translation, None);
         assert_eq!(snap.lines[0].status, LineStatus::Waiting);
+    }
+
+    #[test]
+    fn run_started_resets_only_a_board_that_isnt_this_runs() {
+        let board = board_with_lines(2);
+        board.apply(&landed(&[(1, "One")]));
+        let started = |files: &[&str]| RunEvent::RunStarted {
+            folder: "/nowhere".into(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            resume: false,
+        };
+        // The command reset it already: nothing is lost.
+        assert_eq!(board.apply(&started(&["ep01.ass", "ep02.ass"])), Change::All);
+        assert_eq!(live(board.snapshot("ep01.ass")).lines[0].translation.as_deref(), Some("One"));
+        // Another run's board, or none: a fresh one.
+        board.apply(&started(&["ep03.ass"]));
+        assert!(matches!(board.snapshot("ep01.ass"), EpisodeView::NotInRun));
+        assert!(live_or_unreadable(board.snapshot("ep03.ass")));
+        let empty = LiveBoard::default();
+        assert_eq!(empty.apply(&started(&["ep01.ass"])), Change::All);
+        assert_eq!(empty.standing(Path::new("/nowhere"), "ep01.ass"), Standing::Running);
+    }
+
+    fn live_or_unreadable(view: EpisodeView) -> bool {
+        matches!(view, EpisodeView::Live(_) | EpisodeView::Unreadable { .. })
     }
 
     #[test]

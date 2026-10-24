@@ -157,6 +157,10 @@ pub struct FileResult {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "../../src/types/generated/")]
 pub enum RunEvent {
+    /// A run began: always its first event, for translation runs and for
+    /// review runs (retranslating lines or a glossary term's lines) alike.
+    /// `folder` as the run was given it; `files` in run order.
+    RunStarted { folder: String, files: Vec<String>, resume: bool },
     State { file: String, state: FileStateKind, detail: Option<String> },
     Progress {
         file: String,
@@ -209,7 +213,8 @@ impl RunEvent {
             | RunEvent::Idle { .. }
             | RunEvent::RequestSent { .. }
             | RunEvent::RequestWaiting { .. } => true,
-            RunEvent::State { .. }
+            RunEvent::RunStarted { .. }
+            | RunEvent::State { .. }
             | RunEvent::Progress { .. }
             | RunEvent::Log { .. }
             | RunEvent::FileDone { .. }

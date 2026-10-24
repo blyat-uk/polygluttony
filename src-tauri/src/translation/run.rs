@@ -340,6 +340,8 @@ fn panic_message(err: tauri::Error) -> String {
 /// started file's result. `work` must send the file's own events.
 fn spawn_files<F, Fut>(
     kit: Kit,
+    folder: String,
+    resume: bool,
     files: Vec<String>,
     on_panic: impl Fn(&str, &str) + Send + 'static,
     work: F,
@@ -357,6 +359,14 @@ fn spawn_files<F, Fut>(
     } = kit;
     let sem = Arc::new(Semaphore::new(concurrency as usize));
     tauri::async_runtime::spawn(async move {
+        // Always the run's first event: before any file task exists.
+        let _ = tx
+            .send(RunEvent::RunStarted {
+                folder,
+                files: files.clone(),
+                resume,
+            })
+            .await;
         // Zip file names with task handles so a panicking task can emit a named error.
         let mut handles: Vec<(String, tauri::async_runtime::JoinHandle<FileResult>)> = Vec::new();
         for name in files {
@@ -491,46 +501,54 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     };
     let files = args.files;
     let folder_arg = args.folder;
-    spawn_files(kit, files, on_panic, move |name, svc, verify_svc, tx| {
-        let seed = seeds
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&name);
-        let (stop, glossary, prompts, pair) = (
-            stop.clone(),
-            glossary.clone(),
-            prompts.clone(),
-            pair.clone(),
-        );
-        let (store, folder, meta, app, folder_arg) = (
-            store.clone(),
-            folder.clone(),
-            meta.clone(),
-            app.clone(),
-            folder_arg.clone(),
-        );
-        async move {
-            let outcome = translate_file(FileJob {
-                input: folder.join(&name),
-                file_name: name.clone(),
-                svc: &svc,
-                verify_svc: &verify_svc,
-                glossary: &glossary,
-                pair,
-                prompts: &prompts,
-                batch_limit,
-                stop: stop.clone(),
-                tx,
-                seed,
-            })
-            .await;
-            if let Err(e) = store_outcome(&store, &folder, &outcome, &meta, &stop) {
-                tracing::warn!("couldn't store {name}'s result: {e}");
+    let started_folder = folder_arg.clone();
+    spawn_files(
+        kit,
+        started_folder,
+        args.resume,
+        files,
+        on_panic,
+        move |name, svc, verify_svc, tx| {
+            let seed = seeds
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&name);
+            let (stop, glossary, prompts, pair) = (
+                stop.clone(),
+                glossary.clone(),
+                prompts.clone(),
+                pair.clone(),
+            );
+            let (store, folder, meta, app, folder_arg) = (
+                store.clone(),
+                folder.clone(),
+                meta.clone(),
+                app.clone(),
+                folder_arg.clone(),
+            );
+            async move {
+                let outcome = translate_file(FileJob {
+                    input: folder.join(&name),
+                    file_name: name.clone(),
+                    svc: &svc,
+                    verify_svc: &verify_svc,
+                    glossary: &glossary,
+                    pair,
+                    prompts: &prompts,
+                    batch_limit,
+                    stop: stop.clone(),
+                    tx,
+                    seed,
+                })
+                .await;
+                if let Err(e) = store_outcome(&store, &folder, &outcome, &meta, &stop) {
+                    tracing::warn!("couldn't store {name}'s result: {e}");
+                }
+                results_changed(&app, &folder_arg, &name);
+                outcome.result
             }
-            results_changed(&app, &folder_arg, &name);
-            outcome.result
-        }
-    });
+        },
+    );
     Ok(())
 }
 
@@ -622,6 +640,8 @@ pub async fn start_review(
     let batch_limit = kit.batch_limit;
     spawn_files(
         kit,
+        folder.clone(),
+        false,
         files,
         |_, _| {},
         move |name, svc, verify_svc, tx| {
@@ -952,6 +972,8 @@ mod tests {
         let doomed = stop.clone();
         spawn_files(
             kit,
+            "/work".into(),
+            true,
             files,
             |_, _| {},
             move |name, _svc, _verify, tx| {
@@ -992,6 +1014,13 @@ mod tests {
             .map(|e| match e {
                 RunEvent::State { file, state, .. } => format!("{file} {state:?}"),
                 RunEvent::Stopped { info } => format!("stopped: {}", info.message),
+                RunEvent::RunStarted {
+                    folder,
+                    files,
+                    resume,
+                } => {
+                    format!("started {folder} {files:?} resume={resume}")
+                }
                 RunEvent::RunFinished { results } => format!(
                     "finished {:?}",
                     results.iter().map(|r| r.file.as_str()).collect::<Vec<_>>()
@@ -1003,6 +1032,7 @@ mod tests {
         assert_eq!(
             tags,
             [
+                r#"started /work ["a.ass", "b.ass", "c.ass"] resume=true"#,
                 "a.ass Stopped",
                 "stopped: Anthropic rejected the API key used for Translate.",
                 "finished [\"a.ass\"]",
