@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { ConnectionsConfig } from "@/types/generated/ConnectionsConfig";
@@ -251,7 +251,22 @@ function FormCard({
   onRemove?: () => void;
 }) {
   const titleId = useId();
-  const tested = useModelTest(model);
+  // Test checks what the form shows (model, address, key), saved or not.
+  const [formDraft, setFormDraft] = useState<Model | null>(model ?? null);
+  const shown = useMemo(
+    () =>
+      formDraft
+        ? {
+            ...formDraft,
+            model: formDraft.model.trim(),
+            base_url: formDraft.base_url.trim(),
+            api_key: formDraft.api_key.trim(),
+          }
+        : undefined,
+    [formDraft],
+  );
+  const tested = useModelTest(shown);
+  const shownInfo = shown ? findProvider(providers, shown.provider) : undefined;
   const assign = target.kind === "add" ? target.assign : undefined;
   const used = model ? stepsUsing(config, model.id) : [];
   const info = model ? findProvider(providers, model.provider) : undefined;
@@ -285,18 +300,20 @@ function FormCard({
             <EyebrowNote>
               {used.length > 0 ? `used by ${stepNames(used)}` : "no step uses it yet"}
             </EyebrowNote>
-            <ModelStatusDot status={modelStatus(model, tested.test)} />
-            {isUsable(model) ? (
+            {shown ? <ModelStatusDot status={modelStatus(shown, tested.test)} /> : null}
+            {shown && isUsable(shown) ? (
               <TestButton
                 test={tested.test}
                 onTest={() => void tested.run()}
-                label={modelLabel(info, model.model)}
+                label={modelLabel(shownInfo, shown.model)}
               />
             ) : null}
           </div>
         ) : null}
       </div>
-      {model ? <TestOutcome test={tested.test} model={model} info={info} className="mt-2" /> : null}
+      {model && shown ? (
+        <TestOutcome test={tested.test} model={shown} info={shownInfo} className="mt-2" />
+      ) : null}
       <ConnectionForm
         role={role}
         providers={providers}
@@ -305,6 +322,7 @@ function FormCard({
         onSave={onSave}
         onCancel={onCancel}
         onRemove={onRemove}
+        onDraftChange={setFormDraft}
         autoFocus
         heading={assign ? ASK[assign] : model ? undefined : "Which AI do you want to add?"}
         lead={

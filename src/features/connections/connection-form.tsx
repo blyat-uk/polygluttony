@@ -63,6 +63,7 @@ export function ConnectionForm({
   onCancel,
   onRemove,
   onStageChange,
+  onDraftChange,
   autoFocus = false,
   heading,
   lead,
@@ -78,6 +79,9 @@ export function ConnectionForm({
   /** Edit mode only: the last control on the form. */
   onRemove?: () => void;
   onStageChange?: (stage: FormStage) => void;
+  /** What the fields show now (null while picking a provider), unsaved. Pass a stable
+   *  function, such as a state setter. */
+  onDraftChange?: (draft: Model | null) => void;
   /** Focus the first provider tile on mount (the form was opened by a click). */
   autoFocus?: boolean;
   /** Overrides the role's heading above the provider tiles. */
@@ -109,6 +113,7 @@ export function ConnectionForm({
   const stage: FormStage = draft && info ? "fields" : "pick";
 
   useEffect(() => onStageChange?.(stage), [stage, onStageChange]);
+  useEffect(() => onDraftChange?.(draft), [draft, onDraftChange]);
 
   // Live models: debounced while typing an address or key, then fetched once it settles.
   const probeSource = draft ? `${draft.provider}\n${draft.base_url.trim()}\n${draft.api_key.trim()}` : "";
