@@ -266,11 +266,15 @@ export function EpisodeWindow({
     [folder],
   );
 
+  // The form is open: Ctrl+E would open it afresh over what's being typed.
+  const draftOpen = useRef(false);
+  draftOpen.current = draft !== null;
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "e") {
         e.preventDefault();
-        openDraft();
+        if (!draftOpen.current) openDraft();
       }
     };
     window.addEventListener("keydown", onKey);
