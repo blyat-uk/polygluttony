@@ -1,20 +1,23 @@
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { RunScreen } from "./run-screen";
 import { ExtractionConsole } from "./extraction-console";
+import { useGlossaryUi } from "./ui-store";
 
 export function BuildProgress() {
-  // Cancelling an append can only lose work that was never in the glossary.
-  // Cancelling a re-generate leaves the partial IN PLACE OF the old glossary,
-  // so the reassuring append wording would be a lie here.
-  const regenerating = useGlossaryRun((s) => s.buildMode) === "regenerate";
+  // Stopping an append can only lose work that was never in the glossary.
+  // Stopping a rebuild leaves the partial result IN PLACE OF the old glossary,
+  // so the reassuring append wording would be a lie there.
+  const rebuilding = useGlossaryRun((s) => s.buildMode) === "regenerate";
+  const folder = useGlossaryRun((s) => s.folder);
+  const first = useGlossaryUi((s) => s.firstBuild !== null && s.firstBuild === folder);
   return (
     <RunScreen
-      title={regenerating ? "Re-generating glossary" : "Building glossary"}
-      description="Extracting names, terms & places from your subtitles."
+      title={rebuilding ? "Rebuilding from scratch" : first ? "Building glossary" : "Adding new episodes"}
+      description="Finding names, terms and places in your subtitles."
       cancelNote={
-        regenerating
-          ? "Cancelling keeps what was extracted so far — but it does not restore your previous glossary."
-          : "Partial results are kept — cancelling never throws away extracted terms."
+        rebuilding
+          ? "Stopping keeps the names found so far, in place of the old glossary. Restore an earlier version… brings the old one back."
+          : "Stopping keeps the names found so far."
       }
       body={<ExtractionConsole />}
     />
