@@ -1353,6 +1353,6 @@ mod tests {
             })
             .expect("FileDone with warnings");
         assert_eq!(done_issues.len(), result.issues.len());
-        assert_eq!(done_issues[0].issue_type, "drift");
+        assert_eq!(done_issues[0].issue_type, "meaning");
     }
 }
