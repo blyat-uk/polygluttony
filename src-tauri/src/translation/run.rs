@@ -283,6 +283,7 @@ pub fn store_outcome(
             source_hash: hash.clone(),
             total_lines: result.total_lines,
             translations: outcome.translations.clone(),
+            output_hash: outcome.output_hash.clone(),
         }),
         _ => None,
     };
@@ -626,6 +627,7 @@ fn plan_review(
             "{file} changed since it was translated. Translate it again to review it."
         )));
     }
+    crate::translation::output::check_unchanged(folder, &output_name, lines.output_hash.as_deref())?;
     Ok(ReviewPlan {
         line_ids,
         output_name,
@@ -719,6 +721,7 @@ pub async fn start_review(
                     },
                     line_ids: plan.line_ids,
                     output_name: plan.output_name,
+                    output_hash: plan.lines.output_hash.clone(),
                     issues: plan.issues,
                     needs_look: plan.needs_look,
                 })
@@ -729,6 +732,7 @@ pub async fn start_review(
                     let stored = store.edit_episode(&folder_path, &name, |record, lines| {
                         if let Some(lines) = lines {
                             lines.translations = outcome.translations.clone();
+                            lines.output_hash = outcome.output_hash.clone();
                         }
                         record.issues.retain(|i| !fixed.contains(&i.line_id));
                         record.translated_lines = outcome.translations.len() as u32;
@@ -843,6 +847,7 @@ mod tests {
                 .map(|(id, t)| (*id, t.to_string()))
                 .collect(),
             source_hash: Some(crate::translation::results::fingerprint(SRC)),
+            output_hash: None,
         }
     }
 
@@ -1007,6 +1012,18 @@ mod tests {
         assert!(plan.needs_look);
         assert_eq!(plan.output_name, "look.ass.out");
         assert_eq!(plan.issues.len(), 1);
+
+        // The output was edited by hand since it was written: not overwritten.
+        std::fs::write(folder.path().join("look.ass.out"), "fixed by hand").unwrap();
+        store
+            .edit_episode(folder.path(), "look.ass", |_, lines| {
+                lines.as_mut().unwrap().output_hash =
+                    Some(crate::translation::results::fingerprint_bytes(b"as written"));
+                Ok(())
+            })
+            .unwrap();
+        assert!(err(plan_review(&store, folder.path(), "look.ass", vec![3]))
+            .starts_with("look.ass.out was changed outside Polygluttony"));
     }
 
     #[tokio::test]

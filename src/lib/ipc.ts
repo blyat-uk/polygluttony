@@ -125,9 +125,15 @@ export const ipc = {
   /** Save the user's own translation of one line into the output file. */
   saveLine: (folder: string, file: string, lineId: number, text: string) =>
     invoke<void>("save_line", { folder, file, lineId, text }),
-  /** "Looks fine" — drop one issue from the stored results. */
-  dismissIssue: (folder: string, file: string, lineId: number, issueType: string) =>
-    invoke<void>("dismiss_issue", { folder, file, lineId, issueType }),
+  /** "Looks fine" — drop one issue from the stored results. `term` picks the name
+   *  issue about that name; without it, every issue of that type on the line goes. */
+  dismissIssue: (
+    folder: string,
+    file: string,
+    lineId: number,
+    issueType: string,
+    term?: string | null,
+  ) => invoke<void>("dismiss_issue", { folder, file, lineId, issueType, term: term ?? null }),
   /** Rename the .warning output to the clean name; the episode is done. */
   markEpisodeDone: (folder: string, file: string) =>
     invoke<void>("mark_episode_done", { folder, file }),

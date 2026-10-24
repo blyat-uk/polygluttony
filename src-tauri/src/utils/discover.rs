@@ -70,21 +70,33 @@ pub fn discover_source_files(dir: &Path, pair: &LanguagePair) -> Vec<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputOnDisk {
     pub state: TranslationState,
-    /// Both the clean and the `.warning` output exist (an old leftover).
+    /// Both the clean and the `.warning` output exist: a leftover from an
+    /// older version, which wrote one without removing the other.
     pub both_variants: bool,
-    /// The output that stands for the episode: the clean one when it exists,
-    /// else the `.warning` one; `None` when there's neither.
+    /// The output that stands for the episode: the one that exists, or the
+    /// newer of the two; `None` when there's neither.
     pub path: Option<PathBuf>,
 }
 
-/// What translation output exists next to `source`. A clean output wins over a
-/// `.warning` one: the episode is done, the warning file is a leftover.
+/// When `path` was last written, if that can be read.
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// What translation output exists next to `source`. Every writer removes
+/// the other variant, so both are there only as a leftover: then the newer
+/// file stands for the episode (the clean one when that can't be told).
 pub fn output_on_disk(source: &Path, pair: &LanguagePair) -> OutputOnDisk {
     let dir = source.parent().unwrap_or_else(|| Path::new("."));
     let clean = dir.join(output_filename(source, pair));
     let warning = dir.join(warning_filename(source, pair));
     let (has_clean, has_warning) = (clean.is_file(), warning.is_file());
+    let warning_is_newer = || match (modified(&clean), modified(&warning)) {
+        (Some(c), Some(w)) => w > c,
+        _ => false,
+    };
     let (state, path) = match (has_clean, has_warning) {
+        (true, true) if warning_is_newer() => (TranslationState::NeedsLook, Some(warning)),
         (true, _) => (TranslationState::Done, Some(clean)),
         (false, true) => (TranslationState::NeedsLook, Some(warning)),
         (false, false) => (TranslationState::None, None),
@@ -187,11 +199,26 @@ mod tests {
         assert_eq!(none.state, TranslationState::None);
         assert_eq!(none.path, None);
 
-        // Clean wins; the warning file is an old leftover.
+        // Both: the newer one counts.
+        let set_mtime = |name: &str, secs: u64| {
+            let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            fs::File::options().write(true).open(p.join(name)).unwrap().set_modified(at).unwrap();
+        };
+        set_mtime("ep04.eng.ass", 2_000_000_000);
+        set_mtime("ep04.warning.eng.ass", 1_000_000_000);
         let both = output_on_disk(&p.join("ep04.ass"), &pair);
         assert_eq!(both.state, TranslationState::Done);
         assert!(both.both_variants);
         assert_eq!(both.path, Some(p.join("ep04.eng.ass")));
+        // A newer warning file isn't hidden by a stale clean one.
+        set_mtime("ep04.warning.eng.ass", 2_100_000_000);
+        let both = output_on_disk(&p.join("ep04.ass"), &pair);
+        assert_eq!(both.state, TranslationState::NeedsLook);
+        assert!(both.both_variants);
+        assert_eq!(both.path, Some(p.join("ep04.warning.eng.ass")));
+        // Same time: the clean one.
+        set_mtime("ep04.eng.ass", 2_100_000_000);
+        assert_eq!(output_on_disk(&p.join("ep04.ass"), &pair).state, TranslationState::Done);
     }
 
     #[test]

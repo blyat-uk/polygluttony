@@ -45,7 +45,6 @@ use tokio::sync::mpsc;
 use crate::ass::decode::decode_file;
 use crate::ass::parse::{parse_dialogues, DialogueLine};
 use crate::ass::tags::strip_for_text;
-use crate::ass::writer::write_translated;
 use crate::config::Step;
 use crate::events::{
     EpisodeActivity, ErrorKind, FileResult, FileStateKind, LogLevel, LogPhase, RunEvent,
@@ -61,6 +60,7 @@ use crate::translation::batching::{
 };
 use crate::translation::cleanup::cleanup_pass;
 use crate::translation::live::episode_sources;
+use crate::translation::output;
 use crate::translation::results::fingerprint;
 use crate::translation::source_detect::SourceDetector;
 use crate::translation::stop::{RunStop, StopCause};
@@ -135,6 +135,8 @@ pub struct FileOutcome {
     pub source_hash: Option<String>,
     /// The output written next to the source, if any.
     pub output_name: Option<String>,
+    /// Fingerprint of the output's bytes as written.
+    pub output_hash: Option<String>,
 }
 
 /// Why a file didn't get to the end.
@@ -152,6 +154,7 @@ struct Finished {
     issues: Vec<VerifyIssue>,
     output_name: String,
     output_path: PathBuf,
+    output_hash: String,
 }
 
 /// Translate one `.ass` file end-to-end. Never panics outward: every way it
@@ -437,13 +440,15 @@ impl<'j, 'a> FileState<'j, 'a> {
         } else {
             output_filename(&job.input, &job.pair)
         };
-        let output_path = self.write_output(original, &output_name)?;
-        Ok(Finished { has_warnings, issues, output_name, output_path })
+        let (output_path, output_hash) = self.write_output(original, &output_name)?;
+        Ok(Finished { has_warnings, issues, output_name, output_path, output_hash })
     }
 
-    /// Write every translated line next to the source. Untranslated lines are
-    /// dropped, not written back as source text (spec).
-    fn write_output(&self, original: &str, name: &str) -> Result<PathBuf, FileError> {
+    /// Write every translated line next to the source, and remove the other
+    /// variant (clean or `.warning`) of the output. Untranslated lines are
+    /// dropped, not written back as source text (spec). Returns the path and
+    /// the fingerprint of what was written.
+    fn write_output(&self, original: &str, name: &str) -> Result<(PathBuf, String), FileError> {
         let path = match self.job.input.parent() {
             Some(parent) => parent.join(name),
             None => PathBuf::from(name),
@@ -460,11 +465,10 @@ impl<'j, 'a> FileState<'j, 'a> {
                 })
             })
             .collect();
-        write_translated(&path, original, &out_lines).map_err(|e| FileError::Failed {
-            message: format!("Couldn't write {name}: {e}"),
-            kind: ErrorKind::Other,
+        let hash = output::write(&self.job.input, &self.job.pair, name, original, &out_lines).map_err(|e| {
+            FileError::Failed { message: format!("Couldn't write {name}: {e}"), kind: ErrorKind::Other }
         })?;
-        Ok(path)
+        Ok((path, hash))
     }
 
     /// Send the file's last events and say how it ended.
@@ -499,6 +503,7 @@ impl<'j, 'a> FileState<'j, 'a> {
                     translations: self.translations,
                     source_hash,
                     output_name: Some(f.output_name),
+                    output_hash: Some(f.output_hash),
                 }
             }
             Err(FileError::Stopped) => {
@@ -517,6 +522,7 @@ impl<'j, 'a> FileState<'j, 'a> {
                     translations: self.translations,
                     source_hash,
                     output_name: None,
+                    output_hash: None,
                 }
             }
             Err(FileError::Failed { message, kind }) => {
@@ -538,6 +544,7 @@ impl<'j, 'a> FileState<'j, 'a> {
                     translations: BTreeMap::new(),
                     source_hash,
                     output_name: None,
+                    output_hash: None,
                 }
             }
         }
@@ -950,6 +957,9 @@ pub struct ReviewJob<'a> {
     pub line_ids: Vec<u32>,
     /// The output to rewrite, next to the source.
     pub output_name: String,
+    /// Fingerprint of the output as Polygluttony last wrote it: the rewrite
+    /// is refused when the file changed since (`None`: not known, rewrite).
+    pub output_hash: Option<String>,
     /// Issues still open before this; those on lines that get new text go.
     pub issues: Vec<VerifyIssue>,
     /// The episode still needs a look (its output is the `.warning` file).
@@ -965,6 +975,8 @@ pub struct ReviewOutcome {
     pub translations: BTreeMap<u32, String>,
     /// Lines that got new text.
     pub retranslated: Vec<u32>,
+    /// Fingerprint of the rewritten output (`None`: nothing was written).
+    pub output_hash: Option<String>,
     /// Why nothing could be done (unreadable or changed source, a write
     /// error), as one plain sentence. Nothing was written or stored.
     pub failed: Option<String>,
@@ -992,6 +1004,7 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
         },
         translations: BTreeMap::new(),
         retranslated: Vec::new(),
+        output_hash: None,
         failed: Some(message),
     };
     // However it goes, the episode ends where it started: its output stays.
@@ -1059,9 +1072,18 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
     let issues: Vec<VerifyIssue> =
         review.issues.iter().filter(|i| !fixed.contains(&i.line_id)).cloned().collect();
     let mut output_path = None;
+    let mut output_hash = None;
     if !retranslated.is_empty() {
-        match st.write_output(&original, &review.output_name) {
-            Ok(path) => output_path = Some(path.display().to_string()),
+        // Someone may have edited the output while the lines were out.
+        let dir = job.input.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let written = output::check_unchanged(dir, &review.output_name, review.output_hash.as_deref())
+            .map_err(|e| FileError::Failed { message: e.to_string(), kind: ErrorKind::Other })
+            .and_then(|()| st.write_output(&original, &review.output_name));
+        match written {
+            Ok((path, hash)) => {
+                output_path = Some(path.display().to_string());
+                output_hash = Some(hash);
+            }
             Err(FileError::Failed { message, kind }) => {
                 st.emit(RunEvent::Error { file: job.file_name.clone(), message: message.clone(), error_kind: kind })
                     .await;
@@ -1090,6 +1112,7 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
         },
         translations: st.translations,
         retranslated,
+        output_hash,
         failed: None,
     }
 }
@@ -1142,12 +1165,21 @@ mod tests {
         responses: Vec<Result<String, crate::llm::error::LlmError>>,
         seed: Option<Seed>,
     ) -> Ran {
+        run_in(tempfile::tempdir().unwrap(), source, responses, seed).await
+    }
+
+    /// `run_with` in a folder the test prepared.
+    async fn run_in(
+        dir: tempfile::TempDir,
+        source: &str,
+        responses: Vec<Result<String, crate::llm::error::LlmError>>,
+        seed: Option<Seed>,
+    ) -> Ran {
         let driver = ScriptedDriver::new(responses);
         let (tx, mut rx) = mpsc::channel(256);
         let stop = RunStop::default();
         let svc = LlmService::new(driver.clone(), 2, stop.token().clone(), tx.clone())
             .with_provider("Anthropic");
-        let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("ep01.ass");
         std::fs::write(&input, source).unwrap();
         let prompts = crate::prompts::TranslationPrompts::defaults(
@@ -2038,6 +2070,13 @@ mod tests {
         assert_eq!(spans, [(3, 4, 3), (9, 9, 9), (12, 12, 12)]);
     }
 
+    /// The output as it is on disk before a review, and as Polygluttony last
+    /// wrote it.
+    struct OnDisk {
+        now: &'static str,
+        written: &'static str,
+    }
+
     async fn review(
         src: &str,
         stored: &[(u32, &str)],
@@ -2045,12 +2084,27 @@ mod tests {
         ids: Vec<u32>,
         responses: Vec<Result<String, crate::llm::error::LlmError>>,
     ) -> (ReviewOutcome, Vec<RunEvent>, std::sync::Arc<ScriptedDriver>, tempfile::TempDir) {
+        review_over(src, stored, hash, ids, responses, None).await
+    }
+
+    async fn review_over(
+        src: &str,
+        stored: &[(u32, &str)],
+        hash: String,
+        ids: Vec<u32>,
+        responses: Vec<Result<String, crate::llm::error::LlmError>>,
+        on_disk: Option<OnDisk>,
+    ) -> (ReviewOutcome, Vec<RunEvent>, std::sync::Arc<ScriptedDriver>, tempfile::TempDir) {
         let driver = ScriptedDriver::new(responses);
         let (tx, mut rx) = mpsc::channel(256);
         let stop = RunStop::default();
         let svc = LlmService::new(driver.clone(), 2, stop.token().clone(), tx.clone());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("ep01.ass"), src).unwrap();
+        let output_hash = on_disk.map(|o| {
+            std::fs::write(dir.path().join("ep01.warning.eng.ass"), o.now).unwrap();
+            crate::translation::results::fingerprint_bytes(o.written.as_bytes())
+        });
         let pair = LanguagePair::from_codes("zh", "en").unwrap();
         let prompts =
             crate::prompts::TranslationPrompts::defaults(&pair, crate::config::projects::Tone::Standard);
@@ -2083,6 +2137,7 @@ mod tests {
             },
             line_ids: ids,
             output_name: "ep01.warning.eng.ass".into(),
+            output_hash,
             issues: vec![issue(2, "name"), issue(4, "untranslated"), issue(1, "meaning")],
             needs_look: true,
         })
@@ -2137,5 +2192,61 @@ mod tests {
         assert_eq!(driver.call_count(), 0);
         assert!(!dir.path().join("ep01.warning.eng.ass").exists());
         assert!(events.iter().any(|e| matches!(e, RunEvent::Error { .. })));
+    }
+
+    #[tokio::test]
+    async fn review_rewrites_an_unchanged_output_and_drops_the_other_variant() {
+        let src = ass_source(&["你好", "走吧"]);
+        let before = "what Polygluttony wrote";
+        let (outcome, _events, _driver, dir) = review_over(
+            &src,
+            &[(1, "Hello"), (2, "Go.")],
+            fingerprint(&src),
+            vec![2],
+            vec![Ok(ok_batch(&[(2, "Let's go.")]))],
+            Some(OnDisk { now: before, written: before }),
+        )
+        .await;
+        assert!(outcome.failed.is_none());
+        let bytes = std::fs::read(dir.path().join("ep01.warning.eng.ass")).unwrap();
+        assert_eq!(outcome.output_hash, Some(crate::translation::results::fingerprint_bytes(&bytes)));
+        assert!(String::from_utf8(bytes).unwrap().contains("Let's go."));
+    }
+
+    #[tokio::test]
+    async fn review_wont_overwrite_an_output_changed_since_it_was_written() {
+        let src = ass_source(&["你好", "走吧"]);
+        let (outcome, events, _driver, dir) = review_over(
+            &src,
+            &[(1, "Hello"), (2, "Go.")],
+            fingerprint(&src),
+            vec![2],
+            vec![Ok(ok_batch(&[(2, "Let's go.")]))],
+            Some(OnDisk { now: "fixed by hand", written: "what Polygluttony wrote" }),
+        )
+        .await;
+        let failed = outcome.failed.unwrap();
+        assert!(failed.starts_with("ep01.warning.eng.ass was changed outside Polygluttony"), "{failed}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ep01.warning.eng.ass")).unwrap(),
+            "fixed by hand"
+        );
+        assert!(outcome.output_hash.is_none());
+        assert!(events.iter().any(|e| matches!(e, RunEvent::Error { .. })));
+        // It ends where it started.
+        assert!(matches!(events.last(), Some(RunEvent::State { state: FileStateKind::Warning, .. })));
+    }
+
+    #[tokio::test]
+    async fn a_finished_file_replaces_the_other_output_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = ass_source(&["你好"]);
+        std::fs::write(dir.path().join("ep01.warning.eng.ass"), "an older run's").unwrap();
+        let script = vec![Ok(ok_batch(&[(1, "Hello there")])), Ok(r#"{"issues":[]}"#.into())];
+        let Ran { outcome, dir, .. } = run_in(dir, &src, script, None).await;
+        assert_eq!(outcome.output_name.as_deref(), Some("ep01.eng.ass"));
+        assert!(!dir.path().join("ep01.warning.eng.ass").exists());
+        let bytes = std::fs::read(dir.path().join("ep01.eng.ass")).unwrap();
+        assert_eq!(outcome.output_hash, Some(crate::translation::results::fingerprint_bytes(&bytes)));
     }
 }

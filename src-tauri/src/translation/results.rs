@@ -78,6 +78,11 @@ pub struct StoredLines {
     /// Line id (the pipeline's, 1-based) → the translation as written to the
     /// file, override tags in.
     pub translations: BTreeMap<u32, String>,
+    /// [`fingerprint_bytes`] of the output as Polygluttony last wrote it, so
+    /// Review won't overwrite changes made since in an editor. `None` for
+    /// results stored before this was kept, and while there's no output.
+    #[serde(default)]
+    pub output_hash: Option<String>,
 }
 
 /// Stable 64-bit FNV-1a, hex. Unlike `DefaultHasher` it never changes
@@ -94,6 +99,11 @@ fn fnv1a(bytes: &[u8]) -> String {
 /// Fingerprint of a decoded subtitle file.
 pub fn fingerprint(text: &str) -> String {
     fnv1a(text.as_bytes())
+}
+
+/// Fingerprint of a file's bytes as they are on disk.
+pub fn fingerprint_bytes(bytes: &[u8]) -> String {
+    fnv1a(bytes)
 }
 
 /// Epoch ms, for `finished_ms`.
@@ -312,6 +322,7 @@ mod tests {
             source_hash: fingerprint("source"),
             total_lines: 2,
             translations: [(1, "{\\an8}One".to_string()), (2, "Two".to_string())].into(),
+            output_hash: None,
         }
     }
 
@@ -482,6 +493,15 @@ mod tests {
             store.record(folder.path(), "ep01.ass").unwrap().outcome,
             EpisodeOutcome::Done
         );
+    }
+
+    #[test]
+    fn lines_stored_before_output_fingerprints_still_load() {
+        let old = r#"{"file":"ep01.ass","source_lang":"zh","target_lang":"en","tone":"xianxia",
+            "source_hash":"abc","total_lines":2,"translations":{"1":"One"}}"#;
+        let lines: StoredLines = serde_json::from_str(old).unwrap();
+        assert_eq!(lines.output_hash, None);
+        assert_eq!(lines.translations[&1], "One");
     }
 
     #[test]

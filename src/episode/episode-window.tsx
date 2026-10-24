@@ -211,7 +211,9 @@ export function EpisodeWindow({
         setNotice(null);
         void (async () => {
           try {
-            for (const it of issues) await ipc.dismissIssue(folder, file, id, it.issue_type);
+            for (const it of issues) {
+              await ipc.dismissIssue(folder, file, id, it.issue_type, it.term);
+            }
           } catch (e) {
             fail(e);
           }

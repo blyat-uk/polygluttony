@@ -192,7 +192,9 @@ pub fn save_line(
     Ok(())
 }
 
-/// "Looks fine": drop one issue from the stored results.
+/// "Looks fine": drop one issue from the stored results. `term` picks the
+/// name issue about that name; without it, every issue of that type on the
+/// line goes.
 #[tauri::command]
 pub fn dismiss_issue(
     app: AppHandle,
@@ -200,10 +202,12 @@ pub fn dismiss_issue(
     file: String,
     line_id: u32,
     issue_type: String,
+    term: Option<String>,
 ) -> AppResult<()> {
     let path = PathBuf::from(&folder);
     not_running(&app, &path, &file)?;
-    review::dismiss_issue(&ResultsStore::for_app(&app)?, &path, &file, line_id, &issue_type)?;
+    let store = ResultsStore::for_app(&app)?;
+    review::dismiss_issue(&store, &path, &file, line_id, &issue_type, term.as_deref())?;
     changed(&app, &folder, &file);
     Ok(())
 }
