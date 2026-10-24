@@ -2,7 +2,6 @@ import { useState, type ReactNode } from "react";
 import { Stop } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import { ipc } from "@/lib/ipc";
-import { plural } from "@/lib/utils";
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
@@ -10,7 +9,7 @@ import { Progress } from "@/components/ui/progress";
 import { LogPanel, LogToggleButton } from "@/components/log-drawer";
 
 /** Shared full-screen chrome for glossary runs (build ④ / import ②):
- *  header → optional phase line → bar → action row [Cancel | note | …Logs] →
+ *  header → optional phase line → bar → action row [Stop | note | …Logs] →
  *  log drawer below the row. */
 export function RunScreen({
   title,
@@ -42,7 +41,7 @@ export function RunScreen({
             <div className="flex items-center gap-3">
               <Progress value={total > 0 ? (done / total) * 100 : 0} className="flex-1" />
               <span className="text-[11px] text-muted-foreground tabular-nums">
-                {done}/{plural(total, "batch", "batches")}
+                batch {done} of {total}
               </span>
             </div>
           </>
@@ -54,7 +53,7 @@ export function RunScreen({
           variant="destructive"
           onClick={() => ipc.cancelGlossaryBuild().catch((e: unknown) => toast.error(String(e)))}
         >
-          <Stop className="size-4" /> Cancel
+          <Stop className="size-4" /> Stop
         </Button>
         <span className="text-[11px] text-muted-foreground">{cancelNote}</span>
         <span className="flex-1" />
