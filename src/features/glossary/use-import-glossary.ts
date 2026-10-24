@@ -3,7 +3,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { ipc } from "@/lib/ipc";
 import { useAppStore } from "@/stores/app-store";
-import { glossaryKey } from "./glossary-page";
+import { glossaryKey } from "./keys";
 import { projectKey } from "@/features/project/use-project";
 
 /** The single undo slot (glossary.prev.json) as the confirm dialogs describe it.
