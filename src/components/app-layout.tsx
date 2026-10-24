@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window"
 import { NavRail } from "@/components/nav-rail"
 import { StatusBar } from "@/components/status-bar"
 import { AtmosphereBackdrop } from "@/components/atmosphere-backdrop"
+import { NAVIGATE_EVENT } from "@/components/ui/error-toast"
 import { usePickFolder } from "@/features/welcome/use-pick-folder"
 import { runPrimaryAction } from "@/hooks/use-primary-action"
 import { GLOSSARY_FOCUS_TERM_EVENT, onBackendEvent, type GlossaryFocusTerm } from "@/lib/ipc"
@@ -105,6 +106,16 @@ export function AppLayout({ children }: { children: ReactNode }) {
     return () => {
       un.then((f) => f())
     }
+  }, [navigate])
+
+  // An error toast's "Open Models" (and the like): go where the fix is.
+  useEffect(() => {
+    const onGo = (e: Event) => {
+      const to = (e as CustomEvent<string>).detail
+      if (typeof to === "string") void navigate({ to: to as never })
+    }
+    window.addEventListener(NAVIGATE_EVENT, onGo)
+    return () => window.removeEventListener(NAVIGATE_EVENT, onGo)
   }, [navigate])
 
   // A folder dropped anywhere on the window opens it.

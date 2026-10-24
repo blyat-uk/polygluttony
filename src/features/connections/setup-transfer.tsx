@@ -13,6 +13,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { errorToast } from "@/components/ui/error-toast";
 import { ipc } from "@/lib/ipc";
 import { plural } from "@/lib/utils";
 import { listNames } from "./steps";
@@ -55,7 +56,8 @@ export function useSetupTransfer(): SetupTransfer {
     try {
       await task();
     } catch (e: unknown) {
-      toast.error(String(e));
+      // e.g. "…Fix it on the Prompts page, then export again." gets "Open Prompts".
+      errorToast(String(e));
     } finally {
       running.current = false;
       setBusy(false);
