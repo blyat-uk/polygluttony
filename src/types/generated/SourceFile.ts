@@ -16,4 +16,9 @@ translation: TranslationState,
 /**
  * Both the clean and the `.warning` output exist (an old leftover).
  */
-both_variants: boolean, };
+both_variants: boolean, 
+/**
+ * Path of the output that stands for this episode (the clean one when it
+ * exists, else the `.warning` one); `None` when nothing is on disk.
+ */
+output_path: string | null, };

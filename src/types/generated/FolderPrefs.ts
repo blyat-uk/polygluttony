@@ -7,7 +7,8 @@ import type { WorldType } from "./WorldType";
  */
 export type FolderPrefs = { source_lang: string, target_lang: string, world_override: WorldType | null, tone: Tone, 
 /**
- * Explicit list of selected file names (empty = none selected). A freshly
- * opened folder is seeded with all files selected; see `open_folder`.
+ * Explicit list of ticked file names (empty = none ticked). Kept here
+ * during a session, but never restored: every open ticks the episodes
+ * that have no translation yet; see `open_folder`.
  */
 selected_files: Array<string>, };

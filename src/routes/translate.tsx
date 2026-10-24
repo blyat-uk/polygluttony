@@ -1,16 +1,8 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { useAppStore } from "@/stores/app-store";
-import { TranslatePage } from "@/features/translate/translate-page";
-import { EmptyState } from "@/components/empty-state";
+import { createFileRoute, redirect } from "@tanstack/react-router";
 
-function TranslateRoute() {
-  const workdir = useAppStore((s) => s.workdir);
-  if (!workdir) {
-    return <EmptyState title="Translate" description="Open a folder first." />;
-  }
-  return <TranslatePage />;
-}
-
+/** Project and Translate became Episodes; old links land there. */
 export const Route = createFileRoute("/translate")({
-  component: TranslateRoute,
+  beforeLoad: () => {
+    throw redirect({ to: "/episodes" });
+  },
 });
