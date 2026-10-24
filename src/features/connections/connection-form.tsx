@@ -20,8 +20,8 @@ import {
   type ProviderKind,
   type Role,
 } from "./connection-model";
-import { commandFailure, problemCopy, type FieldKey } from "./error-copy";
-import { ConnectButton, Field, KeyLink, Msg, TextButton, type Phase } from "./form-parts";
+import { commandFailure, problemCopy, problemDetails, type FieldKey } from "./error-copy";
+import { ConnectButton, Details, Field, KeyLink, Msg, TextButton, type Phase } from "./form-parts";
 import { ModelPicker } from "./model-picker";
 import { ChosenProvider, ProviderTiles } from "./provider-tiles";
 import { capabilitiesQuery, useCapabilities, useLiveModels } from "./use-connections";
@@ -257,6 +257,7 @@ export function ConnectionForm({
   const problem = failure ? problemCopy(failure, p, d) : null;
   const fieldError = (f: FieldKey) => errors[f] ?? (problem?.field === f ? problem.text : undefined);
   const cardError = problem && problem.field === null ? problem.text : undefined;
+  const details = failure && problem ? problemDetails(failure, problem.text) : null;
   const busy = phase !== "idle";
   const ids = { key: `${uid}-key`, address: `${uid}-address`, model: `${uid}-model` };
 
@@ -490,6 +491,7 @@ export function ConnectionForm({
           )}
         </div>
       </div>
+      {details ? <Details text={details} className="mt-1" /> : null}
 
       {onRemove ? (
         <div className="mt-4 border-t border-border pt-3">
