@@ -52,7 +52,7 @@ import { WorkspaceHeader } from "./workspace-header";
 import { TermToolbar } from "./term-toolbar";
 import { TermTable, type AddDraft, type Highlight } from "./term-table";
 import type { EditField } from "./term-row";
-import { BulkBar } from "./bulk-bar";
+import { BULK_BAR_LIFT, BulkBar, useToastsShowing } from "./bulk-bar";
 import { ReplaceDialog } from "./replace-dialog";
 import { RestoreDialog } from "./restore-dialog";
 import { RebuildDialog } from "./rebuild-dialog";
@@ -434,6 +434,18 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
 
   // ── render ────────────────────────────────────────────────────────────────
 
+  // "New, not reviewed yet" on: the bar offers to mark every shown NEW term.
+  const shownNew = show === "new" ? visible.filter((r) => r.isNew) : [];
+  const markAll =
+    shownNew.length > 0
+      ? {
+          count: shownNew.length,
+          onClick: () => reviewRows(shownNew),
+        }
+      : null;
+  const barShown = (selected.size > 0 || markAll !== null) && !panel;
+  const toastsShowing = useToastsShowing();
+
   const world = state.doc.world_type || view.prefs.world_override || view.detected_world;
   const canLookup = !!searchModel;
 
@@ -488,7 +500,7 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
           onAdd={add}
           addSourceRef={addSourceRef}
           highlight={highlight}
-          bottomPad={selected.size > 0 && !panel ? 72 : 0}
+          bottomPad={barShown ? 72 + (toastsShowing ? BULK_BAR_LIFT : 0) : 0}
           actions={{
             onCommitEdit: commitEdit,
             onMove: (row, to) => moveRows([row], to, false),
@@ -515,10 +527,11 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
           }
         />
 
-        {selected.size > 0 && !panel ? (
+        {barShown ? (
           <BulkBar
             count={selectedRows.length}
             anyNew={selectedRows.some((r) => r.isNew)}
+            markAll={markAll}
             disabled={false}
             canTidy={hasModel && !busy}
             onMove={(to) => moveRows(selectedRows, to, true)}
