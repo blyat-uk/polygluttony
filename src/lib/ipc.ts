@@ -235,6 +235,10 @@ export interface GlossaryFocusTerm {
   source: string;
 }
 
+/** Stored results changed (a run finished an episode, or a review edit landed);
+ *  payload `ResultsChanged`. */
+export const RESULTS_CHANGED_EVENT = "results://changed";
+
 /** Sent to an open episode window to scroll to and select a line. Payload
  *  `EpisodeGoToLine`. */
 export const EPISODE_GO_TO_LINE_EVENT = "episode://go-to-line";

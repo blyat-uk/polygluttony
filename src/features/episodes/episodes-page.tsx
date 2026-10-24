@@ -84,6 +84,7 @@ function Episodes({ folder }: { folder: string }) {
       throttle: s.throttle,
       startError: s.startError,
       lastStart: s.lastStart,
+      external: s.external,
     })),
   );
   const [logsOpen, setLogsOpen] = useState(false);
@@ -214,7 +215,7 @@ function Episodes({ folder }: { folder: string }) {
       noModel: !hasUsableConnection,
       retry: run.lastStart,
     };
-  } else if (ours && run.results) {
+  } else if (ours && run.results && !run.external) {
     const tally = tallyRun(run.files, run.results);
     banner = run.stopInfo ? { kind: "stopped", info: run.stopInfo, tally } : { kind: "finished", tally };
   }

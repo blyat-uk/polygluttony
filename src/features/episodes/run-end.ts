@@ -18,13 +18,15 @@ import { notificationBody, tallyRun } from "./run-summary";
 /**
  * What happens when a run ends, wherever the user is in the app: the files it
  * translated are unticked, the folder view and the stored results refetch, and
- * when Polygluttony isn't the focused window an OS notification says how it went.
+ * when Polygluttony isn't the focused window an OS notification says how it went
+ * (not for a run started elsewhere, such as a review in an episode window).
  */
 export function onRunFinished(
   folder: string,
   files: Record<string, FileRow>,
   results: FileResult[],
   stop: StopInfo | null,
+  external = false,
 ) {
   queryClient.setQueryData<ProjectView>(projectKey(folder), (v) =>
     v
@@ -33,7 +35,9 @@ export function onRunFinished(
   );
   void queryClient.invalidateQueries({ queryKey: projectKey(folder) });
   void queryClient.invalidateQueries({ queryKey: folderResultsKey(folder) });
-  void notifyIfAway(folderTitle(folder), notificationBody(tallyRun(files, results), stop));
+  if (!external) {
+    void notifyIfAway(folderTitle(folder), notificationBody(tallyRun(files, results), stop));
+  }
 }
 
 const ASKED_KEY = "pg.notification-permission-asked";

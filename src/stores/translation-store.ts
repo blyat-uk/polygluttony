@@ -69,6 +69,10 @@ interface TranslationRunState {
   startError: string | null
   /** What the last start asked for, so a refused start can be tried again. */
   lastStart: { files: string[]; resume: boolean } | null
+  /** Started somewhere else (an episode window's review, a glossary term's
+   *  retranslation) and picked up from `run_started`: no end-of-run banner or
+   *  notification for it. */
+  external: boolean
   start: (files: string[], folder: string, resume?: boolean) => void
   /** The user pressed Stop; the run winds down and sends `run_finished`. */
   requestStop: () => void
@@ -114,9 +118,11 @@ export const useTranslationRun = create<TranslationRunState>((set, get) => ({
   throttle: null,
   startError: null,
   lastStart: null,
+  external: false,
 
   start: (files, folder, resume = false) =>
     set({
+      external: false,
       running: true,
       folder,
       results: null,
@@ -142,9 +148,27 @@ export const useTranslationRun = create<TranslationRunState>((set, get) => ({
     })),
 
   applyEvent: (e) => {
-    // Only the run this window started. Other work on the same channel (an
-    // episode window retranslating a few lines) has no folder here and would
-    // be mistaken for the last run.
+    // Every run opens with `run_started`. One this window didn't start (an
+    // episode window retranslating a few lines) is picked up here, so the
+    // Episodes list and the status bar show it too.
+    if (e.kind === "run_started") {
+      if (!get().running) {
+        set({
+          external: true,
+          running: true,
+          folder: e.folder,
+          results: null,
+          logs: [],
+          stopInfo: null,
+          stopRequested: false,
+          throttle: null,
+          startError: null,
+          lastStart: null,
+          files: Object.fromEntries(e.files.map((f) => [f, emptyRow()])),
+        })
+      }
+      return
+    }
     if (!get().running) return
     set((s) => {
       const files = { ...s.files }
@@ -214,7 +238,7 @@ export const useTranslationRun = create<TranslationRunState>((set, get) => ({
     })
     if (e.kind === "run_finished") {
       const s = get()
-      if (s.folder) onRunFinished(s.folder, s.files, e.results, s.stopInfo)
+      if (s.folder) onRunFinished(s.folder, s.files, e.results, s.stopInfo, s.external)
     }
   },
 
@@ -230,5 +254,6 @@ export const useTranslationRun = create<TranslationRunState>((set, get) => ({
       throttle: null,
       startError: null,
       lastStart: null,
+      external: false,
     }),
 }))

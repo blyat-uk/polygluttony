@@ -8,11 +8,19 @@ import { AtmosphereBackdrop } from "@/components/atmosphere-backdrop"
 import { NAVIGATE_EVENT } from "@/components/ui/error-toast"
 import { usePickFolder } from "@/features/welcome/use-pick-folder"
 import { runPrimaryAction } from "@/hooks/use-primary-action"
-import { GLOSSARY_FOCUS_TERM_EVENT, onBackendEvent, type GlossaryFocusTerm } from "@/lib/ipc"
+import {
+  GLOSSARY_FOCUS_TERM_EVENT,
+  RESULTS_CHANGED_EVENT,
+  onBackendEvent,
+  type GlossaryFocusTerm,
+} from "@/lib/ipc"
+import { queryClient } from "@/lib/query-client"
+import { folderResultsKey } from "@/features/episodes/queries"
 import { useTranslationRun } from "@/stores/translation-store"
 import { useGlossaryRun } from "@/stores/glossary-store"
 import type { RunEvent } from "@/types/generated/RunEvent"
 import type { GlossaryEvent } from "@/types/generated/GlossaryEvent"
+import type { ResultsChanged } from "@/types/generated/ResultsChanged"
 
 /** Ctrl/Cmd + 1…5: the rail's pages, top to bottom. */
 export const PAGE_SHORTCUTS = [
@@ -86,6 +94,17 @@ export function AppLayout({ children }: { children: ReactNode }) {
       un.then((f) => f())
     }
   }, [applyEvent])
+
+  // A review edit in an episode window (or a run) stored a result: the
+  // Episodes list refetches that folder's results.
+  useEffect(() => {
+    const un = onBackendEvent<ResultsChanged>(RESULTS_CHANGED_EVENT, (e) => {
+      void queryClient.invalidateQueries({ queryKey: folderResultsKey(e.payload.folder) })
+    })
+    return () => {
+      un.then((f) => f())
+    }
+  }, [])
 
   useEffect(() => {
     const un = onBackendEvent<GlossaryEvent>("glossary://event", (e) =>
