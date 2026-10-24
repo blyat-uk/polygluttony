@@ -3,6 +3,7 @@ import type { FileStateKind } from "@/types/generated/FileStateKind";
 import type { SourceFile } from "@/types/generated/SourceFile";
 import type { VerifyIssue } from "@/types/generated/VerifyIssue";
 import type { FileRow, Throttle } from "@/stores/translation-store";
+import { plural } from "@/lib/utils";
 import { STATE_COLOR, STATE_LABEL } from "@/features/translate/file-state-chip";
 
 export type StatusKind =
@@ -50,15 +51,92 @@ const done = (): EpisodeStatus => ({
   issues: [],
 });
 
-const needsLook = (issues: VerifyIssue[] | null): EpisodeStatus => ({
-  kind: "needs_look",
-  label: issues && issues.length > 0 ? `Needs a look · ${issues.length}` : "Needs a look",
-  color: COLOR.look,
-  live: false,
-  detail: null,
-  detailTone: "muted",
-  issues: issues ?? [],
-});
+/** The engine lists only the first few untranslated lines as issues, then one
+ *  "…and N more untranslated lines" entry on line 0, which isn't a line. */
+const isLine = (it: VerifyIssue) => it.line_id > 0;
+
+/** Untranslated lines the issues account for: the listed ones plus the
+ *  summary entry's "N more". */
+export function untranslatedInIssues(issues: readonly VerifyIssue[]): number {
+  let n = 0;
+  for (const it of issues) {
+    if (it.issue_type !== "untranslated") continue;
+    if (isLine(it)) n++;
+    else n += Number(/\d[\d,]*/.exec(it.description)?.[0].replace(/,/g, "") ?? 0);
+  }
+  return n;
+}
+
+/** Lines that need a look, counted the way the episode window counts them. */
+export interface LookCount {
+  /** Lines left untranslated. */
+  missing: number;
+  /** Other lines an issue names (a name, a meaning). */
+  others: number;
+  lines: number;
+}
+
+/**
+ * `missing` comes from the line counts when they're known (the issues list
+ * only the first few untranslated lines); otherwise from the issues. Every
+ * other issue counts once per line, and the "…and N more" entry never does.
+ */
+export function lookCount(issues: readonly VerifyIssue[], missing: number | null): LookCount {
+  const gone = Math.max(0, missing ?? untranslatedInIssues(issues));
+  const untranslatedIds = new Set(
+    issues.filter((i) => isLine(i) && i.issue_type === "untranslated").map((i) => i.line_id),
+  );
+  const others = new Set(
+    issues
+      .filter((i) => isLine(i) && i.issue_type !== "untranslated" && !untranslatedIds.has(i.line_id))
+      .map((i) => i.line_id),
+  ).size;
+  return { missing: gone, others, lines: gone + others };
+}
+
+/** A finished row of the run: lines it left untranslated. The counts can lag
+ *  a last clean-up, so the issues get a say too. */
+export function rowMissing(row: FileRow): number {
+  // Done means every line came back.
+  if (row.state === "done") return 0;
+  const fromCounts = row.total > 0 ? Math.max(0, row.total - row.translated) : 0;
+  return Math.max(fromCounts, untranslatedInIssues(row.issues));
+}
+
+/** A stored result: lines it left untranslated, when its counts are known. */
+export function recordMissing(record: EpisodeRecord): number | null {
+  return record.total_lines > 0 ? Math.max(0, record.total_lines - record.translated_lines) : null;
+}
+
+/** "Needs a look · 3", or with lines missing "Needs a look · 175 lines missing"
+ *  ("…, 2 more" when other lines need a look too). */
+export function lookLabel(c: LookCount): string {
+  if (c.lines === 0) return "Needs a look";
+  if (c.missing === 0) return `Needs a look · ${c.lines.toLocaleString()}`;
+  const missing = `${plural(c.missing, "line")} missing`;
+  return c.others > 0
+    ? `Needs a look · ${missing}, ${c.others.toLocaleString()} more`
+    : `Needs a look · ${missing}`;
+}
+
+/** By line; summary entries (line 0) last. */
+export function byLine(issues: readonly VerifyIssue[]): VerifyIssue[] {
+  const at = (i: VerifyIssue) => (isLine(i) ? i.line_id : Number.MAX_SAFE_INTEGER);
+  return [...issues].sort((a, b) => at(a) - at(b));
+}
+
+const needsLook = (issues: VerifyIssue[] | null, missing: number | null): EpisodeStatus => {
+  const list = issues ?? [];
+  return {
+    kind: "needs_look",
+    label: lookLabel(lookCount(list, missing)),
+    color: COLOR.look,
+    live: false,
+    detail: null,
+    detailTone: "muted",
+    issues: byLine(list),
+  };
+};
 
 const fresh = (): EpisodeStatus => ({
   kind: "new",
@@ -164,7 +242,7 @@ export function resolveStatus(inputs: StatusInputs): EpisodeStatus {
 
   if (live && running) {
     if (live.state === "done") return done();
-    if (live.state === "warning") return needsLook(live.issues);
+    if (live.state === "warning") return needsLook(live.issues, rowMissing(live));
     if (live.state === "failed") return failed(live.error);
     if (live.state === "stopped") return notFinished("the run stopped");
     const inFlight = IN_FLIGHT.has(live.state);
@@ -192,12 +270,14 @@ export function resolveStatus(inputs: StatusInputs): EpisodeStatus {
     if (record.outcome === "failed") return failed(record.reason);
     if (record.outcome === "stopped") return notFinished(record.reason ?? "the run stopped");
     if (disk === "done") return done();
-    if (disk === "needs_look") return needsLook(record.issues);
+    if (disk === "needs_look") return needsLook(record.issues, recordMissing(record));
     return fresh();
   }
 
   if (disk === "done") return done();
-  if (disk === "needs_look") return needsLook(live?.state === "warning" ? live.issues : null);
+  if (disk === "needs_look") {
+    return live?.state === "warning" ? needsLook(live.issues, rowMissing(live)) : needsLook(null, null);
+  }
   return fresh();
 }
 
