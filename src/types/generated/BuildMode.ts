@@ -3,9 +3,10 @@
 /**
  * Whether a build merges into the glossary already on disk or replaces it.
  *
- * `Append` is the everyday case: existing terms win, new terms fill gaps.
- * `Regenerate` starts from nothing, which makes it byte-for-byte the
- * first-time build path — and destructive, so `run::start` takes a backup
- * first (see `io::backup_folder_glossary`).
+ * `Append` (Add new episodes) is the everyday case: existing terms win, new
+ * terms fill gaps. `Regenerate` (Rebuild from scratch) starts from nothing,
+ * which makes it byte-for-byte the first-time build path — and destructive,
+ * so the current glossary goes to the history before the first write (see
+ * `BuildWriter`).
  */
 export type BuildMode = "append" | "regenerate";
