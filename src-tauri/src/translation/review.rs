@@ -167,12 +167,17 @@ fn finished<'a>(
 /// typed tags of their own, those the typed text doesn't set already. Rewrites
 /// the output and clears the line's issues. Refused when the output changed
 /// on disk since Polygluttony wrote it.
-pub fn save_line(
+///
+/// `free` says whether the episode may be edited now (no run has it). It is
+/// asked under the store's lock, so a review run that marks the episode
+/// before reading its lines can't miss this edit or overwrite it.
+pub fn save_line_when(
     store: &ResultsStore,
     folder: &Path,
     file: &str,
     line_id: u32,
     text: &str,
+    free: impl FnOnce() -> AppResult<()>,
 ) -> AppResult<()> {
     let text = text.trim().replace("\r\n", "\\N").replace('\n', "\\N");
     if text.is_empty() {
@@ -180,6 +185,7 @@ pub fn save_line(
     }
     let source = read_source(folder, file)?;
     store.edit_episode(folder, file, |record, lines| {
+        free()?;
         let (output_name, lines) = finished(record, lines, &source)?;
         let raw = line_id
             .checked_sub(1)
@@ -200,6 +206,18 @@ pub fn save_line(
         record.translated_lines = lines.translations.len() as u32;
         Ok(())
     })
+}
+
+/// [`save_line_when`] with nothing else to wait for.
+#[cfg(test)]
+pub fn save_line(
+    store: &ResultsStore,
+    folder: &Path,
+    file: &str,
+    line_id: u32,
+    text: &str,
+) -> AppResult<()> {
+    save_line_when(store, folder, file, line_id, text, || Ok(()))
 }
 
 /// "Looks fine": drop that issue from the line. With `term`, only the issue
@@ -606,6 +624,16 @@ mod tests {
         assert!(std::fs::read_to_string(&out).unwrap().contains("Go on."));
         // …and from then on it is fingerprinted.
         assert!(fx.store.lines(fx.folder.path(), "ep01.ass").unwrap().output_hash.is_some());
+    }
+
+    #[test]
+    fn save_line_asks_whether_the_episode_is_free_under_the_lock() {
+        let fx = fixture(EpisodeOutcome::NeedsLook);
+        let busy = || Err(other("This episode is being translated right now."));
+        let err = save_line_when(&fx.store, fx.folder.path(), "ep01.ass", 2, "Go on.", busy);
+        assert!(err.unwrap_err().to_string().contains("being translated"));
+        let lines = fx.store.lines(fx.folder.path(), "ep01.ass").unwrap();
+        assert_eq!(lines.translations[&2], "You go first.", "nothing written");
     }
 
     #[test]

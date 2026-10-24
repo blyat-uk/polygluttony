@@ -176,12 +176,24 @@ impl LiveBoard {
 
     /// Start a fresh board for a new run: every episode pending, nothing known.
     pub fn reset(&self, folder: &Path, files: &[String]) {
-        *self.lock() = Some(Board {
+        drop(self.replace(folder, files));
+    }
+
+    /// [`LiveBoard::reset`], keeping the board it replaces: from here the
+    /// episodes stand as running (so review actions on them wait), and if
+    /// the run doesn't start after all, [`LiveBoard::put_back`] undoes it.
+    pub fn replace(&self, folder: &Path, files: &[String]) -> SetAside {
+        SetAside(self.lock().replace(Board {
             folder: folder.to_path_buf(),
             run_active: true,
             episodes: files.iter().map(|f| Episode::new(f.clone())).collect(),
             throttle: None,
-        });
+        }))
+    }
+
+    /// Put back the board [`LiveBoard::replace`] took: its run never started.
+    pub fn put_back(&self, previous: SetAside) {
+        *self.lock() = previous.0;
     }
 
     /// Translations an episode starts the run with (Resume's kept lines, a
@@ -326,6 +338,9 @@ impl LiveBoard {
         }
     }
 }
+
+/// The board a new run replaced, kept until the run is sure to start.
+pub struct SetAside(Option<Board>);
 
 /// See [`LiveBoard::standing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,6 +616,21 @@ mod tests {
         assert_eq!(board.standing(&spelled, "ep01.ass"), Standing::Running);
         board.apply(&RunEvent::RunFinished { results: vec![] });
         assert_eq!(board.standing(dir.path(), "ep01.ass"), Standing::Finished);
+    }
+
+    #[test]
+    fn a_run_that_never_starts_puts_the_last_board_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = LiveBoard::default();
+        board.reset(dir.path(), &["ep01.ass".into()]);
+        board.apply(&RunEvent::RunFinished { results: vec![] });
+
+        let previous = board.replace(dir.path(), &["ep02.ass".into()]);
+        assert_eq!(board.standing(dir.path(), "ep02.ass"), Standing::Running);
+        assert_eq!(board.standing(dir.path(), "ep01.ass"), Standing::Absent);
+        board.put_back(previous);
+        assert_eq!(board.standing(dir.path(), "ep01.ass"), Standing::Finished);
+        assert_eq!(board.standing(dir.path(), "ep02.ass"), Standing::Absent);
     }
 
     #[test]
