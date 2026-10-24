@@ -142,6 +142,10 @@ export const useTranslationRun = create<TranslationRunState>((set, get) => ({
     })),
 
   applyEvent: (e) => {
+    // Only the run this window started. Other work on the same channel (an
+    // episode window retranslating a few lines) has no folder here and would
+    // be mistaken for the last run.
+    if (!get().running) return
     set((s) => {
       const files = { ...s.files }
       const touch = (name: string, patch: Partial<FileRow>) => {
