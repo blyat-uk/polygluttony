@@ -960,10 +960,9 @@ pub struct ReviewJob<'a> {
 #[derive(Debug)]
 pub struct ReviewOutcome {
     pub result: FileResult,
-    /// Every translation the episode has now (tags in).
+    /// Every translation the episode has now (tags in). `result.issues`
+    /// holds the issues still open.
     pub translations: BTreeMap<u32, String>,
-    /// Issues still open.
-    pub issues: Vec<VerifyIssue>,
     /// Lines that got new text.
     pub retranslated: Vec<u32>,
     /// Why nothing could be done (unreadable or changed source, a write
@@ -992,7 +991,6 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
             output_path: None,
         },
         translations: BTreeMap::new(),
-        issues: review.issues.clone(),
         retranslated: Vec::new(),
         failed: Some(message),
     };
@@ -1086,11 +1084,10 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
             total_lines: last,
             translated_lines: st.translations.len() as u32,
             has_warnings: review.needs_look,
-            issues: issues.clone(),
+            issues,
             output_path,
         },
         translations: st.translations,
-        issues,
         retranslated,
         failed: None,
     }
@@ -2112,7 +2109,7 @@ mod tests {
         assert!(outcome.failed.is_none());
         assert_eq!(outcome.retranslated, [2, 4]);
         // Only line 1's issue is left.
-        assert_eq!(outcome.issues.iter().map(|i| i.line_id).collect::<Vec<_>>(), [1]);
+        assert_eq!(outcome.result.issues.iter().map(|i| i.line_id).collect::<Vec<_>>(), [1]);
         assert_eq!(driver.call_count(), 2);
         // Line 4's request carries the lines before it as context.
         assert!(driver.last_request().unwrap().user.contains("Let's go."));

@@ -27,8 +27,12 @@ impl StopCause {
         let (who, step, model) = (&self.who, self.step.label(), &self.model);
         match self.kind {
             ErrorKind::Auth => format!("{who} rejected the API key used for {step}."),
-            ErrorKind::Billing => format!("{who} says the account used for {step} is out of credit."),
-            ErrorKind::Model => format!("{who} doesn't recognise the model “{model}” used for {step}."),
+            ErrorKind::Billing => {
+                format!("{who} says the account used for {step} is out of credit.")
+            }
+            ErrorKind::Model => {
+                format!("{who} doesn't recognise the model “{model}” used for {step}.")
+            }
             ErrorKind::RateLimit => format!("{who} kept asking us to slow down during {step}."),
             ErrorKind::Network => format!("Couldn't reach {who} for {step}."),
             ErrorKind::Server => format!("{who} kept failing on its side during {step}."),
@@ -53,7 +57,10 @@ pub struct RunStop {
 impl RunStop {
     #[cfg(test)]
     pub fn new(token: CancellationToken) -> Self {
-        Self { token, reason: Arc::default() }
+        Self {
+            token,
+            reason: Arc::default(),
+        }
     }
 
     /// The token every request and file task watches.
@@ -86,7 +93,10 @@ impl RunStop {
     }
 
     fn reason(&self) -> Option<Reason> {
-        self.reason.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The error that stopped the run, if one did.
@@ -110,7 +120,12 @@ impl RunStop {
                 kind: Some(cause.kind),
                 step: Some(cause.step),
             },
-            None => StopInfo { by_user: true, message: String::new(), kind: None, step: None },
+            None => StopInfo {
+                by_user: true,
+                message: String::new(),
+                kind: None,
+                step: None,
+            },
         })
     }
 
@@ -128,7 +143,12 @@ mod tests {
     use super::*;
 
     fn cause(kind: ErrorKind, step: Step) -> StopCause {
-        StopCause { kind, step, who: "Anthropic".into(), model: "claude-x".into() }
+        StopCause {
+            kind,
+            step,
+            who: "Anthropic".into(),
+            model: "claude-x".into(),
+        }
     }
 
     #[test]
@@ -158,7 +178,10 @@ mod tests {
         assert!(!info.by_user);
         assert_eq!(info.kind, Some(ErrorKind::Auth));
         assert_eq!(info.step, Some(Step::Translate));
-        assert_eq!(info.message, "Anthropic rejected the API key used for Translate.");
+        assert_eq!(
+            info.message,
+            "Anthropic rejected the API key used for Translate."
+        );
         assert!(stop.token().is_cancelled());
     }
 

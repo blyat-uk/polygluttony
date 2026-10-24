@@ -157,16 +157,34 @@ fn kit(app: &AppHandle, folder: &Path) -> AppResult<(Kit, mpsc::Receiver<RunEven
         )
     };
     let svc = service(conn.clone());
-    let verify_svc =
-        if same_service(&conn, &verify_conn) { svc.clone() } else { service(verify_conn) };
+    let verify_svc = if same_service(&conn, &verify_conn) {
+        svc.clone()
+    } else {
+        service(verify_conn)
+    };
     let batch_limit = conn.batch_dialogue_limit;
-    Ok((Kit { stop, tx, svc, verify_svc, glossary, batch_limit, concurrency }, rx))
+    Ok((
+        Kit {
+            stop,
+            tx,
+            svc,
+            verify_svc,
+            glossary,
+            batch_limit,
+            concurrency,
+        },
+        rx,
+    ))
 }
 
 /// Resolve prompt templates ONCE — a running job is immune to mid-job edits;
 /// changes apply to the next run. An unreadable override fails loudly here.
 fn prompts(app: &AppHandle, pair: &LanguagePair, tone: Tone) -> AppResult<Arc<TranslationPrompts>> {
-    Ok(Arc::new(TranslationPrompts::resolve(&crate::prompts::overrides_dir(app)?, pair, tone)?))
+    Ok(Arc::new(TranslationPrompts::resolve(
+        &crate::prompts::overrides_dir(app)?,
+        pair,
+        tone,
+    )?))
 }
 
 /// Forwarder: engine events → live board + webview; clears the run slot
@@ -200,7 +218,10 @@ fn reset_board(app: &AppHandle, folder: &Path, files: &[String]) {
 fn results_changed(app: &AppHandle, folder: &str, file: &str) {
     let _ = app.emit(
         RESULTS_CHANGED_EVENT,
-        ResultsChanged { folder: folder.to_string(), file: file.to_string() },
+        ResultsChanged {
+            folder: folder.to_string(),
+            file: file.to_string(),
+        },
     );
 }
 
@@ -226,8 +247,18 @@ pub fn store_outcome(
     let (kind, reason, issues, keep_lines) = match &outcome.end {
         FileEnd::Done => (EpisodeOutcome::Done, None, result.issues.clone(), true),
         FileEnd::NeedsLook => (EpisodeOutcome::NeedsLook, None, result.issues.clone(), true),
-        FileEnd::Stopped => (EpisodeOutcome::Stopped, Some(stop.reason_sentence()), Vec::new(), true),
-        FileEnd::Failed { reason, .. } => (EpisodeOutcome::Failed, Some(reason.clone()), Vec::new(), false),
+        FileEnd::Stopped => (
+            EpisodeOutcome::Stopped,
+            Some(stop.reason_sentence()),
+            Vec::new(),
+            true,
+        ),
+        FileEnd::Failed { reason, .. } => (
+            EpisodeOutcome::Failed,
+            Some(reason.clone()),
+            Vec::new(),
+            false,
+        ),
     };
     let lines = match (&outcome.source_hash, keep_lines) {
         (Some(hash), true) => Some(StoredLines {
@@ -255,14 +286,29 @@ pub fn store_outcome(
 }
 
 /// Pure: the stored partial translations of the stopped files among `files`.
-pub fn resume_seeds(store: &ResultsStore, folder: &Path, files: &[String]) -> HashMap<String, Seed> {
+pub fn resume_seeds(
+    store: &ResultsStore,
+    folder: &Path,
+    files: &[String],
+) -> HashMap<String, Seed> {
     let results = store.results(folder);
     files
         .iter()
-        .filter(|f| results.episodes.get(*f).is_some_and(|r| r.outcome == EpisodeOutcome::Stopped))
+        .filter(|f| {
+            results
+                .episodes
+                .get(*f)
+                .is_some_and(|r| r.outcome == EpisodeOutcome::Stopped)
+        })
         .filter_map(|f| {
             let lines = store.lines(folder, f)?;
-            Some((f.clone(), Seed { source_hash: lines.source_hash, translations: lines.translations }))
+            Some((
+                f.clone(),
+                Seed {
+                    source_hash: lines.source_hash,
+                    translations: lines.translations,
+                },
+            ))
         })
         .collect()
 }
@@ -301,7 +347,14 @@ fn spawn_files<F, Fut>(
     F: Fn(String, Arc<LlmService>, Arc<LlmService>, mpsc::Sender<RunEvent>) -> Fut + Send + 'static,
     Fut: Future<Output = FileResult> + Send + 'static,
 {
-    let Kit { stop, tx, svc, verify_svc, concurrency, .. } = kit;
+    let Kit {
+        stop,
+        tx,
+        svc,
+        verify_svc,
+        concurrency,
+        ..
+    } = kit;
     let sem = Arc::new(Semaphore::new(concurrency as usize));
     tauri::async_runtime::spawn(async move {
         // Zip file names with task handles so a panicking task can emit a named error.
@@ -391,7 +444,11 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     let pair = LanguagePair::from_codes(&args.source_lang, &args.target_lang)?;
     let prompts = prompts(&app, &pair, args.tone)?;
     let store = ResultsStore::for_app(&app)?;
-    let seeds = if args.resume { resume_seeds(&store, &folder, &args.files) } else { HashMap::new() };
+    let seeds = if args.resume {
+        resume_seeds(&store, &folder, &args.files)
+    } else {
+        HashMap::new()
+    };
     let seeds = Arc::new(std::sync::Mutex::new(seeds));
     let meta = RunMeta {
         source_lang: pair.source.clone(),
@@ -399,7 +456,9 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         tone: args.tone,
     };
 
-    *guard = Some(RunHandle { stop: kit.stop.clone() });
+    *guard = Some(RunHandle {
+        stop: kit.stop.clone(),
+    });
     drop(guard);
     reset_board(&app, &folder, &args.files);
     spawn_forwarder(app.clone(), rx);
@@ -407,7 +466,12 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     let stop = kit.stop.clone();
     let glossary = kit.glossary.clone();
     let batch_limit = kit.batch_limit;
-    let panic_store = (store.clone(), folder.clone(), app.clone(), args.folder.clone());
+    let panic_store = (
+        store.clone(),
+        folder.clone(),
+        app.clone(),
+        args.folder.clone(),
+    );
     let on_panic = move |file: &str, message: &str| {
         let (store, folder, app, folder_arg) = &panic_store;
         let record = EpisodeRecord {
@@ -428,11 +492,23 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     let files = args.files;
     let folder_arg = args.folder;
     spawn_files(kit, files, on_panic, move |name, svc, verify_svc, tx| {
-        let seed = seeds.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
-        let (stop, glossary, prompts, pair) =
-            (stop.clone(), glossary.clone(), prompts.clone(), pair.clone());
-        let (store, folder, meta, app, folder_arg) =
-            (store.clone(), folder.clone(), meta.clone(), app.clone(), folder_arg.clone());
+        let seed = seeds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&name);
+        let (stop, glossary, prompts, pair) = (
+            stop.clone(),
+            glossary.clone(),
+            prompts.clone(),
+            pair.clone(),
+        );
+        let (store, folder, meta, app, folder_arg) = (
+            store.clone(),
+            folder.clone(),
+            meta.clone(),
+            app.clone(),
+            folder_arg.clone(),
+        );
         async move {
             let outcome = translate_file(FileJob {
                 input: folder.join(&name),
@@ -476,7 +552,9 @@ fn plan_review(
     line_ids: Vec<u32>,
 ) -> AppResult<ReviewPlan> {
     let record = store.record(folder, file).ok_or_else(|| {
-        AppError::Other(format!("There's no stored result for {file}. Translate it first."))
+        AppError::Other(format!(
+            "There's no stored result for {file}. Translate it first."
+        ))
     })?;
     let output_name = match (record.outcome, record.output_name) {
         (EpisodeOutcome::Done | EpisodeOutcome::NeedsLook, Some(name)) => name,
@@ -492,7 +570,9 @@ fn plan_review(
         ))
     })?;
     if line_ids.is_empty() {
-        return Err(AppError::Other("Pick at least one line to retranslate.".into()));
+        return Err(AppError::Other(
+            "Pick at least one line to retranslate.".into(),
+        ));
     }
     Ok(ReviewPlan {
         line_ids,
@@ -506,11 +586,16 @@ fn plan_review(
 /// A review run: retranslate chosen lines of finished episodes (with their
 /// neighbours as context), rewrite each output and update its stored lines
 /// and issues. `jobs` is file → line ids.
-pub async fn start_review(app: AppHandle, folder: String, jobs: Vec<(String, Vec<u32>)>) -> AppResult<()> {
+pub async fn start_review(
+    app: AppHandle,
+    folder: String,
+    jobs: Vec<(String, Vec<u32>)>,
+) -> AppResult<()> {
     let mut guard = claim(&app).await?;
     let folder_path = PathBuf::from(&folder);
     let store = ResultsStore::for_app(&app)?;
-    let mut plans: HashMap<String, (ReviewPlan, LanguagePair, Arc<TranslationPrompts>)> = HashMap::new();
+    let mut plans: HashMap<String, (ReviewPlan, LanguagePair, Arc<TranslationPrompts>)> =
+        HashMap::new();
     let mut files = Vec::new();
     for (file, ids) in jobs {
         let plan = plan_review(&store, &folder_path, &file, ids)?;
@@ -524,7 +609,9 @@ pub async fn start_review(app: AppHandle, folder: String, jobs: Vec<(String, Vec
     }
     let (kit, rx) = kit(&app, &folder_path)?;
 
-    *guard = Some(RunHandle { stop: kit.stop.clone() });
+    *guard = Some(RunHandle {
+        stop: kit.stop.clone(),
+    });
     drop(guard);
     reset_board(&app, &folder_path, &files);
     spawn_forwarder(app.clone(), rx);
@@ -533,61 +620,69 @@ pub async fn start_review(app: AppHandle, folder: String, jobs: Vec<(String, Vec
     let stop = kit.stop.clone();
     let glossary = kit.glossary.clone();
     let batch_limit = kit.batch_limit;
-    spawn_files(kit, files, |_, _| {}, move |name, svc, verify_svc, tx| {
-        let plan = plans.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
-        let (stop, glossary, store, folder_path, app, folder) = (
-            stop.clone(),
-            glossary.clone(),
-            store.clone(),
-            folder_path.clone(),
-            app.clone(),
-            folder.clone(),
-        );
-        async move {
-            let (plan, pair, prompts) = plan.expect("every queued file has a plan");
-            let outcome = retranslate_episode_lines(ReviewJob {
-                job: FileJob {
-                    input: folder_path.join(&name),
-                    file_name: name.clone(),
-                    svc: &svc,
-                    verify_svc: &verify_svc,
-                    glossary: &glossary,
-                    pair,
-                    prompts: &prompts,
-                    batch_limit,
-                    stop,
-                    tx,
-                    seed: Some(Seed {
-                        source_hash: plan.lines.source_hash.clone(),
-                        translations: plan.lines.translations.clone(),
-                    }),
-                },
-                line_ids: plan.line_ids,
-                output_name: plan.output_name,
-                issues: plan.issues,
-                needs_look: plan.needs_look,
-            })
-            .await;
-            if outcome.failed.is_none() && !outcome.retranslated.is_empty() {
-                let fixed: std::collections::BTreeSet<u32> =
-                    outcome.retranslated.iter().copied().collect();
-                let stored = store.edit_episode(&folder_path, &name, |record, lines| {
-                    if let Some(lines) = lines {
-                        lines.translations = outcome.translations.clone();
+    spawn_files(
+        kit,
+        files,
+        |_, _| {},
+        move |name, svc, verify_svc, tx| {
+            let plan = plans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&name);
+            let (stop, glossary, store, folder_path, app, folder) = (
+                stop.clone(),
+                glossary.clone(),
+                store.clone(),
+                folder_path.clone(),
+                app.clone(),
+                folder.clone(),
+            );
+            async move {
+                let (plan, pair, prompts) = plan.expect("every queued file has a plan");
+                let outcome = retranslate_episode_lines(ReviewJob {
+                    job: FileJob {
+                        input: folder_path.join(&name),
+                        file_name: name.clone(),
+                        svc: &svc,
+                        verify_svc: &verify_svc,
+                        glossary: &glossary,
+                        pair,
+                        prompts: &prompts,
+                        batch_limit,
+                        stop,
+                        tx,
+                        seed: Some(Seed {
+                            source_hash: plan.lines.source_hash.clone(),
+                            translations: plan.lines.translations.clone(),
+                        }),
+                    },
+                    line_ids: plan.line_ids,
+                    output_name: plan.output_name,
+                    issues: plan.issues,
+                    needs_look: plan.needs_look,
+                })
+                .await;
+                if outcome.failed.is_none() && !outcome.retranslated.is_empty() {
+                    let fixed: std::collections::BTreeSet<u32> =
+                        outcome.retranslated.iter().copied().collect();
+                    let stored = store.edit_episode(&folder_path, &name, |record, lines| {
+                        if let Some(lines) = lines {
+                            lines.translations = outcome.translations.clone();
+                        }
+                        record.issues.retain(|i| !fixed.contains(&i.line_id));
+                        record.translated_lines = outcome.translations.len() as u32;
+                        record.finished_ms = now_ms();
+                        Ok(())
+                    });
+                    if let Err(e) = stored {
+                        tracing::warn!("couldn't store {name}'s review: {e}");
                     }
-                    record.issues.retain(|i| !fixed.contains(&i.line_id));
-                    record.translated_lines = outcome.translations.len() as u32;
-                    record.finished_ms = now_ms();
-                    Ok(())
-                });
-                if let Err(e) = stored {
-                    tracing::warn!("couldn't store {name}'s review: {e}");
+                    results_changed(&app, &folder, &name);
                 }
-                results_changed(&app, &folder, &name);
+                outcome.result
             }
-            outcome.result
-        }
-    });
+        },
+    );
     Ok(())
 }
 
@@ -625,17 +720,27 @@ mod tests {
         let mut other_thinking = verify.clone();
         other_thinking.thinking = Some(ThinkingLevel::Low);
         assert!(!same_service(&translate, &other_thinking));
-        assert!(!same_service(&translate, &sample(Provider::Anthropic, "claude-haiku-5-5")));
+        assert!(!same_service(
+            &translate,
+            &sample(Provider::Anthropic, "claude-haiku-5-5")
+        ));
     }
 
     #[test]
     fn who_names_the_provider_or_the_server() {
-        assert_eq!(who(&sample(Provider::Anthropic, "claude-sonnet-5-5")), "Anthropic");
+        assert_eq!(
+            who(&sample(Provider::Anthropic, "claude-sonnet-5-5")),
+            "Anthropic"
+        );
         assert_eq!(who(&sample(Provider::Custom, "x")), "The server");
     }
 
     fn meta() -> RunMeta {
-        RunMeta { source_lang: "zh".into(), target_lang: "en".into(), tone: Tone::Xianxia }
+        RunMeta {
+            source_lang: "zh".into(),
+            target_lang: "en".into(),
+            tone: Tone::Xianxia,
+        }
     }
 
     fn outcome(file: &str, end: FileEnd, translations: &[(u32, &str)]) -> FileOutcome {
@@ -645,7 +750,11 @@ mod tests {
                 file: file.into(),
                 success: finished,
                 total_lines: 3,
-                translated_lines: if matches!(end, FileEnd::Failed { .. }) { 0 } else { translations.len() as u32 },
+                translated_lines: if matches!(end, FileEnd::Failed { .. }) {
+                    0
+                } else {
+                    translations.len() as u32
+                },
                 has_warnings: end == FileEnd::NeedsLook,
                 issues: if end == FileEnd::NeedsLook {
                     vec![VerifyIssue {
@@ -665,7 +774,10 @@ mod tests {
             },
             output_name: finished.then(|| format!("{file}.out")),
             end,
-            translations: translations.iter().map(|(id, t)| (*id, t.to_string())).collect(),
+            translations: translations
+                .iter()
+                .map(|(id, t)| (*id, t.to_string()))
+                .collect(),
             source_hash: Some("abc".into()),
         }
     }
@@ -689,7 +801,10 @@ mod tests {
             outcome("stopped.ass", FileEnd::Stopped, &[(1, "a")]),
             outcome(
                 "failed.ass",
-                FileEnd::Failed { reason: "This file has no dialogue lines.".into(), kind: ErrorKind::Other },
+                FileEnd::Failed {
+                    reason: "This file has no dialogue lines.".into(),
+                    kind: ErrorKind::Other,
+                },
                 &[],
             ),
         ];
@@ -706,16 +821,25 @@ mod tests {
 
         let stopped = get("stopped.ass");
         assert_eq!(stopped.outcome, EpisodeOutcome::Stopped);
-        assert_eq!(stopped.reason.as_deref(), Some("Anthropic rejected the API key used for Translate."));
+        assert_eq!(
+            stopped.reason.as_deref(),
+            Some("Anthropic rejected the API key used for Translate.")
+        );
         assert_eq!((stopped.translated_lines, stopped.total_lines), (1, 3));
         assert_eq!(stopped.output_name, None);
         let partial = store.lines(folder.path(), "stopped.ass").unwrap();
         assert_eq!(partial.translations.len(), 1);
-        assert_eq!((partial.source_lang.as_str(), partial.tone), ("zh", Tone::Xianxia));
+        assert_eq!(
+            (partial.source_lang.as_str(), partial.tone),
+            ("zh", Tone::Xianxia)
+        );
 
         let failed = get("failed.ass");
         assert_eq!(failed.outcome, EpisodeOutcome::Failed);
-        assert_eq!(failed.reason.as_deref(), Some("This file has no dialogue lines."));
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("This file has no dialogue lines.")
+        );
         assert!(store.lines(folder.path(), "failed.ass").is_none());
     }
 
@@ -726,10 +850,20 @@ mod tests {
         let store = ResultsStore::at(data.path());
         let stop = RunStop::default();
         stop.by_user();
-        store_outcome(&store, folder.path(), &outcome("ep.ass", FileEnd::Stopped, &[]), &meta(), &stop)
-            .unwrap();
+        store_outcome(
+            &store,
+            folder.path(),
+            &outcome("ep.ass", FileEnd::Stopped, &[]),
+            &meta(),
+            &stop,
+        )
+        .unwrap();
         assert_eq!(
-            store.record(folder.path(), "ep.ass").unwrap().reason.as_deref(),
+            store
+                .record(folder.path(), "ep.ass")
+                .unwrap()
+                .reason
+                .as_deref(),
             Some("You stopped the run.")
         );
     }
@@ -747,8 +881,10 @@ mod tests {
         ] {
             store_outcome(&store, folder.path(), &o, &meta(), &stop).unwrap();
         }
-        let files: Vec<String> =
-            ["stopped.ass", "done.ass", "new.ass"].iter().map(|s| s.to_string()).collect();
+        let files: Vec<String> = ["stopped.ass", "done.ass", "new.ass"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let seeds = resume_seeds(&store, folder.path(), &files);
         assert_eq!(seeds.keys().collect::<Vec<_>>(), ["stopped.ass"]);
         assert_eq!(seeds["stopped.ass"].source_hash, "abc");
@@ -763,14 +899,31 @@ mod tests {
         let stop = RunStop::default();
         let err = |r: AppResult<ReviewPlan>| r.err().map(|e| e.to_string()).unwrap_or_default();
 
-        assert!(err(plan_review(&store, folder.path(), "ep.ass", vec![1])).contains("Translate it first"));
-        store_outcome(&store, folder.path(), &outcome("stopped.ass", FileEnd::Stopped, &[(1, "a")]), &meta(), &stop)
-            .unwrap();
-        assert!(err(plan_review(&store, folder.path(), "stopped.ass", vec![1])).contains("no finished translation"));
+        assert!(err(plan_review(&store, folder.path(), "ep.ass", vec![1]))
+            .contains("Translate it first"));
+        store_outcome(
+            &store,
+            folder.path(),
+            &outcome("stopped.ass", FileEnd::Stopped, &[(1, "a")]),
+            &meta(),
+            &stop,
+        )
+        .unwrap();
+        assert!(
+            err(plan_review(&store, folder.path(), "stopped.ass", vec![1]))
+                .contains("no finished translation")
+        );
 
-        store_outcome(&store, folder.path(), &outcome("look.ass", FileEnd::NeedsLook, &[(1, "a")]), &meta(), &stop)
-            .unwrap();
-        assert!(err(plan_review(&store, folder.path(), "look.ass", vec![])).contains("at least one line"));
+        store_outcome(
+            &store,
+            folder.path(),
+            &outcome("look.ass", FileEnd::NeedsLook, &[(1, "a")]),
+            &meta(),
+            &stop,
+        )
+        .unwrap();
+        assert!(err(plan_review(&store, folder.path(), "look.ass", vec![]))
+            .contains("at least one line"));
         let plan = plan_review(&store, folder.path(), "look.ass", vec![3]).unwrap();
         assert!(plan.needs_look);
         assert_eq!(plan.output_name, "look.ass.out");
@@ -792,32 +945,44 @@ mod tests {
             batch_limit: None,
             concurrency: 1,
         };
-        let files: Vec<String> = ["a.ass", "b.ass", "c.ass"].iter().map(|s| s.to_string()).collect();
+        let files: Vec<String> = ["a.ass", "b.ass", "c.ass"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let doomed = stop.clone();
-        spawn_files(kit, files, |_, _| {}, move |name, _svc, _verify, tx| {
-            let stop = doomed.clone();
-            async move {
-                // The first file meets a dead key: the run stops.
-                stop.by_error(StopCause {
-                    kind: ErrorKind::Auth,
-                    step: Step::Translate,
-                    who: "Anthropic".into(),
-                    model: "m".into(),
-                });
-                let _ = tx
-                    .send(RunEvent::State { file: name.clone(), state: FileStateKind::Stopped, detail: None })
-                    .await;
-                FileResult {
-                    file: name,
-                    success: false,
-                    total_lines: 3,
-                    translated_lines: 1,
-                    has_warnings: false,
-                    issues: Vec::new(),
-                    output_path: None,
+        spawn_files(
+            kit,
+            files,
+            |_, _| {},
+            move |name, _svc, _verify, tx| {
+                let stop = doomed.clone();
+                async move {
+                    // The first file meets a dead key: the run stops.
+                    stop.by_error(StopCause {
+                        kind: ErrorKind::Auth,
+                        step: Step::Translate,
+                        who: "Anthropic".into(),
+                        model: "m".into(),
+                    });
+                    let _ = tx
+                        .send(RunEvent::State {
+                            file: name.clone(),
+                            state: FileStateKind::Stopped,
+                            detail: None,
+                        })
+                        .await;
+                    FileResult {
+                        file: name,
+                        success: false,
+                        total_lines: 3,
+                        translated_lines: 1,
+                        has_warnings: false,
+                        issues: Vec::new(),
+                        output_path: None,
+                    }
                 }
-            }
-        });
+            },
+        );
         let mut events = Vec::new();
         while let Some(e) = rx.recv().await {
             events.push(e);

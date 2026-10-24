@@ -148,7 +148,11 @@ impl ResultsStore {
         let canonical = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
         let text = canonical.to_string_lossy();
         let trimmed = text.trim_end_matches(['/', '\\']);
-        fnv1a(if trimmed.is_empty() { text.as_bytes() } else { trimmed.as_bytes() })
+        fnv1a(if trimmed.is_empty() {
+            text.as_bytes()
+        } else {
+            trimmed.as_bytes()
+        })
     }
 
     fn results_path(&self, folder: &Path) -> PathBuf {
@@ -156,7 +160,9 @@ impl ResultsStore {
     }
 
     fn lines_path(&self, folder: &Path, file: &str) -> PathBuf {
-        self.dir.join(Self::folder_key(folder)).join(format!("{}.json", fnv1a(file.as_bytes())))
+        self.dir
+            .join(Self::folder_key(folder))
+            .join(format!("{}.json", fnv1a(file.as_bytes())))
     }
 
     fn read_results(&self, folder: &Path) -> FolderResults {
@@ -171,7 +177,10 @@ impl ResultsStore {
             folder: folder.to_string_lossy().into_owned(),
             episodes: &results.episodes,
         };
-        write_atomic(&self.results_path(folder), &serde_json::to_vec_pretty(&on_disk)?)
+        write_atomic(
+            &self.results_path(folder),
+            &serde_json::to_vec_pretty(&on_disk)?,
+        )
     }
 
     fn read_lines(&self, folder: &Path, file: &str) -> Option<StoredLines> {
@@ -181,7 +190,10 @@ impl ResultsStore {
     }
 
     fn write_lines(&self, folder: &Path, lines: &StoredLines) -> AppResult<()> {
-        write_atomic(&self.lines_path(folder, &lines.file), &serde_json::to_vec(lines)?)
+        write_atomic(
+            &self.lines_path(folder, &lines.file),
+            &serde_json::to_vec(lines)?,
+        )
     }
 
     fn remove_lines(&self, folder: &Path, file: &str) -> AppResult<()> {
@@ -261,7 +273,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("results");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("results");
     let tmp = path.with_file_name(format!(".{name}.tmp"));
     std::fs::write(&tmp, bytes)?;
     if let Err(e) = std::fs::rename(&tmp, path) {
@@ -307,19 +322,40 @@ mod tests {
         let store = ResultsStore::at(data.path().join("results"));
         assert!(store.results(folder.path()).episodes.is_empty());
 
-        store.put_episode(folder.path(), record("ep01.ass", EpisodeOutcome::Done), Some(&lines("ep01.ass"))).unwrap();
-        store.put_episode(folder.path(), record("ep02.ass", EpisodeOutcome::Stopped), None).unwrap();
+        store
+            .put_episode(
+                folder.path(),
+                record("ep01.ass", EpisodeOutcome::Done),
+                Some(&lines("ep01.ass")),
+            )
+            .unwrap();
+        store
+            .put_episode(
+                folder.path(),
+                record("ep02.ass", EpisodeOutcome::Stopped),
+                None,
+            )
+            .unwrap();
 
         // A fresh store on the same dir reads it all back.
         let again = ResultsStore::at(data.path().join("results"));
         let results = again.results(folder.path());
         assert_eq!(results.episodes.len(), 2);
         assert_eq!(results.episodes["ep01.ass"].outcome, EpisodeOutcome::Done);
-        assert_eq!(results.episodes["ep02.ass"].outcome, EpisodeOutcome::Stopped);
-        assert_eq!(again.lines(folder.path(), "ep01.ass"), Some(lines("ep01.ass")));
+        assert_eq!(
+            results.episodes["ep02.ass"].outcome,
+            EpisodeOutcome::Stopped
+        );
+        assert_eq!(
+            again.lines(folder.path(), "ep01.ass"),
+            Some(lines("ep01.ass"))
+        );
         assert_eq!(again.lines(folder.path(), "ep02.ass"), None);
         // No temp files left behind.
-        let leftovers: Vec<_> = walk(data.path()).into_iter().filter(|p| p.ends_with(".tmp")).collect();
+        let leftovers: Vec<_> = walk(data.path())
+            .into_iter()
+            .filter(|p| p.ends_with(".tmp"))
+            .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
@@ -342,7 +378,9 @@ mod tests {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
         let store = ResultsStore::at(data.path());
-        store.put_episode(a.path(), record("ep01.ass", EpisodeOutcome::Done), None).unwrap();
+        store
+            .put_episode(a.path(), record("ep01.ass", EpisodeOutcome::Done), None)
+            .unwrap();
         assert!(store.results(b.path()).episodes.is_empty());
         let slashed = PathBuf::from(format!("{}/", a.path().display()));
         assert_eq!(store.results(&slashed).episodes.len(), 1);
@@ -353,7 +391,13 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let folder = tempfile::tempdir().unwrap();
         let store = ResultsStore::at(data.path());
-        store.put_episode(folder.path(), record("ep01.ass", EpisodeOutcome::Done), Some(&lines("ep01.ass"))).unwrap();
+        store
+            .put_episode(
+                folder.path(),
+                record("ep01.ass", EpisodeOutcome::Done),
+                Some(&lines("ep01.ass")),
+            )
+            .unwrap();
 
         std::fs::write(store.results_path(folder.path()), "{ not json").unwrap();
         std::fs::write(store.lines_path(folder.path(), "ep01.ass"), "[1, 2").unwrap();
@@ -361,7 +405,13 @@ mod tests {
         assert_eq!(store.lines(folder.path(), "ep01.ass"), None);
 
         // Writing over a damaged store starts it afresh.
-        store.put_episode(folder.path(), record("ep02.ass", EpisodeOutcome::Failed), None).unwrap();
+        store
+            .put_episode(
+                folder.path(),
+                record("ep02.ass", EpisodeOutcome::Failed),
+                None,
+            )
+            .unwrap();
         let results = store.results(folder.path());
         assert_eq!(results.episodes.keys().collect::<Vec<_>>(), ["ep02.ass"]);
     }
@@ -371,9 +421,19 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let folder = tempfile::tempdir().unwrap();
         let store = ResultsStore::at(data.path());
-        store.put_episode(folder.path(), record("ep01.ass", EpisodeOutcome::Done), Some(&lines("ep01.ass"))).unwrap();
+        store
+            .put_episode(
+                folder.path(),
+                record("ep01.ass", EpisodeOutcome::Done),
+                Some(&lines("ep01.ass")),
+            )
+            .unwrap();
         // A file whose name hashes to the same path can't read someone else's lines.
-        std::fs::copy(store.lines_path(folder.path(), "ep01.ass"), store.lines_path(folder.path(), "ep09.ass")).unwrap();
+        std::fs::copy(
+            store.lines_path(folder.path(), "ep01.ass"),
+            store.lines_path(folder.path(), "ep09.ass"),
+        )
+        .unwrap();
         assert_eq!(store.lines(folder.path(), "ep09.ass"), None);
     }
 
@@ -382,25 +442,46 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let folder = tempfile::tempdir().unwrap();
         let store = ResultsStore::at(data.path());
-        assert!(store.edit_episode(folder.path(), "ep01.ass", |_, _| Ok(())).is_err());
-        store.put_episode(folder.path(), record("ep01.ass", EpisodeOutcome::NeedsLook), Some(&lines("ep01.ass"))).unwrap();
+        assert!(store
+            .edit_episode(folder.path(), "ep01.ass", |_, _| Ok(()))
+            .is_err());
+        store
+            .put_episode(
+                folder.path(),
+                record("ep01.ass", EpisodeOutcome::NeedsLook),
+                Some(&lines("ep01.ass")),
+            )
+            .unwrap();
 
         store
             .edit_episode(folder.path(), "ep01.ass", |rec, lines| {
                 rec.outcome = EpisodeOutcome::Done;
-                lines.as_mut().unwrap().translations.insert(2, "Deux".into());
+                lines
+                    .as_mut()
+                    .unwrap()
+                    .translations
+                    .insert(2, "Deux".into());
                 Ok(())
             })
             .unwrap();
-        assert_eq!(store.record(folder.path(), "ep01.ass").unwrap().outcome, EpisodeOutcome::Done);
-        assert_eq!(store.lines(folder.path(), "ep01.ass").unwrap().translations[&2], "Deux");
+        assert_eq!(
+            store.record(folder.path(), "ep01.ass").unwrap().outcome,
+            EpisodeOutcome::Done
+        );
+        assert_eq!(
+            store.lines(folder.path(), "ep01.ass").unwrap().translations[&2],
+            "Deux"
+        );
 
         let err = store.edit_episode(folder.path(), "ep01.ass", |rec, _| -> AppResult<()> {
             rec.outcome = EpisodeOutcome::Failed;
             Err(AppError::Other("no".into()))
         });
         assert!(err.is_err());
-        assert_eq!(store.record(folder.path(), "ep01.ass").unwrap().outcome, EpisodeOutcome::Done);
+        assert_eq!(
+            store.record(folder.path(), "ep01.ass").unwrap().outcome,
+            EpisodeOutcome::Done
+        );
     }
 
     #[test]
