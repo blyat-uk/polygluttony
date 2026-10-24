@@ -60,6 +60,21 @@ function selectedTerm(): string | null {
   return text && text.length <= 60 ? text : null;
 }
 
+/** The first line on screen in the table under `root`, or null. */
+function firstLineInView(root: HTMLElement | null): number | null {
+  if (!root) return null;
+  const top = root.getBoundingClientRect().top;
+  let best: { id: number; top: number } | null = null;
+  for (const row of root.querySelectorAll<HTMLElement>("[data-line]")) {
+    const r = row.getBoundingClientRect();
+    // Past the column heads, and not scrolled out above them.
+    if (r.bottom <= top + 32) continue;
+    const id = Number(row.dataset.line);
+    if (!best || r.top < best.top) best = { id, top: r.top };
+  }
+  return best?.id ?? null;
+}
+
 /** "Fix in glossary": the main window shows the Glossary with this term,
  *  and comes to the front when the platform lets it. */
 async function focusTermInMain(folder: string, source: string) {
@@ -137,6 +152,18 @@ export function EpisodeWindow({
       unlisten?.();
     };
   }, [file, goToLine]);
+
+  // Only flagged on or off: the line you were on stays in view.
+  const toggleOnlyFlagged = () => {
+    const next = !onlyFlagged;
+    const anchor = selected ?? firstLineInView(mainRef.current);
+    setOnlyFlagged(next);
+    if (anchor === null) return;
+    const id = !next || flags.has(anchor) ? anchor : (flagged.find((f) => f > anchor) ?? flagged[flagged.length - 1]);
+    if (id === undefined) return;
+    goToSeq.current += 1;
+    setGoTo({ id, seq: goToSeq.current });
+  };
 
   const nav: Navigator | null =
     snapshot && folder
@@ -227,6 +254,42 @@ export function EpisodeWindow({
       },
     };
   }, [folder, file, blocked, editingId, busy, fail]);
+
+  // A line acted on (retranslated, edited, looks fine) that stops needing a
+  // look hands over to the next one, so the navigator keeps its place.
+  const advanceFrom = useRef<number | null>(null);
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const review = useMemo<ReviewActions | null>(() => {
+    if (!actions) return null;
+    const from = (id: number) => {
+      advanceFrom.current = id;
+    };
+    return {
+      ...actions,
+      saveEdit: (id, text) => {
+        from(id);
+        return actions.saveEdit(id, text);
+      },
+      retranslate: (ids) => {
+        if (ids.length === 1) from(ids[0]);
+        actions.retranslate(ids);
+      },
+      looksFine: (id, issues) => {
+        from(id);
+        actions.looksFine(id, issues);
+      },
+    };
+  }, [actions]);
+  useEffect(() => {
+    const at = advanceFrom.current;
+    // Wait for a retranslation to finish, and for the line to be resolved.
+    if (at === null || blocked !== null || flagged.includes(at)) return;
+    advanceFrom.current = null;
+    if (selectedRef.current !== at) return;
+    const next = flagged.find((id) => id > at) ?? flagged[0];
+    if (next !== undefined) goToLine(next);
+  }, [flagged, blocked, goToLine]);
 
   const markDone = () => {
     if (!folder) return;
@@ -347,7 +410,7 @@ export function EpisodeWindow({
   }
 
   return (
-    <ReviewContext.Provider value={actions}>
+    <ReviewContext.Provider value={review}>
       <div className="flex h-screen flex-col bg-background text-foreground">
         <EpisodeHeader
           file={file}
@@ -357,7 +420,7 @@ export function EpisodeWindow({
           refreshError={view !== null ? error : null}
           nav={nav}
           onlyFlagged={onlyFlagged}
-          onToggleOnlyFlagged={() => setOnlyFlagged((on) => !on)}
+          onToggleOnlyFlagged={toggleOnlyFlagged}
         />
         <main ref={mainRef} className="relative flex min-h-0 flex-1 flex-col">
           {body}

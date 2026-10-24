@@ -65,9 +65,11 @@ export function draftFrom(sel: LineSelection | null, fallback: Rect): GlossaryDr
     : { source: "", target: sel.text, anchor: sel.rect };
 }
 
-/** The small button over a selection. Keeps the selection when pressed. */
+/** The small button under a selection (above it, near the window's bottom
+ *  edge), so it never covers the line before. Keeps the selection when pressed. */
 export function SelectionButton({ sel, onOpen }: { sel: LineSelection; onOpen: () => void }) {
-  const top = Math.max(6, sel.rect.top - 30);
+  const below = sel.rect.top + sel.rect.height + 6;
+  const top = below + 30 <= window.innerHeight ? below : Math.max(6, sel.rect.top - 30);
   const left = Math.max(70, Math.min(window.innerWidth - 70, sel.rect.left + sel.rect.width / 2));
   return (
     <button
