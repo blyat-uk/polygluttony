@@ -41,7 +41,8 @@ export function finishedLine(t: RunTally): string {
       ? `No episodes were translated — ${failed} failed.`
       : "No episodes were translated.";
   }
-  const parts = [`${t.done.length} done`];
+  const parts: string[] = [];
+  if (t.done.length > 0) parts.push(`${t.done.length} done`);
   if (t.look.length > 0) parts.push(`${t.look.length} ${needs(t.look.length)} a look`);
   if (failed > 0) parts.push(`${failed} failed`);
   return `Translated ${episodes(translated)} — ${parts.join(", ")}.`;

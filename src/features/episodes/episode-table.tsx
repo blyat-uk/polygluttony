@@ -102,7 +102,7 @@ export function EpisodeTable({
             <th className="w-10 py-2 pl-4 text-left">
               <Checkbox
                 aria-label="Select every episode"
-                checked={allTicked ? true : selected.length > 0 ? "indeterminate" : false}
+                checked={allTicked}
                 onCheckedChange={() => onSelect(allTicked ? [] : files.map((f) => f.name))}
               />
             </th>

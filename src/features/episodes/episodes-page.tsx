@@ -241,7 +241,9 @@ function Episodes({ folder }: { folder: string }) {
     setSelection(presetSelection(preset, view.files, (n) => statusOf(n).kind));
 
   return (
-    <div className="flex h-full flex-col">
+    // Inline-size containment: long paths and names truncate instead of
+    // widening the app's grid column.
+    <div className="flex h-full min-w-0 flex-col [contain:inline-size]">
       <FolderHeader folder={folder} rescanning={isFetching} onRescan={refresh} />
 
       <div className="min-h-0 flex-1 space-y-3.5 overflow-auto p-5">

@@ -91,7 +91,7 @@ export function FolderSettings({
                 htmlFor="ep-world"
                 help={
                   <HelpText>
-                    Which terms matter most, e.g. Xianxia favours cultivation terms like 金丹 →
+                    Which terms matter most, e.g. Xianxia favors cultivation terms like 金丹 →
                     “Golden Core”.
                   </HelpText>
                 }
