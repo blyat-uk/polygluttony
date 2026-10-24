@@ -253,7 +253,7 @@ pub async fn build_glossary(
             personalized: false,
             aborted: false,
             cancelled: false,
-            errors: vec!["No text found in files".into()],
+            errors: vec!["No dialogue found in the chosen files.".into()],
             diff: GlossaryDiff::compute(diff_base.as_ref(), &persisted),
         };
         let _ = tx.send(GlossaryEvent::Done { summary }).await;
@@ -362,7 +362,7 @@ pub async fn build_glossary(
                         log(
                             &tx,
                             LogLevel::Warning,
-                            format!("batch {n}/{total}: unparseable response ({e})"),
+                            format!("batch {n} of {total}: the answer couldn't be read ({e})"),
                         )
                         .await;
                         Glossary::new(&job.world_type)
@@ -389,7 +389,7 @@ pub async fn build_glossary(
                         .await;
                     }
                 }
-                log(&tx, LogLevel::Info, format!("batch {n}/{total}: {count} terms")).await;
+                log(&tx, LogLevel::Info, format!("batch {n} of {total}: {count} terms")).await;
             }
             Err(e) if e.is_auth() && !aborted => {
                 // Retrying won't fix credentials: stop the REMAINING batches,
@@ -400,18 +400,18 @@ pub async fn build_glossary(
                 log(
                     &tx,
                     LogLevel::Warning,
-                    format!("batch {n}/{total}: auth error — stopping remaining batches"),
+                    format!("batch {n} of {total}: the API key didn't work — stopping the remaining batches"),
                 )
                 .await;
                 errors.push(format!(
-                    "batch {n}/{total}: auth error, remaining batches stopped ({e})"
+                    "batch {n} of {total}: the API key didn't work, so the remaining batches were stopped ({e})"
                 ));
             }
             Err(e) => {
                 let noise = (aborted || job.cancel.is_cancelled()) && e.is_cancelled();
                 if !noise {
-                    log(&tx, LogLevel::Warning, format!("batch {n}/{total} failed: {e}")).await;
-                    errors.push(format!("batch {n}/{total} failed: {e}"));
+                    log(&tx, LogLevel::Warning, format!("batch {n} of {total} failed: {e}")).await;
+                    errors.push(format!("batch {n} of {total} failed: {e}"));
                 }
             }
         }
@@ -485,7 +485,7 @@ pub async fn build_glossary(
             // remains on disk.
             let _ = tx
                 .send(GlossaryEvent::Error {
-                    message: format!("could not save {}: {e}", glossary_path.display()),
+                    message: format!("Couldn't save {}: {e}", glossary_path.display()),
                 })
                 .await;
             return;
@@ -683,7 +683,7 @@ mod tests {
         assert!(!s.aborted, "non-auth failures must not abort");
         assert_eq!(s.batches_processed, 1);
         assert_eq!(s.errors.len(), 1);
-        assert!(s.errors[0].contains("batch 1"));
+        assert!(s.errors[0].starts_with("batch 1 of 2"), "{}", s.errors[0]);
         assert_eq!(s.terms_final, 1); // half a glossary > no glossary
         assert!(load_folder_glossary(dir.path()).is_some());
     }
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(s.batches_processed, 0);
         assert_eq!(s.batches_total, 3);
         assert_eq!(s.errors.len(), 1, "queued-batch noise suppressed: {:?}", s.errors);
-        assert!(s.errors[0].contains("auth error"), "{}", s.errors[0]);
+        assert!(s.errors[0].contains("API key didn't work"), "{}", s.errors[0]);
     }
 
     /// The ONLY `Error` event in the build: the final save fails. Unix-only —
@@ -776,7 +776,7 @@ mod tests {
             })
             .collect();
         assert_eq!(error_msgs.len(), 1, "exactly one Error event: {events:?}");
-        assert!(error_msgs[0].contains("could not save"), "{}", error_msgs[0]);
+        assert!(error_msgs[0].starts_with("Couldn't save"), "{}", error_msgs[0]);
         assert!(
             error_msgs[0].contains("glossary.json"),
             "Error names the path: {}",
@@ -827,7 +827,7 @@ mod tests {
         )
         .await;
         assert_eq!(s.files_processed, 0);
-        assert_eq!(s.errors, vec!["No text found in files".to_string()]);
+        assert_eq!(s.errors, vec!["No dialogue found in the chosen files.".to_string()]);
         assert!(load_folder_glossary(dir.path()).is_none());
     }
 
