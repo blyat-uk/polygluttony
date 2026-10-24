@@ -170,9 +170,13 @@ function Episodes({ folder }: { folder: string }) {
     if (langsChanged) refresh();
   };
 
-  const startRun = (files: string[], resume = false) => {
+  // Every start resumes: the engine carries on only episodes whose stored
+  // result is a stop with the same source (and settings); the rest start
+  // fresh. So a stopped episode's kept batches are never thrown away.
+  const startRun = (files: string[]) => {
     if (!view || files.length === 0) return;
     const { prefs } = view;
+    const resume = true;
     const store = useTranslationRun.getState();
     store.start(files, folder, resume);
     // Running a folder keeps its settings (and it's no longer a first visit).
@@ -276,8 +280,8 @@ function Episodes({ folder }: { folder: string }) {
         <RunBanner
           state={banner}
           busy={run.running || glossaryBusy}
-          onResume={(files) => startRun(files, true)}
-          onRetry={(files, resume) => startRun(files, resume)}
+          onResume={(files) => startRun(files)}
+          onRetry={(files) => startRun(files)}
         />
 
         <EpisodeTable
