@@ -345,8 +345,10 @@ pub struct ResultsChanged {
 pub const EPISODE_GO_TO_LINE_EVENT: &str = "episode://go-to-line";
 
 /// Payload of `EPISODE_GO_TO_LINE_EVENT` (typed in `src/lib/ipc.ts`).
+/// `folder` is the one the window was opened with (`None` = the run's).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeGoToLine {
+    pub folder: Option<String>,
     pub file: String,
     pub line: u32,
 }

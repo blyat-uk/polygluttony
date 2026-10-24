@@ -125,7 +125,8 @@ export function EpisodeWindow({
     let disposed = false;
     let unlisten: UnlistenFn | undefined;
     onBackendEvent<EpisodeGoToLine>(EPISODE_GO_TO_LINE_EVENT, (e) => {
-      if (e.payload.file === file) goToLine(e.payload.line);
+      // Two seasons can both have an `01.ass`: the folder must match too.
+      if (e.payload.file === file && (e.payload.folder || null) === folder) goToLine(e.payload.line);
     })
       .then((fn) => {
         if (disposed) fn();
@@ -136,7 +137,7 @@ export function EpisodeWindow({
       disposed = true;
       unlisten?.();
     };
-  }, [file, goToLine]);
+  }, [file, folder, goToLine]);
 
   const nav: Navigator | null =
     snapshot && folder

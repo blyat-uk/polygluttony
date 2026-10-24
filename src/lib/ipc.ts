@@ -249,6 +249,8 @@ export const RESULTS_CHANGED_EVENT = "results://changed";
  *  `EpisodeGoToLine`. */
 export const EPISODE_GO_TO_LINE_EVENT = "episode://go-to-line";
 export interface EpisodeGoToLine {
+  /** The folder the window was opened with; null = the run's. */
+  folder: string | null;
   file: string;
   line: number;
 }
