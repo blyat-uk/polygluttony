@@ -35,6 +35,13 @@ export function problemCopy(
 
   switch (result.problem) {
     case "key": {
+      // A local server has no key: it refused for another reason.
+      if (kind === "local") {
+        return {
+          field: "address",
+          text: `${info.label} refused the request. Check the address, and that the model is installed.`,
+        };
+      }
       const hint = info.key_hint ? ` (${info.key_hint})` : "";
       return {
         field: hasKeyField ? "key" : null,
@@ -106,10 +113,12 @@ export function commandFailure(conn: Pick<Model, "model">, e: unknown): TestResu
  * banner and the Models page say one thing. `who` is the provider's name ("Anthropic").
  * Null for `other`: show the run's own message.
  */
-export function errorKindCopy(kind: ErrorKind, who: string): string | null {
+export function errorKindCopy(kind: ErrorKind, who: string, local = false): string | null {
   switch (kind) {
     case "auth":
-      return `${who} rejected the API key. Check it on the Models page.`;
+      return local
+        ? `${who} refused the request. Check the address, and that the model is installed.`
+        : `${who} rejected the API key. Check it on the Models page.`;
     case "billing":
       return `${who} says this account is out of credit. Add credit in your ${who} account, then Try again.`;
     case "rate_limit":

@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import type { GlossaryMeta } from "@/types/generated/GlossaryMeta";
 import type { ProjectView } from "@/types/generated/ProjectView";
 import { Button } from "@/components/ui/button";
 import { HelpText } from "@/components/help-text";
 import { usePrimaryAction } from "@/hooks/use-primary-action";
 import { useGlossaryRun } from "@/stores/glossary-store";
+import { projectKey } from "@/features/project/use-project";
 import { defaultAddSelection, episodes } from "./episodes";
 import { EpisodeChecklist } from "./episode-checklist";
 import { TidyOption } from "./glossary-build-options";
@@ -35,6 +37,22 @@ export function AddEpisodesPanel({
   const [tidy, setTidy] = useState(true);
   const scanned = new Set(meta.scanned_files);
   const canRun = selected.length > 0 && busy === null;
+
+  // A file just copied into the folder shows up without a Rescan: read the
+  // folder again on open, and tick what that adds the way the panel would have.
+  const qc = useQueryClient();
+  useEffect(() => {
+    void qc.invalidateQueries({ queryKey: projectKey(view.folder) });
+  }, [qc, view.folder]);
+  const known = useRef(new Set(view.files.map((f) => f.name)));
+  useEffect(() => {
+    const added = view.files.filter((f) => !known.current.has(f.name));
+    if (added.length === 0) return;
+    for (const f of added) known.current.add(f.name);
+    if (preset) return;
+    const tick = defaultAddSelection(added, meta.scanned_files).selected;
+    if (tick.length > 0) setSelected((sel) => [...sel, ...tick.filter((n) => !sel.includes(n))]);
+  }, [view.files, preset, meta.scanned_files]);
 
   const run = () => {
     if (!canRun) return;

@@ -12,6 +12,7 @@ export function EpisodesFooter({
   blocked,
   estimate,
   addToGlossary,
+  note = null,
   logs,
   logsOpen,
   onToggleLogs,
@@ -26,6 +27,8 @@ export function EpisodesFooter({
   blocked: Blocked;
   estimate: string | null;
   addToGlossary: { label: string; onClick: () => void } | null;
+  /** A quiet word about the run, e.g. that it goes without the glossary. */
+  note?: string | null;
   logs: LogLine[];
   logsOpen: boolean;
   onToggleLogs: () => void;
@@ -46,6 +49,7 @@ export function EpisodesFooter({
         )}
 
         {running ? null : <FooterHint blocked={blocked} estimate={estimate} />}
+        {note && !running ? <span className="text-[11.5px] text-muted-foreground">{note}</span> : null}
 
         <span className="flex-1" />
 

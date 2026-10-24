@@ -67,7 +67,10 @@ function Episodes({ folder }: { folder: string }) {
   });
   const { data: stored } = useFolderResults(folder);
   const hasGlossary = !!view?.supports_glossary && view.glossary_terms != null;
-  const { data: glossary } = useGlossaryLoad(folder, hasGlossary);
+  // Read whenever the folder can have one: a glossary.json that can't be read
+  // counts no terms, and the page says so instead of "No glossary yet".
+  const { data: glossary } = useGlossaryLoad(folder, !!view?.supports_glossary);
+  const glossaryBroken = !!view?.supports_glossary && glossary?.status === "unreadable";
 
   const translationLabel = useAppStore((s) => s.translationLabel);
   const hasUsableConnection = useAppStore((s) => s.hasUsableConnection);
@@ -120,6 +123,7 @@ function Episodes({ folder }: { folder: string }) {
           file,
           live: ours ? run.files[file.name] : undefined,
           running: runningHere,
+          external: run.external,
           record: stored?.episodes[file.name],
           throttle: run.throttle,
           now,
@@ -127,7 +131,7 @@ function Episodes({ folder }: { folder: string }) {
       );
     }
     return (name: string) => map.get(name)!;
-  }, [view, ours, runningHere, run.files, run.throttle, stored, now]);
+  }, [view, ours, runningHere, run.external, run.files, run.throttle, stored, now]);
 
   const selected = view ? existingSelection(view.prefs.selected_files, view.files) : [];
   const sameLanguage = !!view && view.prefs.source_lang === view.prefs.target_lang;
@@ -170,9 +174,13 @@ function Episodes({ folder }: { folder: string }) {
     if (langsChanged) refresh();
   };
 
-  const startRun = (files: string[], resume = false) => {
+  // Every start resumes: the engine carries on only episodes whose stored
+  // result is a stop with the same source (and settings); the rest start
+  // fresh. So a stopped episode's kept batches are never thrown away.
+  const startRun = (files: string[]) => {
     if (!view || files.length === 0) return;
     const { prefs } = view;
+    const resume = true;
     const store = useTranslationRun.getState();
     store.start(files, folder, resume);
     // Running a folder keeps its settings (and it's no longer a first visit).
@@ -251,15 +259,13 @@ function Episodes({ folder }: { folder: string }) {
         <FolderSettings
           view={view}
           languages={languages}
+          glossaryBroken={glossaryBroken}
           locked={runningHere}
           onChange={(next) => void persist(next)}
         />
 
+        {/* The presets come first, so they stay put while the count changes length. */}
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12.5px]">
-          <span className="font-medium text-foreground tabular-nums">
-            {selectionLine(selected, view.files)}
-          </span>
-          <span className="text-muted-foreground/50">·</span>
           <span className="text-muted-foreground">Select:</span>
           {PRESETS.map((p) => (
             <button
@@ -271,13 +277,17 @@ function Episodes({ folder }: { folder: string }) {
               {p.label}
             </button>
           ))}
+          <span className="text-muted-foreground/50">·</span>
+          <span className="font-medium text-foreground tabular-nums">
+            {selectionLine(selected, view.files)}
+          </span>
         </div>
 
         <RunBanner
           state={banner}
           busy={run.running || glossaryBusy}
-          onResume={(files) => startRun(files, true)}
-          onRetry={(files, resume) => startRun(files, resume)}
+          onResume={(files) => startRun(files)}
+          onRetry={(files) => startRun(files)}
         />
 
         <EpisodeTable
@@ -299,6 +309,7 @@ function Episodes({ folder }: { folder: string }) {
         blocked={blocked}
         estimate={estimateLine(lines, translationLabel, view.glossary_terms)}
         addToGlossary={addToGlossary}
+        note={glossaryBroken ? "The glossary can't be read, so this run won't use it." : null}
         logs={ours ? run.logs : []}
         logsOpen={logsOpen}
         onToggleLogs={() => setLogsOpen((o) => !o)}

@@ -12,6 +12,7 @@ import { cn, plural } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { useTranslationRun, type FileRow } from "@/stores/translation-store";
+import { tallyRun } from "@/features/episodes/run-summary";
 
 const WORLD_LABEL: Record<WorldType, string> = {
   xianxia: "Xianxia",
@@ -52,12 +53,14 @@ export function glossaryLabel(op: string, done: number, total: number): string {
 }
 
 /** The last run's outcome, by episode: finished clean, finished with something to look at,
- *  or failed. */
-export function runTally(results: readonly FileResult[]) {
+ *  not finished (stopped, or never started), or failed. Only real failures are failed. */
+export function runTally(files: Record<string, FileRow>, results: readonly FileResult[]) {
+  const t = tallyRun(files, [...results]);
   return {
-    done: results.filter((r) => r.success && !r.has_warnings).length,
-    needsLook: results.filter((r) => r.success && r.has_warnings).length,
-    failed: results.filter((r) => !r.success).length,
+    done: t.done.length,
+    needsLook: t.look.length,
+    notFinished: t.unfinished.length,
+    failed: t.failed.length,
   };
 }
 
@@ -130,7 +133,7 @@ export function StatusBar() {
       ? { to: "/glossary", label: glossaryLabel(gBusy, gDone, gTotal) }
       : null;
   // The last run's result stays until the next run — for the folder it belongs to.
-  const tally = !translating && results && runFolder === workdir ? runTally(results) : null;
+  const tally = !translating && results && runFolder === workdir ? runTally(files, results) : null;
 
   const go = (to: string) => void navigate({ to: to as never });
   const folder = workdir
@@ -174,7 +177,7 @@ export function StatusBar() {
           />
           <span className="truncate">{live.label}</span>
         </Segment>
-      ) : tally && tally.done + tally.needsLook + tally.failed > 0 ? (
+      ) : tally && tally.done + tally.needsLook + tally.notFinished + tally.failed > 0 ? (
         <Segment onClick={() => go("/episodes")} title="The last run's episodes" className="border-border">
           {tally.done > 0 ? (
             <span className="whitespace-nowrap text-[color:var(--color-jade)]">✓ {tally.done} done</span>
@@ -185,10 +188,18 @@ export function StatusBar() {
               {tally.needsLook} {tally.needsLook === 1 ? "needs" : "need"} a look
             </span>
           ) : null}
+          {tally.notFinished > 0 ? (
+            <span className="whitespace-nowrap text-foreground/80">
+              {tally.done + tally.needsLook > 0 ? <span className="text-muted-foreground">· </span> : null}■{" "}
+              {tally.notFinished} not finished
+            </span>
+          ) : null}
           {tally.failed > 0 ? (
             <span className="whitespace-nowrap text-[color:var(--color-coral)]">
-              {tally.done + tally.needsLook > 0 ? <span className="text-muted-foreground">· </span> : null}✗{" "}
-              {tally.failed} failed
+              {tally.done + tally.needsLook + tally.notFinished > 0 ? (
+                <span className="text-muted-foreground">· </span>
+              ) : null}
+              ✗ {tally.failed} failed
             </span>
           ) : null}
         </Segment>

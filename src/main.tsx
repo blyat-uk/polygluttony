@@ -43,7 +43,8 @@ ReactDOM.createRoot(rootElement).render(
       <QueryClientProvider client={queryClient}>
         <TooltipProvider>
           <RouterProvider router={router} />
-          <Toaster richColors position="bottom-right" />
+          {/* Expanded: a later toast (Retranslate N lines) never hides an Undo. */}
+          <Toaster richColors position="bottom-right" expand />
         </TooltipProvider>
       </QueryClientProvider>
     </ThemeProvider>

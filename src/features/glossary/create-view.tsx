@@ -26,6 +26,10 @@ export function CreateView({ view }: { view: ProjectView }) {
   const busy = useGlossaryRun((s) => s.busy);
   const summary = useGlossaryRun((s) => s.summary);
   const error = useGlossaryRun((s) => s.error);
+  // The last build here ran to the end and found nothing.
+  const emptyBuild = useGlossaryRun(
+    (s) => s.folder === view.folder && s.summary !== null && s.summary.terms_final === 0,
+  );
   const openReview = useGlossaryRun((s) => s.openReview);
   const hasModel = useAppStore((s) => s.hasUsableConnection);
   const searchModel = useSearchModel();
@@ -89,6 +93,12 @@ export function CreateView({ view }: { view: ProjectView }) {
         {summary?.cancelled ? (
           <p className="text-sm text-[color:var(--color-alert)]">
             Stopped. {plural(summary.terms_final, "term")} kept.
+          </p>
+        ) : null}
+        {summary && emptyBuild && !summary.cancelled && summary.errors.length === 0 && !error ? (
+          <p className="text-sm text-[color:var(--color-alert)]">
+            No names or terms were found in these episodes. Check the source language on
+            Episodes, or pick other episodes.
           </p>
         ) : null}
         {summary && summary.errors.length > 0 ? (

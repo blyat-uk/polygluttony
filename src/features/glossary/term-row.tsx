@@ -41,7 +41,8 @@ export type EditField = "source" | "target";
 export interface RowActions {
   onSelect: (key: string, on: boolean) => void;
   onStartEdit: (key: string, field: EditField) => void;
-  onCommitEdit: (row: TermRow, field: EditField, value: string, viaEnter: boolean) => void;
+  /** False when the edit was refused (the editor stays open with the text). */
+  onCommitEdit: (row: TermRow, field: EditField, value: string, viaEnter: boolean) => boolean;
   onCancelEdit: () => void;
   onMove: (row: TermRow, to: Category) => void;
   onDelete: (row: TermRow) => void;
@@ -54,6 +55,7 @@ export const TermRowView = memo(function TermRowView({
   row,
   selected,
   editing,
+  editError = null,
   flash,
   disabled,
   actions,
@@ -61,6 +63,8 @@ export const TermRowView = memo(function TermRowView({
   row: TermRow;
   selected: boolean;
   editing: EditField | null;
+  /** Why the last try at saving the open edit was refused. */
+  editError?: string | null;
   flash: boolean;
   disabled: boolean;
   actions: RowActions;
@@ -87,6 +91,7 @@ export const TermRowView = memo(function TermRowView({
       <EditableCell
         value={row.source}
         editing={editing === "source"}
+        error={editing === "source" ? editError : null}
         disabled={disabled}
         label={`Edit ${row.source}`}
         className="text-[13.5px] text-[color:var(--color-ink-emphasis)]"
@@ -98,6 +103,7 @@ export const TermRowView = memo(function TermRowView({
       <EditableCell
         value={row.target}
         editing={editing === "target"}
+        error={editing === "target" ? editError : null}
         disabled={disabled}
         label={`Edit the translation of ${row.source}`}
         className="text-[13px] text-foreground"
@@ -124,10 +130,12 @@ export function NewTag() {
 }
 
 /** A cell that edits on a single click. Enter saves (and the table moves to the
- *  next row), Esc cancels, leaving the field saves. */
+ *  next row), Esc cancels, leaving the field saves. A refused edit keeps the
+ *  field open with what was typed, and says why under it. */
 function EditableCell({
   value,
   editing,
+  error,
   disabled,
   label,
   className,
@@ -138,16 +146,17 @@ function EditableCell({
 }: {
   value: string;
   editing: boolean;
+  error: string | null;
   disabled: boolean;
   label: string;
   className?: string;
   after?: ReactNode;
   onStart: () => void;
-  onCommit: (value: string, viaEnter: boolean) => void;
+  onCommit: (value: string, viaEnter: boolean) => boolean;
   onCancel: () => void;
 }) {
   if (editing) {
-    return <InlineInput initial={value} onCommit={onCommit} onCancel={onCancel} />;
+    return <InlineInput initial={value} error={error} onCommit={onCommit} onCancel={onCancel} />;
   }
   return (
     <button
@@ -171,38 +180,52 @@ function EditableCell({
 
 function InlineInput({
   initial,
+  error,
   onCommit,
   onCancel,
 }: {
   initial: string;
-  onCommit: (value: string, viaEnter: boolean) => void;
+  error: string | null;
+  onCommit: (value: string, viaEnter: boolean) => boolean;
   onCancel: () => void;
 }) {
   // Enter/Esc unmount the input, which fires blur: `done` keeps the blur from
-  // committing a second time (or bringing back a cancelled edit).
+  // committing a second time (or bringing back a cancelled edit). A refused
+  // Enter leaves the input open, so it isn't done.
   const done = useRef(false);
   return (
-    <Input
-      autoFocus
-      defaultValue={initial}
-      onFocus={(e) => e.currentTarget.select()}
-      className="h-8 min-w-0 rounded-lg px-2 text-[13px] md:text-[13px]"
-      onKeyDown={(e) => {
-        if (e.key === "Enter") {
-          e.preventDefault();
-          done.current = true;
-          onCommit(e.currentTarget.value, true);
-        } else if (e.key === "Escape") {
-          // Ours: the side panel must not close on this Esc.
-          e.preventDefault();
-          done.current = true;
-          onCancel();
-        }
-      }}
-      onBlur={(e) => {
-        if (!done.current) onCommit(e.currentTarget.value, false);
-      }}
-    />
+    <div className="relative min-w-0">
+      <Input
+        autoFocus
+        defaultValue={initial}
+        aria-invalid={error ? true : undefined}
+        onFocus={(e) => e.currentTarget.select()}
+        className="h-8 min-w-0 rounded-lg px-2 text-[13px] md:text-[13px]"
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            done.current = true;
+            if (!onCommit(e.currentTarget.value, true)) done.current = false;
+          } else if (e.key === "Escape") {
+            // Ours: the side panel must not close on this Esc.
+            e.preventDefault();
+            done.current = true;
+            onCancel();
+          }
+        }}
+        onBlur={(e) => {
+          if (!done.current) onCommit(e.currentTarget.value, false);
+        }}
+      />
+      {error ? (
+        <p
+          role="alert"
+          className="absolute top-full left-0 z-10 mt-1 w-max max-w-[300px] rounded-md border border-[color:var(--color-danger)]/40 bg-[color:var(--popover)] px-2 py-1 text-[11.5px] text-[color:var(--color-danger)] shadow-[0_6px_18px_-8px_rgba(0,0,0,.8)]"
+        >
+          {error}
+        </p>
+      ) : null}
+    </div>
   );
 }
 

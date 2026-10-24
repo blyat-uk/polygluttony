@@ -10,16 +10,21 @@ export interface RunTally {
   failed: string[];
   /** Cut short or never started — what Resume carries on with. */
   unfinished: string[];
+  /** Lines the finished episodes left untranslated. */
+  missingLines: number;
 }
 
 /** Sort a run's files by how they ended. The results say which succeeded; the
  *  live rows say which failed, and everything else didn't finish. */
 export function tallyRun(files: Record<string, FileRow>, results: FileResult[] | null): RunTally {
-  const tally: RunTally = { done: [], look: [], failed: [], unfinished: [] };
+  const tally: RunTally = { done: [], look: [], failed: [], unfinished: [], missingLines: 0 };
   const byFile = new Map((results ?? []).map((r) => [r.file, r]));
   for (const [name, row] of Object.entries(files)) {
     const r = byFile.get(name);
-    if (r?.success) (r.has_warnings ? tally.look : tally.done).push(name);
+    if (r?.success) {
+      (r.has_warnings ? tally.look : tally.done).push(name);
+      tally.missingLines += Math.max(0, r.total_lines - r.translated_lines);
+    }
     else if (row.state === "done") tally.done.push(name);
     else if (row.state === "warning") tally.look.push(name);
     else if (row.state === "failed") tally.failed.push(name);
@@ -32,7 +37,8 @@ const episodes = (n: number) => `${n} ${n === 1 ? "episode" : "episodes"}`;
 const wasnt = (n: number) => (n === 1 ? "wasn't" : "weren't");
 const needs = (n: number) => (n === 1 ? "needs" : "need");
 
-/** "Translated 4 episodes — 3 done, 1 needs a look." (", 2 failed" when some failed). */
+/** "Translated 4 episodes — 3 done, 1 needs a look." (", 2 failed" when some failed,
+ *  " · 175 lines weren't translated" when lines are missing). */
 export function finishedLine(t: RunTally): string {
   const translated = t.done.length + t.look.length;
   const failed = t.failed.length;
@@ -45,7 +51,11 @@ export function finishedLine(t: RunTally): string {
   if (t.done.length > 0) parts.push(`${t.done.length} done`);
   if (t.look.length > 0) parts.push(`${t.look.length} ${needs(t.look.length)} a look`);
   if (failed > 0) parts.push(`${failed} failed`);
-  return `Translated ${episodes(translated)} — ${parts.join(", ")}.`;
+  const missing =
+    t.missingLines > 0
+      ? ` · ${t.missingLines.toLocaleString()} ${t.missingLines === 1 ? "line" : "lines"} ${wasnt(t.missingLines)} translated`
+      : "";
+  return `Translated ${episodes(translated)} — ${parts.join(", ")}${missing}.`;
 }
 
 /** "Stopped. 3 episodes weren't finished." */

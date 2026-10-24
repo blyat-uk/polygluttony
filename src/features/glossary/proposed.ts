@@ -183,6 +183,25 @@ export function diffOfChanges(changes: ProposedChange[]): GlossaryDiff {
 }
 
 /**
+ * Whether a change still applies to the glossary as it is now. `at` is the
+ * category that holds the change's source now (null: none does). A change to
+ * a term that's gone (deleted, or renamed to another source) is skipped, so
+ * applying it can't bring the term back; only `added` creates a term.
+ */
+export function stillApplies(ch: ProposedChange, at: Category | null): boolean {
+  switch (ch.kind) {
+    case "changed":
+      return at !== null && ch.new !== null;
+    case "removed":
+      return at !== null;
+    case "moved":
+      return at !== null && (ch.new ?? ch.old) !== null;
+    case "added":
+      return (ch.new ?? ch.old) !== null;
+  }
+}
+
+/**
  * Apply only the ticked changes to the glossary as it is now (the user may
  * have edited it while the run was going). Applied terms become yours and lose
  * their NEW tag; `meta.last_change` records what was applied.
@@ -202,13 +221,13 @@ export function applyProposed(
   for (const ch of changes) {
     if (!ticked.has(ch.id)) continue;
     const at = categoryOf(doc(), ch.source);
+    if (!stillApplies(ch, at)) continue;
     switch (ch.kind) {
       case "changed": {
-        if (ch.new === null) continue;
+        if (!at || ch.new === null) continue;
         // Update the term where it lives now; it may have been moved meanwhile.
-        const cat = at ?? ch.category;
-        putTerm(terms, cat, ch.source, ch.new);
-        markYours(meta, cat, ch.source);
+        putTerm(terms, at, ch.source, ch.new);
+        markYours(meta, at, ch.source);
         break;
       }
       case "removed":

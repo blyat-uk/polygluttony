@@ -8,14 +8,22 @@ import { AtmosphereBackdrop } from "@/components/atmosphere-backdrop"
 import { NAVIGATE_EVENT } from "@/components/ui/error-toast"
 import { usePickFolder } from "@/features/welcome/use-pick-folder"
 import { runPrimaryAction } from "@/hooks/use-primary-action"
+import { toast } from "sonner"
 import {
+  GLOSSARY_CHANGED_EVENT,
   GLOSSARY_FOCUS_TERM_EVENT,
   RESULTS_CHANGED_EVENT,
+  ipc,
   onBackendEvent,
+  type GlossaryChanged,
   type GlossaryFocusTerm,
 } from "@/lib/ipc"
+import { folderTitle } from "@/lib/folder-title"
 import { queryClient } from "@/lib/query-client"
 import { folderResultsKey } from "@/features/episodes/queries"
+import { glossaryKey } from "@/features/glossary/keys"
+import { projectKey } from "@/features/project/use-project"
+import { useAppStore } from "@/stores/app-store"
 import { useTranslationRun } from "@/stores/translation-store"
 import { useGlossaryRun } from "@/stores/glossary-store"
 import type { RunEvent } from "@/types/generated/RunEvent"
@@ -96,10 +104,12 @@ export function AppLayout({ children }: { children: ReactNode }) {
   }, [applyEvent])
 
   // A review edit in an episode window (or a run) stored a result: the
-  // Episodes list refetches that folder's results.
+  // Episodes list refetches that folder's results, and the folder view (which
+  // output files exist), so Mark done shows Done at once.
   useEffect(() => {
     const un = onBackendEvent<ResultsChanged>(RESULTS_CHANGED_EVENT, (e) => {
       void queryClient.invalidateQueries({ queryKey: folderResultsKey(e.payload.folder) })
+      void queryClient.invalidateQueries({ queryKey: projectKey(e.payload.folder) })
     })
     return () => {
       un.then((f) => f())
@@ -115,16 +125,46 @@ export function AppLayout({ children }: { children: ReactNode }) {
     }
   }, [applyGlossaryEvent])
 
+  // An episode window's "Add to glossary" saved the glossary: reload it, even
+  // right after a save of our own, so a later edit here can't save over the new term.
+  useEffect(() => {
+    const un = onBackendEvent<GlossaryChanged>(GLOSSARY_CHANGED_EVENT, (e) => {
+      void queryClient.invalidateQueries({ queryKey: glossaryKey(e.payload.folder) })
+    })
+    return () => {
+      un.then((f) => f())
+    }
+  }, [])
+
   // "Fix in glossary" in an episode window: show that term on the Glossary page, up front.
+  // A term from another folder than the open one only gets a note.
   useEffect(() => {
     const un = onBackendEvent<GlossaryFocusTerm>(GLOSSARY_FOCUS_TERM_EVENT, (e) => {
-      useGlossaryRun.getState().requestFocusTerm(e.payload.folder, e.payload.source)
-      void navigate({ to: "/glossary" })
+      const { folder: termFolder, source } = e.payload
       const main = getCurrentWindow()
       void main
         .unminimize()
         .then(() => main.setFocus())
         .catch(() => undefined)
+      if (useAppStore.getState().workdir !== termFolder) {
+        useGlossaryRun.getState().clearFocusTerm()
+        toast.info(`That term is in ${folderTitle(termFolder)}. Open that folder to see it.`)
+        return
+      }
+      // The term may have just been added in that window: reload the glossary
+      // before showing it, so the page finds the term.
+      void queryClient
+        .fetchQuery({
+          queryKey: glossaryKey(termFolder),
+          queryFn: () => ipc.loadGlossary(termFolder),
+          staleTime: 0,
+        })
+        .catch(() => undefined)
+        .then(() => {
+          if (useAppStore.getState().workdir !== termFolder) return
+          useGlossaryRun.getState().requestFocusTerm(termFolder, source)
+          void navigate({ to: "/glossary" })
+        })
     })
     return () => {
       un.then((f) => f())
@@ -153,16 +193,28 @@ export function AppLayout({ children }: { children: ReactNode }) {
     }
   }, [openPath])
 
-  // App-wide shortcuts.
+  // Ctrl/Cmd+Enter runs the page's main action. In the capture phase, so a
+  // focused control that handles Enter itself (a checkbox) can't swallow it;
+  // when an action ran, nothing else acts on the same key press.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (dialogOpen()) return
+      if (shortcutFor(e, isTyping(e.target))?.kind !== "primary") return
+      if (runPrimaryAction()) {
+        e.preventDefault()
+        e.stopPropagation()
+      }
+    }
+    window.addEventListener("keydown", onKey, true)
+    return () => window.removeEventListener("keydown", onKey, true)
+  }, [])
+
+  // The other app-wide shortcuts.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || dialogOpen()) return
       const shortcut = shortcutFor(e, isTyping(e.target))
-      if (!shortcut) return
-      if (shortcut.kind === "primary") {
-        if (runPrimaryAction()) e.preventDefault()
-        return
-      }
+      if (!shortcut || shortcut.kind === "primary") return
       e.preventDefault()
       if (shortcut.kind === "open") void pick()
       else void navigate({ to: shortcut.to as never })

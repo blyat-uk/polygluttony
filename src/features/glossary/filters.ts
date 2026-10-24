@@ -9,7 +9,8 @@ export const SHOW_FILTERS: ShowFilter[] = ["all", "new", "changed", "yours"];
 
 export const SHOW_LABEL: Record<ShowFilter, string> = {
   all: "All terms",
-  new: "New in last scan",
+  // NEW marks add up across scans until reviewed, so not just the last scan's.
+  new: "New, not reviewed yet",
   changed: "Changed by Tidy up or Look up",
   yours: "Edited by you",
 };

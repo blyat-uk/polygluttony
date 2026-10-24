@@ -241,6 +241,13 @@ export interface GlossaryFocusTerm {
   source: string;
 }
 
+/** Sent by an episode window after it saved the glossary ("Add to glossary"); the
+ *  main window reloads that folder's glossary. Payload `GlossaryChanged`. */
+export const GLOSSARY_CHANGED_EVENT = "glossary://changed";
+export interface GlossaryChanged {
+  folder: string;
+}
+
 /** Stored results changed (a run finished an episode, or a review edit landed);
  *  payload `ResultsChanged`. */
 export const RESULTS_CHANGED_EVENT = "results://changed";

@@ -89,6 +89,7 @@ export function WorkspaceHeader({
   folder,
   count,
   subtitle,
+  subtitleHint,
   showNext,
   searchModel,
   canRunModel,
@@ -98,6 +99,8 @@ export function WorkspaceHeader({
   folder: string;
   count: number;
   subtitle: string;
+  /** Shown on hover over the subtitle, e.g. "Built as Modern". */
+  subtitleHint?: string;
   /** The quiet "Next: Translate episodes →" after the first build. */
   showNext: boolean;
   searchModel: string | null;
@@ -115,7 +118,7 @@ export function WorkspaceHeader({
           <span>Glossary · {plural(count, "term")}</span>
           <SaveMark folder={folder} />
         </h1>
-        <p className="truncate text-[12.5px] text-muted-foreground">
+        <p className="truncate text-[12.5px] text-muted-foreground" title={subtitleHint}>
           {subtitle}
           {showNext ? (
             <>

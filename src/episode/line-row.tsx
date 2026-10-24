@@ -241,6 +241,9 @@ function FlagPanel({ line, flag }: { line: EpisodeLine; flag: LineFlag }) {
   const untranslated = flag.untranslated || line.translation === null;
   const off = !review || !review.enabled || review.busy;
   const editing = review?.editingId === line.id;
+  const nameTerms = [
+    ...new Set(issues.filter((i) => i.issue_type === "name" && i.term).map((i) => i.term as string)),
+  ];
 
   const actions = review ? (
     <>
@@ -261,9 +264,18 @@ function FlagPanel({ line, flag }: { line: EpisodeLine; flag: LineFlag }) {
               Looks fine
             </Act>
           ) : null}
-          <Act disabled={off} keepSelection onClick={() => review.fixInGlossary(issueTerm(flag))}>
-            Fix in glossary
-          </Act>
+          {nameTerms.length > 1 ? (
+            // One button per name the line gets wrong.
+            nameTerms.map((term) => (
+              <Act key={term} disabled={off} keepSelection onClick={() => review.fixInGlossary(term)}>
+                Fix {term} in glossary
+              </Act>
+            ))
+          ) : (
+            <Act disabled={off} keepSelection onClick={() => review.fixInGlossary(issueTerm(flag))}>
+              Fix in glossary
+            </Act>
+          )}
         </>
       )}
     </>

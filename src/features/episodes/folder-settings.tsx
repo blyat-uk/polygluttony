@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "@tanstack/react-router";
 import { CaretDown, CaretUp } from "@phosphor-icons/react";
 import type { FolderPrefs } from "@/types/generated/FolderPrefs";
 import type { Language } from "@/types/generated/Language";
@@ -8,10 +9,44 @@ import type { WorldType } from "@/types/generated/WorldType";
 import { SetupField } from "@/components/setup-field";
 import { HelpText } from "@/components/help-text";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { TONES, WORLDS, settingsSummary, titleCase, toneAfterWorldChange } from "./folder-labels";
 
-const SELECT_CLS =
-  "h-9 w-full rounded-md border border-input bg-[color:var(--card)] px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50";
+/** The app's own select: warm dark, pill-shaped, like its other inputs. */
+function PillSelect({
+  id,
+  value,
+  disabled,
+  options,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  disabled: boolean;
+  options: { value: string; label: string }[];
+  onChange: (v: string) => void;
+}) {
+  return (
+    <Select value={value} disabled={disabled} onValueChange={onChange}>
+      <SelectTrigger id={id} className="w-full">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {options.map((o) => (
+          <SelectItem key={o.value} value={o.value}>
+            {o.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
 
 /**
  * The folder's settings as one summary line, with Edit ▾ opening the language,
@@ -21,11 +56,14 @@ const SELECT_CLS =
 export function FolderSettings({
   view,
   languages,
+  glossaryBroken = false,
   locked,
   onChange,
 }: {
   view: ProjectView;
   languages: Language[] | undefined;
+  /** glossary.json is there but can't be read. */
+  glossaryBroken?: boolean;
   /** A run is going in this folder; settings wait until it's done. */
   locked: boolean;
   onChange: (next: FolderPrefs) => void;
@@ -39,7 +77,19 @@ export function FolderSettings({
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-[12.5px]">
-        <span className="text-muted-foreground">{settingsSummary(view, languages)}</span>
+        <span className="text-muted-foreground">
+          {settingsSummary(view, languages, glossaryBroken)}
+          {glossaryBroken ? (
+            <>
+              {" · "}
+              <span className="text-[color:var(--color-alert)]">Glossary has a mistake</span>
+              {" · "}
+              <Link to="/glossary" className="text-primary underline-offset-2 hover:underline">
+                Fix it
+              </Link>
+            </>
+          ) : null}
+        </span>
         <Button
           variant="ghost"
           size="xs"
@@ -96,27 +146,23 @@ export function FolderSettings({
                   </HelpText>
                 }
               >
-                <select
+                <PillSelect
                   id="ep-world"
-                  className={SELECT_CLS}
                   value={world}
                   disabled={locked}
-                  onChange={(e) => {
-                    const next = e.target.value as WorldType;
+                  options={WORLDS.map((w) => ({
+                    value: w,
+                    label: `${titleCase(w)}${!prefs.world_override && w === view.detected_world ? " (detected)" : ""}`,
+                  }))}
+                  onChange={(v) => {
+                    const next = v as WorldType;
                     onChange({
                       ...prefs,
                       world_override: next,
                       tone: toneAfterWorldChange(prefs.tone, world, next),
                     });
                   }}
-                >
-                  {WORLDS.map((w) => (
-                    <option key={w} value={w}>
-                      {titleCase(w)}
-                      {!prefs.world_override && w === view.detected_world ? " (detected)" : ""}
-                    </option>
-                  ))}
-                </select>
+                />
               </SetupField>
             ) : null}
             <SetupField
@@ -129,19 +175,13 @@ export function FolderSettings({
                 </HelpText>
               }
             >
-              <select
+              <PillSelect
                 id="ep-tone"
-                className={SELECT_CLS}
                 value={prefs.tone}
                 disabled={locked}
-                onChange={(e) => onChange({ ...prefs, tone: e.target.value as Tone })}
-              >
-                {TONES.map((t) => (
-                  <option key={t} value={t}>
-                    {titleCase(t)}
-                  </option>
-                ))}
-              </select>
+                options={TONES.map((t) => ({ value: t, label: titleCase(t) }))}
+                onChange={(v) => onChange({ ...prefs, tone: v as Tone })}
+              />
             </SetupField>
           </div>
           {locked ? (
@@ -169,19 +209,12 @@ function LangSelect({
   onChange: (v: string) => void;
 }) {
   return (
-    <select
+    <PillSelect
       id={id}
-      className={SELECT_CLS}
       value={value}
       disabled={disabled || !languages}
-      onChange={(e) => onChange(e.target.value)}
-    >
-      {(languages ?? []).map((l) => (
-        <option key={l.code} value={l.code}>
-          {l.name}
-        </option>
-      ))}
-      {!languages ? <option value={value}>{value}</option> : null}
-    </select>
+      options={languages ? languages.map((l) => ({ value: l.code, label: l.name })) : [{ value, label: value }]}
+      onChange={onChange}
+    />
   );
 }

@@ -39,6 +39,7 @@ import { episodes } from "./episodes";
 import {
   buildRows,
   CATEGORY_LABEL,
+  categoryOf,
   termKey,
   titleCase,
   type Category,
@@ -51,7 +52,7 @@ import { WorkspaceHeader } from "./workspace-header";
 import { TermToolbar } from "./term-toolbar";
 import { TermTable, type AddDraft, type Highlight } from "./term-table";
 import type { EditField } from "./term-row";
-import { BulkBar } from "./bulk-bar";
+import { BulkBar, useBulkBarLift } from "./bulk-bar";
 import { ReplaceDialog } from "./replace-dialog";
 import { RestoreDialog } from "./restore-dialog";
 import { RebuildDialog } from "./rebuild-dialog";
@@ -159,7 +160,8 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
         const lines = hits.reduce((n, h) => n + h.line_ids.length, 0);
         if (lines === 0) return;
         toast(`Retranslate ${plural(lines, "line")} that use ${source} in ${episodes(hits.length)}`, {
-          id: `term-lines:${source}`,
+          // One at a time: a newer offer replaces the last one.
+          id: "term-lines",
           duration: 12000,
           action: {
             label: "Retranslate",
@@ -205,14 +207,13 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
     return true;
   };
 
-  const commitEdit = (row: TermRow, field: EditField, value: string) => {
+  /** Null when the edit went in (or changed nothing); otherwise why it was
+   *  refused, shown under the field that stays open. */
+  const commitEdit = (row: TermRow, field: EditField, value: string): string | null => {
     const s = current();
     const r = field === "target" ? editTarget(s, refOf(row), value) : renameSource(s, refOf(row), value);
-    if (!r.ok) {
-      toast.error(r.error);
-      return;
-    }
-    if (r.state === s) return;
+    if (!r.ok) return r.error;
+    if (r.state === s) return null;
     const v = value.trim();
     if (field === "target") {
       commit(folder, r.state, { label: `Changed ${row.source}: ${row.target} → ${v}` });
@@ -220,6 +221,7 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
     } else {
       commit(folder, r.state, { label: `Renamed ${row.source} → ${v}` });
     }
+    return null;
   };
 
   const moveRows = (list: TermRow[], to: Category, bulk: boolean) => {
@@ -323,15 +325,18 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
   // Episode window → "Fix in glossary": show that term.
   const pendingFocus = useGlossaryRun((s) => s.pendingFocusTerm);
   useEffect(() => {
-    if (!pendingFocus || pendingFocus.folder !== folder) return;
+    if (!pendingFocus) return;
     useGlossaryRun.getState().clearFocusTerm();
+    if (pendingFocus.folder !== folder) return;
     const source = pendingFocus.source;
-    const row = rows.find((r) => r.source === source);
+    // The cache, not `rows`: the glossary was just reloaded (the term may have
+    // been added in that window) and this render can predate it.
+    const cat = categoryOf(current().doc, source);
     ui.setShow("all");
     ui.setCategory(null);
-    if (row) {
+    if (cat) {
       ui.setSearch(source);
-      flashRow(row.key, true);
+      flashRow(termKey(cat, source), true);
     } else {
       // Not in the glossary yet: start the add row with it.
       ui.setSearch("");
@@ -430,7 +435,24 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
 
   // ── render ────────────────────────────────────────────────────────────────
 
-  const world = state.doc.world_type || view.prefs.world_override || view.detected_world;
+  // "New, not reviewed yet" on: the bar offers to mark every shown NEW term.
+  const shownNew = show === "new" ? visible.filter((r) => r.isNew) : [];
+  const markAll =
+    shownNew.length > 0
+      ? {
+          count: shownNew.length,
+          onClick: () => reviewRows(shownNew),
+        }
+      : null;
+  const barShown = (selected.size > 0 || markAll !== null) && !panel;
+  const barLift = useBulkBarLift();
+
+  // The folder's world type, as Episodes shows it; the glossary's own only as a hint.
+  const world = view.prefs.world_override ?? view.detected_world;
+  const builtAs =
+    state.doc.world_type && state.doc.world_type.toLowerCase() !== world.toLowerCase()
+      ? `Built as ${titleCase(state.doc.world_type)}`
+      : undefined;
   const canLookup = !!searchModel;
 
   return (
@@ -439,6 +461,7 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
         folder={folder}
         count={state.doc.count}
         subtitle={`${folderTitle(folder)} · ${titleCase(world)}`}
+        subtitleHint={builtAs}
         showNext={showNext}
         searchModel={searchModel}
         canRunModel={hasModel}
@@ -484,7 +507,7 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
           onAdd={add}
           addSourceRef={addSourceRef}
           highlight={highlight}
-          bottomPad={selected.size > 0 && !panel ? 72 : 0}
+          bottomPad={barShown ? 72 + barLift : 0}
           actions={{
             onCommitEdit: commitEdit,
             onMove: (row, to) => moveRows([row], to, false),
@@ -511,10 +534,11 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
           }
         />
 
-        {selected.size > 0 && !panel ? (
+        {barShown ? (
           <BulkBar
             count={selectedRows.length}
             anyNew={selectedRows.some((r) => r.isNew)}
+            markAll={markAll}
             disabled={false}
             canTidy={hasModel && !busy}
             onMove={(to) => moveRows(selectedRows, to, true)}

@@ -55,9 +55,14 @@ function FolderGlossary({ folder }: { folder: string }) {
   const fileTick = useGlossaryRun((s) => s.fileTick);
   const reviewOpen = useGlossaryRun((s) => s.reviewOpen);
   const { data: view } = useProject(folder);
+  // Always reloaded when the page mounts: an episode window, a text editor or
+  // Restore may have changed the file while the page was away, and an edit
+  // made on a stale copy would save over that change.
   const { data: load, isPending } = useQuery({
     queryKey: glossaryKey(folder),
     queryFn: () => ipc.loadGlossary(folder),
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const state = useMemo<GlossaryState | null>(
     () => (load?.status === "ok" ? { doc: load.doc, meta: load.meta } : null),
@@ -67,6 +72,12 @@ function FolderGlossary({ folder }: { folder: string }) {
   const hasHistory = useGlossaryDoc(
     (s) => s.folder === folder && (s.undo.length > 0 || s.redo.length > 0),
   );
+
+  // Files copied into the folder since it was read show up here (Add new
+  // episodes) without a trip to Episodes → Rescan.
+  useEffect(() => {
+    void qc.invalidateQueries({ queryKey: projectKey(folder) });
+  }, [qc, folder]);
 
   // Workspace state (filters, open panel) belongs to one folder.
   useEffect(() => {
