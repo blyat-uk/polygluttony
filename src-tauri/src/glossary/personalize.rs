@@ -1,6 +1,7 @@
-//! Personalization pass (build step 8): one call on the web-capable
-//! personalization connection to align terms with established fan usage.
-//! Port of `glossary_builder.py:535-563`.
+//! Look up names online (internally "personalize"; build step 8 and the
+//! standalone Improve action): one call on the web-capable connection to
+//! align terms with established fan usage. Port of
+//! `glossary_builder.py:535-563`.
 
 use crate::glossary::model::Glossary;
 use crate::glossary::prompts;
@@ -8,7 +9,8 @@ use crate::llm::service::LlmService;
 use crate::llm::LlmRequest;
 use crate::translation::parse_response;
 
-/// `Err(reason)` ⇒ caller keeps the original glossary and records the reason.
+/// `Err(reason)` ⇒ caller keeps the original glossary and records the reason
+/// (plain words: it reaches the user as is).
 /// A response with zero usable terms is an error — accepting it would replace
 /// the whole glossary with nothing (latent Python hazard, guarded here).
 ///
@@ -27,12 +29,12 @@ pub async fn personalize_pass(
         system: prompts::personalize_prompt(template, world, context),
         user: prompts::personalize_user_prompt(glossary, context),
     };
-    let resp = svc.request(req).await.map_err(|e| format!("personalize request failed: {e}"))?;
+    let resp = svc.request(req).await.map_err(|e| format!("Look up names online failed: {e}"))?;
     let v = parse_response::extract_object(&resp.text)
-        .map_err(|e| format!("personalize response unparseable: {e}"))?;
+        .map_err(|e| format!("Look up names online gave an answer that couldn't be read ({e})."))?;
     let mut out = Glossary::from_terms_value(&v, &glossary.world_type);
     if out.is_empty() {
-        return Err("personalize response contained no terms — keeping original".into());
+        return Err("Look up names online answered with no terms, so nothing was changed.".into());
     }
     // Remove entries with empty/invalid translations so that merge_first_wins
     // below restores the original's valid value for those keys.

@@ -8,7 +8,6 @@ use crate::config::store as config_store;
 use crate::config::Step;
 use crate::error::{AppError, AppResult};
 use crate::glossary::build::BuildMode;
-use crate::glossary::diff::GlossaryDiff;
 use crate::glossary::history;
 use crate::glossary::io::{
     import_glossary_file, load_folder_glossary, save_folder_glossary, GlossaryBackupInfo,
@@ -18,11 +17,12 @@ use crate::glossary::meta::{
     GlossarySnapshot,
 };
 use crate::glossary::model::{Glossary, GlossaryDoc};
-use crate::glossary::normalize::{normalize_pass, NormalizeReview};
+use crate::glossary::normalize::NormalizeReview;
 use crate::glossary::reference::{self, ReferenceStatus, ReferenceSummary, ReferenceTerminology};
 use crate::glossary::run::{self, GlossaryOpKind, StartArgs};
 use crate::glossary::watch::{self, GlossaryWatchState};
 use crate::glossary::world_detector::WorldType;
+use crate::glossary::{improve, scope};
 
 /// O9 — the folder's glossary and its metadata; `missing` when there's no
 /// glossary.json, `unreadable` (with the line, when known) when it isn't valid.
@@ -117,32 +117,47 @@ pub async fn start_glossary_build(
     .await
 }
 
-/// Cancels the active glossary op (build / normalize / import).
+/// Cancels the active glossary op (build / Tidy up / Look up names online /
+/// import).
 #[tauri::command]
 pub async fn cancel_glossary_build(app: AppHandle) -> AppResult<()> {
     run::cancel(app).await
 }
 
-/// O12 — returns the review WITHOUT saving; the UI saves on accept via
-/// `save_glossary`. Claims the op slot (exclusive with build/translation).
+/// The glossary a Tidy up or Look up works on, with plain errors for "there
+/// isn't one" and "it's empty". `what` finishes "…so there's nothing to …".
+fn glossary_to_improve(dir: &Path, what: &str) -> AppResult<Glossary> {
+    let g = load_folder_glossary(dir).ok_or_else(|| AppError::Other(NO_GLOSSARY.into()))?;
+    if g.is_empty() {
+        return Err(AppError::Other(format!("The glossary is empty, so there's nothing to {what}.")));
+    }
+    Ok(g)
+}
+
+const NO_GLOSSARY: &str = "There's no glossary in this folder yet.";
+
+/// Shown when Look up names online has no model to run on.
+const NO_WEB_SEARCH: &str =
+    "No model that can search the web is set up. Turn on Look up names online on the Models page.";
+
+/// O12 — Tidy up, scoped (`scope: None` = all terms). Returns the review
+/// WITHOUT saving; the UI saves on accept via `save_glossary`. Claims the op
+/// slot (exclusive with builds, Look up and translation).
 ///
-/// Cancel semantics (for the UI task): a user cancel mid-normalize makes the
-/// in-flight category requests fail, so the originals are kept and this
-/// command still resolves Ok with a no-changes review — the UI must discard
-/// the resolved review after a user-cancel instead of presenting it.
+/// Cancel semantics: a user cancel resolves Ok with a no-changes review (the
+/// glossary as it is) — the UI must discard a review that resolves after the
+/// user stopped the op instead of presenting it.
 #[tauri::command]
 pub async fn normalize_glossary(
     app: AppHandle,
     folder: String,
     scope: Option<GlossaryScope>,
 ) -> AppResult<NormalizeReview> {
-    // CONTRACT STUB: scope (None = all) is ignored until the glossary engine lands.
-    let _ = scope;
     let dir = PathBuf::from(&folder);
-    let original = load_folder_glossary(&dir)
-        .ok_or_else(|| AppError::Other("no glossary to normalize".into()))?;
-    if original.is_empty() {
-        return Err(AppError::Other("glossary is empty".into()));
+    let original = glossary_to_improve(&dir, "tidy up")?;
+    let sub = scope::resolve(&original, scope.as_ref())?;
+    if sub.is_empty() {
+        return Err(AppError::Other("None of the chosen terms are in the glossary.".into()));
     }
     let cfg = config_store::load(&app)?;
     let conn = config_store::step_connection(&cfg, Step::Normalize)?;
@@ -155,15 +170,18 @@ pub async fn normalize_glossary(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     run::spawn_forwarder(app.clone(), rx);
     let svc = run::service_for(&conn, cancel.clone(), tx.clone());
-    let normalized = normalize_pass(&svc, &original, &tx, &templates).await;
-    Ok(NormalizeReview {
-        diff: GlossaryDiff::compute(Some(&original), &normalized),
-        normalized: GlossaryDoc::from(&normalized),
-    })
+    Ok(improve::tidy_up(&svc, &original, &sub, &templates, &tx, &cancel).await)
 }
 
 /// Look up names online on the glossary as it is — no subtitle files are
-/// read. Returns a review; nothing is saved. `scope: None` = all terms.
+/// read. Scoped like Tidy up (`scope: None` = all terms); `show_name` is what
+/// the model searches for. Returns a review; nothing is saved (the UI saves
+/// the show name in the meta). Runs on the same web-search model a build
+/// would use, claims the op slot (cancel with `cancel_glossary_build`), and
+/// sends a `personalizing` phase event when the request goes out.
+///
+/// Cancel semantics: as `normalize_glossary` — a user cancel resolves Ok with
+/// a no-changes review, which the UI discards.
 #[tauri::command]
 pub async fn lookup_glossary_names(
     app: AppHandle,
@@ -171,8 +189,32 @@ pub async fn lookup_glossary_names(
     show_name: String,
     scope: Option<GlossaryScope>,
 ) -> AppResult<NormalizeReview> {
-    let _ = (app, folder, show_name, scope);
-    Err(AppError::Other("not implemented yet".into()))
+    let dir = PathBuf::from(&folder);
+    let show_name = show_name.trim();
+    if show_name.is_empty() {
+        return Err(AppError::Other(
+            "Type the show's name first, so the lookup knows what to search for.".into(),
+        ));
+    }
+    let original = glossary_to_improve(&dir, "look up")?;
+    let sub = scope::resolve(&original, scope.as_ref())?;
+    if sub.is_empty() {
+        return Err(AppError::Other("None of the chosen terms are in the glossary.".into()));
+    }
+    let cfg = config_store::load(&app)?;
+    let conn =
+        config_store::resolve_web_search(&cfg).ok_or_else(|| AppError::Other(NO_WEB_SEARCH.into()))?;
+    let template = crate::prompts::resolve(
+        crate::prompts::PromptId::GlossaryPersonalize,
+        &crate::prompts::overrides_dir(&app)?,
+    )?;
+    let cancel = run::claim_slot(&app, GlossaryOpKind::LookUp).await?;
+    // Declared before svc/tx so it drops last (after their senders close).
+    let _guard = run::SlotGuard::new(app.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    run::spawn_forwarder(app.clone(), rx);
+    let svc = run::service_for(&conn, cancel.clone(), tx.clone());
+    improve::look_up(&svc, &original, &sub, show_name, &template, &tx, &cancel).await
 }
 
 /// The glossary's version history, newest first: up to ten snapshots, plus
@@ -198,7 +240,7 @@ pub async fn import_reference_files(
     paths: Vec<String>,
 ) -> AppResult<ReferenceSummary> {
     if paths.is_empty() {
-        return Err(AppError::Other("no files selected".into()));
+        return Err(AppError::Other("Pick at least one file first.".into()));
     }
     let dir = PathBuf::from(&folder);
     let cfg = config_store::load(&app)?;
@@ -274,14 +316,16 @@ pub async fn import_glossary(app: AppHandle, folder: String, src: String) -> App
 pub fn export_glossary(folder: String, dest: String) -> AppResult<()> {
     let src = PathBuf::from(folder).join("glossary.json");
     if !src.is_file() {
-        return Err(AppError::Other("no glossary.json to export".into()));
+        return Err(AppError::Other(NO_GLOSSARY.into()));
     }
     // fs::copy truncates dest before reading, so dest == src would zero the
     // glossary. canonicalize fails for a non-existent dest — fine: a
     // non-existent dest can't be src.
     if let (Ok(d), Ok(s)) = (Path::new(&dest).canonicalize(), src.canonicalize()) {
         if d == s {
-            return Err(AppError::Other("export destination is the glossary itself".into()));
+            return Err(AppError::Other(
+                "That's the glossary itself. Pick another place to export to.".into(),
+            ));
         }
     }
     std::fs::copy(src, dest)?;
@@ -294,7 +338,7 @@ pub fn open_glossary_editor(app: AppHandle, folder: String) -> AppResult<()> {
     use tauri_plugin_opener::OpenerExt;
     let path = PathBuf::from(folder).join("glossary.json");
     if !path.is_file() {
-        return Err(AppError::Other("no glossary.json yet".into()));
+        return Err(AppError::Other(NO_GLOSSARY.into()));
     }
     app.opener()
         .open_path(path.to_string_lossy().into_owned(), None::<String>)
@@ -315,7 +359,7 @@ pub fn unwatch_glossary(app: AppHandle) -> AppResult<()> {
 
 /// Label of the model that answers web searches ("Claude Sonnet 5.5") — the
 /// Web search step's, when it is on, usable and can search — else None.
-/// Powers the "Look up established names online" checkbox gating.
+/// Powers the Look up names online gating.
 #[tauri::command]
 pub fn web_search_status(app: AppHandle) -> AppResult<Option<String>> {
     Ok(config_store::web_search_label(&config_store::load(&app)?))
@@ -438,5 +482,17 @@ mod tests {
             .unwrap();
         assert!(history::list(dir.path()).is_empty());
         assert_eq!(load_folder_glossary(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn improve_errors_are_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = glossary_to_improve(dir.path(), "tidy up").unwrap_err().to_string();
+        assert_eq!(err, "There's no glossary in this folder yet.");
+        save_folder(dir.path(), doc(&[]), None, None).unwrap();
+        let err = glossary_to_improve(dir.path(), "look up").unwrap_err().to_string();
+        assert_eq!(err, "The glossary is empty, so there's nothing to look up.");
+        save_folder(dir.path(), doc(&[("林动", "Lin Dong")]), None, None).unwrap();
+        assert_eq!(glossary_to_improve(dir.path(), "tidy up").unwrap().count(), 1);
     }
 }

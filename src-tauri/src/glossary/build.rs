@@ -858,7 +858,7 @@ mod tests {
         let (_events, s) = run_and_collect(j, &svc, Some(&p_svc)).await;
         assert!(!s.personalized);
         assert_eq!(s.errors.len(), 1);
-        assert!(s.errors[0].contains("personalize"));
+        assert!(s.errors[0].starts_with("Look up names online"), "{}", s.errors[0]);
         assert_eq!(s.terms_final, 1); // glossary intact
     }
 

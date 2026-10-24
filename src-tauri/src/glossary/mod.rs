@@ -17,12 +17,15 @@
 //! - `build`       — O10 build orchestrator (`build_glossary`) + cross-file batch helper
 //! - `normalize`   — per-category normalize pass (`normalize_pass`, O12)
 //! - `personalize` — personalization pass (`personalize_pass`, build step 8)
+//! - `scope`       — scoped passes: cut a sub-glossary, overlay the answer, one category per source
+//! - `improve`     — Tidy up / Look up names online on the glossary as it is, returning a review
 //! - `run`         — run manager (single glossary-op slot, exclusivity with translation)
 //! - `watch`       — O15 glossary.json file watcher (`FileChanged` events)
 
 pub mod build;
 pub mod diff;
 pub mod history;
+pub mod improve;
 pub mod io;
 pub mod meta;
 pub mod model;
@@ -31,5 +34,6 @@ pub mod personalize;
 pub mod prompts;
 pub mod reference;
 pub mod run;
+pub mod scope;
 pub mod watch;
 pub mod world_detector;
