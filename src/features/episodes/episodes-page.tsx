@@ -120,6 +120,7 @@ function Episodes({ folder }: { folder: string }) {
           file,
           live: ours ? run.files[file.name] : undefined,
           running: runningHere,
+          external: run.external,
           record: stored?.episodes[file.name],
           throttle: run.throttle,
           now,
@@ -127,7 +128,7 @@ function Episodes({ folder }: { folder: string }) {
       );
     }
     return (name: string) => map.get(name)!;
-  }, [view, ours, runningHere, run.files, run.throttle, stored, now]);
+  }, [view, ours, runningHere, run.external, run.files, run.throttle, stored, now]);
 
   const selected = view ? existingSelection(view.prefs.selected_files, view.files) : [];
   const sameLanguage = !!view && view.prefs.source_lang === view.prefs.target_lang;

@@ -127,6 +127,9 @@ export interface StatusInputs {
   live: FileRow | undefined;
   /** That run is still going. */
   running: boolean;
+  /** That run was started elsewhere (an episode window's review, a glossary
+   *  term's retranslation): its row counts only while it runs. */
+  external?: boolean;
   /** The stored result of the episode's last run. */
   record: EpisodeRecord | undefined;
   throttle: Throttle | null;
@@ -144,9 +147,20 @@ export interface StatusInputs {
  *
  * A finished run's Done / Needs a look only adds detail (the issue count) when
  * the disk agrees, so a file fixed or renamed by hand afterwards reads right.
+ *
+ * A run started elsewhere retranslates a few lines of finished episodes: once
+ * it ends, the stored result and the disk speak again. A failure it hit shows
+ * as a note, never as "Failed" over a translated episode.
  */
-export function resolveStatus({ file, live, running, record, throttle, now }: StatusInputs): EpisodeStatus {
+export function resolveStatus(inputs: StatusInputs): EpisodeStatus {
+  const { file, live, running, external, record, throttle, now } = inputs;
   const disk = file.translation;
+
+  if (live && !running && external) {
+    const base = resolveStatus({ ...inputs, live: undefined, external: false });
+    if (live.state !== "failed" || !live.error || base.kind === "failed") return base;
+    return { ...base, detail: `Couldn’t retranslate: ${live.error}`, detailTone: "danger" };
+  }
 
   if (live && running) {
     if (live.state === "done") return done();
