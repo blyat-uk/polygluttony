@@ -82,11 +82,11 @@ fn find_model<'a>(models: &'a [Model], id: &str) -> Option<&'a Model> {
 /// The connection `step` runs on: its library model merged with the step's
 /// settings, ready to run. `NoActiveConnection` while nothing is set up; when
 /// the step's model has no key, a message that names the step the way the
-/// Connections page does, so the user knows which row to fix.
+/// Models page does, so the user knows which row to fix.
 pub fn step_connection(cfg: &AppConfig, step: Step) -> AppResult<Connection> {
     let steps = cfg.steps.as_ref().ok_or(AppError::NoActiveConnection)?;
     let Some(settings) = steps.get(step) else {
-        return Err(AppError::Other("Web search is off. Turn it on on the Connections page.".into()));
+        return Err(AppError::Other("Look up names online is off. Turn it on on the Models page.".into()));
     };
     // `normalize` keeps every step on a library model; a dangling id can only
     // come from a config that skipped it, and runs nothing.
@@ -1122,18 +1122,18 @@ mod tests {
         ]);
         put(&mut cfg, Step::Normalize, on("m2"));
         let err = step_connection(&cfg, Step::Normalize).unwrap_err().to_string();
-        assert_eq!(err, "Normalize uses Claude Opus 5.5, which needs an API key. Add it on the Connections page.");
+        assert_eq!(err, "Tidy up uses Claude Opus 5.5, which needs an API key. Add it on the Models page.");
         assert!(step_connection(&cfg, Step::Translate).is_ok(), "the other steps still run");
-        // Every step by its name on the Connections page.
+        // Every step by its name on the Models page.
         for s in Step::ALL {
             put(&mut cfg, s, on("m2"));
             let err = step_connection(&cfg, s).unwrap_err().to_string();
             assert_eq!(
                 err,
-                format!("{} uses Claude Opus 5.5, which needs an API key. Add it on the Connections page.", s.label())
+                format!("{} uses Claude Opus 5.5, which needs an API key. Add it on the Models page.", s.label())
             );
         }
-        assert!(step_connection(&cfg, Step::Extract).unwrap_err().to_string().starts_with("Extract names uses"));
+        assert!(step_connection(&cfg, Step::Extract).unwrap_err().to_string().starts_with("Find names uses"));
     }
 
     #[test]

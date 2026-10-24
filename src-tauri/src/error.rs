@@ -23,12 +23,12 @@ pub enum AppError {
     #[error("another operation is already running")]
     RunAlreadyActive,
 
-    #[error("no usable connection — configure one in Connections")]
+    #[error("Connect a model first, on the Models page.")]
     NoActiveConnection,
 
     /// A step's model can't make requests: it has no API key. Names the step
-    /// as the Connections page does, so the user knows which row to fix.
-    #[error("{step} uses {model}, which needs an API key. Add it on the Connections page.")]
+    /// as the Models page does, so the user knows which row to fix.
+    #[error("{step} uses {model}, which needs an API key. Add it on the Models page.")]
     StepNeedsKey { step: &'static str, model: String },
 
     #[error("no active translation run")]

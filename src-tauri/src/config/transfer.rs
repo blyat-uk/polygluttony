@@ -495,7 +495,7 @@ mod tests {
         let err = export_to(&path, &configured(), &dir).unwrap_err().to_string();
         assert_eq!(
             err,
-            "Your edited \"Drift check\" prompt can't be exported: prompt is empty. Fix it on the \
+            "Your edited \"Verify\" prompt can't be exported: prompt is empty. Fix it on the \
              Prompts page, then export again."
         );
         assert_eq!(names_in(root.path()), ["prompts"], "no export, no temp file");
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(error(read(zip_of(&[("config.json", &over)]))), NOT_AN_EXPORT);
         assert_eq!(
             error(read(zip_of(&[("config.json", &ok), ("prompts/verify.txt", &over)]))),
-            "The edited \"Drift check\" prompt in this export can't be used: it's larger than 1 MB."
+            "The edited \"Verify\" prompt in this export can't be used: it's larger than 1 MB."
         );
         let imported = read(zip_of(&[("config.json", &ok), ("prompts/verify.txt", &max)])).unwrap();
         assert_eq!(imported.prompts[0].1.len(), max.len(), "exactly 1 MB is fine");
@@ -629,7 +629,7 @@ mod tests {
         let ok = config_document(&default_config()).unwrap();
         assert_eq!(
             error(read(zip_of(&[("config.json", &ok), ("prompts/verify.txt", &[0xff, 0xfe, 0xfd])]))),
-            "The edited \"Drift check\" prompt in this export can't be used: it isn't UTF-8 text."
+            "The edited \"Verify\" prompt in this export can't be used: it isn't UTF-8 text."
         );
     }
 
@@ -653,7 +653,7 @@ mod tests {
         };
         assert_eq!(
             error(read(damaged(b"check the lines"))),
-            "The edited \"Drift check\" prompt in this export can't be used: it can't be read."
+            "The edited \"Verify\" prompt in this export can't be used: it can't be read."
         );
         assert_eq!(error(read(damaged(b"zh\""))), NOT_AN_EXPORT, "the config, damaged");
     }

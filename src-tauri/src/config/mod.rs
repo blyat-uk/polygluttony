@@ -142,13 +142,13 @@ impl Step {
     /// settings while the page shows a single model (`AppConfig::per_step`).
     pub const TEXT: [Step; 4] = [Step::Extract, Step::Normalize, Step::Translate, Step::Verify];
 
-    /// The step's name on the Connections page, so a message can say where to
-    /// fix it.
+    /// The step's name on the Models page (and everywhere else in the app), so
+    /// a message can say where to fix it.
     pub fn label(self) -> &'static str {
         match self {
-            Step::Extract => "Extract names",
-            Step::Normalize => "Normalize",
-            Step::WebSearch => "Web search",
+            Step::Extract => "Find names",
+            Step::Normalize => "Tidy up",
+            Step::WebSearch => "Look up names online",
             Step::Translate => "Translate",
             Step::Verify => "Verify",
         }
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn steps_come_in_workflow_order_with_their_page_names() {
         let names: Vec<&str> = Step::ALL.iter().map(|s| s.label()).collect();
-        assert_eq!(names, ["Extract names", "Normalize", "Web search", "Translate", "Verify"]);
+        assert_eq!(names, ["Find names", "Tidy up", "Look up names online", "Translate", "Verify"]);
         assert!(Step::ALL.windows(2).all(|w| w[0] < w[1]));
         assert!(!Step::TEXT.contains(&Step::WebSearch));
     }
