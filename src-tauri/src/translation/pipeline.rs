@@ -994,6 +994,8 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
         retranslated: Vec::new(),
         failed: Some(message),
     };
+    // However it goes, the episode ends where it started: its output stays.
+    let prior_state = if review.needs_look { FileStateKind::Warning } else { FileStateKind::Done };
     let original = match decode_file(&job.input) {
         Ok(text) => text,
         Err(e) => {
@@ -1005,12 +1007,11 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
                 error_kind: ErrorKind::Other,
             })
             .await;
-            st.state(FileStateKind::Failed, None).await;
+            st.state(prior_state, None).await;
             return fail(&st, message);
         }
     };
     let mut st = FileState::new(job, parse_dialogues(&original));
-    let prior_state = if review.needs_look { FileStateKind::Warning } else { FileStateKind::Done };
     let seed = job.seed.as_ref().filter(|s| s.source_hash == fingerprint(&original));
     let Some(seed) = seed else {
         let message =
