@@ -227,6 +227,22 @@ export const ipc = {
 /** Tells episode windows to refetch; payload `EpisodeChanged` (`file: null` = all). */
 export const EPISODE_CHANGED_EVENT = "episode://changed";
 
+/** Sent by an episode window's "Fix in glossary"; the main window shows the Glossary
+ *  page with that term. Payload `GlossaryFocusTerm`. */
+export const GLOSSARY_FOCUS_TERM_EVENT = "glossary://focus-term";
+export interface GlossaryFocusTerm {
+  folder: string;
+  source: string;
+}
+
+/** Sent to an open episode window to scroll to and select a line. Payload
+ *  `EpisodeGoToLine`. */
+export const EPISODE_GO_TO_LINE_EVENT = "episode://go-to-line";
+export interface EpisodeGoToLine {
+  file: string;
+  line: number;
+}
+
 /** Subscribe to a backend-emitted event (progress, logs, …). Returns an unlisten fn. */
 export function onBackendEvent<T>(
   name: string,
