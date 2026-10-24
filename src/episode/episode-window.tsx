@@ -258,6 +258,8 @@ export function EpisodeWindow({
   // A line acted on (retranslated, edited, looks fine) that stops needing a
   // look hands over to the next one, so the navigator keeps its place.
   const advanceFrom = useRef<number | null>(null);
+  // Lines sent to be retranslated, until that run ends.
+  const retranslating = useRef<{ ids: number[]; ran: boolean } | null>(null);
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   const review = useMemo<ReviewActions | null>(() => {
@@ -273,6 +275,7 @@ export function EpisodeWindow({
       },
       retranslate: (ids) => {
         if (ids.length === 1) from(ids[0]);
+        retranslating.current = { ids, ran: false };
         actions.retranslate(ids);
       },
       looksFine: (id, issues) => {
@@ -281,6 +284,26 @@ export function EpisodeWindow({
       },
     };
   }, [actions]);
+  // A retranslation ended with some of its lines still untranslated: say so.
+  useEffect(() => {
+    const r = retranslating.current;
+    if (!r) return;
+    if (blocked !== null) {
+      r.ran = true;
+      return;
+    }
+    if (!r.ran) return;
+    retranslating.current = null;
+    const asked = new Set(r.ids);
+    const still = lines.filter((l) => asked.has(l.id) && l.status === "untranslated").length;
+    if (still > 0) {
+      setNotice({
+        text: `${still} ${still === 1 ? "line" : "lines"} still couldn’t be translated.`,
+        tone: "error",
+      });
+    }
+  }, [blocked, lines]);
+
   useEffect(() => {
     const at = advanceFrom.current;
     // Wait for a retranslation to finish, and for the line to be resolved.
@@ -434,7 +457,7 @@ export function EpisodeWindow({
             notice={notice}
             banner={banner}
             shortcut={ADD_SHORTCUT}
-            onRetranslateAll={() => actions?.retranslate(flagged)}
+            onRetranslateAll={() => review?.retranslate(flagged)}
             onMarkDone={markDone}
             onAddToGlossary={(button) => openDraft(button)}
             onRetranslateTerm={retranslateTerm}
