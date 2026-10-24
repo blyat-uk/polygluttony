@@ -1,5 +1,5 @@
-//! Glossary run manager: one glossary op at a time (build / standalone
-//! normalize / import), mutually exclusive with translation runs. Mirrors
+//! Glossary run manager: one glossary op at a time (build / Tidy up / Look
+//! up names online / import), mutually exclusive with translation runs. Mirrors
 //! `translation/run.rs` with a simpler forwarder (the slot is released by a
 //! `SlotGuard` held by the op, not by channel close).
 
@@ -33,7 +33,10 @@ pub struct GlossaryOpHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlossaryOpKind {
     Build,
+    /// Tidy up on the glossary as it is.
     Normalize,
+    /// Look up names online on the glossary as it is.
+    LookUp,
     Import,
 }
 
@@ -133,12 +136,12 @@ pub fn service_for(
 
 pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     if args.files.is_empty() {
-        return Err(AppError::Other("no files selected".into()));
+        return Err(AppError::Other("Pick at least one episode first.".into()));
     }
     let pair = LanguagePair::from_codes(&args.source_lang, &args.target_lang)?;
     if !pair.supports_glossary {
         return Err(AppError::Other(format!(
-            "glossary isn't available for {}",
+            "Glossaries aren't available for {} subtitles.",
             pair.source_name
         )));
     }
@@ -158,24 +161,9 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
 
     let cancel = claim_slot(&app, GlossaryOpKind::Build).await?;
 
-    // Regenerate throws the old glossary away — and not only at the end: the
-    // first completed batch's incremental save (build.rs) already overwrites
-    // glossary.json with new-terms-only.
-    //
-    // The backup runs AFTER the slot claim because taking it is itself
-    // destructive: `glossary.prev.json` is a single slot, so this copy
-    // DESTROYS the previous undo copy. A run that cannot start (another op
-    // holds the slot) must not replace the user's only undo copy while
-    // reporting that nothing happened. `claim_slot` has already taken the slot
-    // and the `SlotGuard` is only created inside the spawned task, so a failing
-    // backup has to hand the slot back itself. A backup we cannot write means
-    // we do not start.
-    if args.mode == BuildMode::Regenerate {
-        if let Err(e) = crate::glossary::io::backup_folder_glossary(&PathBuf::from(&args.folder)) {
-            release_slot(&app).await;
-            return Err(e);
-        }
-    }
+    // No backup here: the build snapshots the current glossary to the history
+    // right before its FIRST write (build.rs `BuildWriter`), so a run that
+    // writes nothing leaves no stray history entry.
     let (tx, rx) = mpsc::channel::<GlossaryEvent>(512);
     spawn_forwarder(app.clone(), rx);
 
@@ -226,7 +214,8 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     Ok(())
 }
 
-/// Cancels whichever glossary op holds the slot (build, normalize, import).
+/// Cancels whichever glossary op holds the slot (build, Tidy up, Look up
+/// names online, import).
 pub async fn cancel(app: AppHandle) -> AppResult<()> {
     let state = app.state::<GlossaryRunState>();
     let guard = state.0.lock().await;

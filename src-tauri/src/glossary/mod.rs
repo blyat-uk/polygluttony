@@ -7,7 +7,8 @@
 //!
 //! Current submodules:
 //! - `model`       — `GlossaryDoc` IPC shape, term ops (merge, dedupe, parse)
-//! - `io`          — atomic pretty-printed save + load, backup and import for the glossary JSON file
+//! - `io`          — atomic pretty-printed save + load and import for the glossary JSON file
+//! - `history`     — snapshots before bulk changes, list and restore ("Restore an earlier version…")
 //! - `diff`        — pure diff between two glossary snapshots (`GlossaryDiff`)
 //! - `meta`        — sidecar metadata (term origins, scanned files, history) and its IPC shapes
 //! - `world_detector` — keyword-heuristic world-type detection (no LLM)
@@ -21,6 +22,7 @@
 
 pub mod build;
 pub mod diff;
+pub mod history;
 pub mod io;
 pub mod meta;
 pub mod model;
