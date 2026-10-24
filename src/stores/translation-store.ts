@@ -73,6 +73,9 @@ interface TranslationRunState {
    *  retranslation) and picked up from `run_started`: no end-of-run banner or
    *  notification for it. */
   external: boolean
+  /** The last full run's outcome (not a review started elsewhere), for the
+   *  status bar's result chip. Kept until the next full run ends. */
+  lastFullRun: { folder: string; files: Record<string, FileRow>; results: FileResult[] } | null
   start: (files: string[], folder: string, resume?: boolean) => void
   /** The user pressed Stop; the run winds down and sends `run_finished`. */
   requestStop: () => void
@@ -119,6 +122,7 @@ export const useTranslationRun = create<TranslationRunState>((set, get) => ({
   startError: null,
   lastStart: null,
   external: false,
+  lastFullRun: null,
 
   start: (files, folder, resume = false) =>
     set({
@@ -225,6 +229,9 @@ export const useTranslationRun = create<TranslationRunState>((set, get) => ({
           return {
             files,
             results: e.results,
+            ...(s.external || !s.folder
+              ? {}
+              : { lastFullRun: { folder: s.folder, files, results: e.results } }),
             running: false,
             throttle: null,
             // An engine that predates `stopped` still ends a stopped run: say so.
@@ -255,5 +262,6 @@ export const useTranslationRun = create<TranslationRunState>((set, get) => ({
       startError: null,
       lastStart: null,
       external: false,
+      lastFullRun: null,
     }),
 }))

@@ -113,9 +113,8 @@ export function StatusBar() {
   const modelLabel = useAppStore((s) => s.translationLabel);
   const usable = useAppStore((s) => s.hasUsableConnection);
   const translating = useTranslationRun((s) => s.running);
-  const runFolder = useTranslationRun((s) => s.folder);
   const files = useTranslationRun((s) => s.files);
-  const results = useTranslationRun((s) => s.results);
+  const lastFullRun = useTranslationRun((s) => s.lastFullRun);
   const gBusy = useGlossaryRun((s) => s.busy);
   const gDone = useGlossaryRun((s) => s.done);
   const gTotal = useGlossaryRun((s) => s.total);
@@ -132,8 +131,12 @@ export function StatusBar() {
     : gBusy
       ? { to: "/glossary", label: glossaryLabel(gBusy, gDone, gTotal) }
       : null;
-  // The last run's result stays until the next run — for the folder it belongs to.
-  const tally = !translating && results && runFolder === workdir ? runTally(files, results) : null;
+  // The last full run's result stays until the next one — for the folder it
+  // belongs to. A review retranslating a few lines doesn't replace it.
+  const tally =
+    !translating && lastFullRun && lastFullRun.folder === workdir
+      ? runTally(lastFullRun.files, lastFullRun.results)
+      : null;
 
   const go = (to: string) => void navigate({ to: to as never });
   const folder = workdir
