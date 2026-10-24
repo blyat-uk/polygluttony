@@ -1,9 +1,10 @@
 import { useEffect, useId, useState, type RefObject } from "react";
 import { Popover as PopoverPrimitive } from "radix-ui";
+import { emit } from "@tauri-apps/api/event";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent } from "@/components/ui/popover";
-import { ipc } from "@/lib/ipc";
+import { GLOSSARY_CHANGED_EVENT, ipc, type GlossaryChanged } from "@/lib/ipc";
 import { findTerm, GLOSSARY_CATEGORIES, plainError, withTerm, type GlossaryCategory } from "./review";
 
 type Rect = { left: number; top: number; width: number; height: number };
@@ -149,6 +150,8 @@ export function AddToGlossary({
       }
       const next = withTerm(load.doc, load.meta, category, source.trim(), target.trim());
       await ipc.saveGlossary(folder, next.doc, next.meta);
+      // The main window reloads its copy, so a later edit there can't save over this term.
+      void emit(GLOSSARY_CHANGED_EVENT, { folder } satisfies GlossaryChanged).catch(() => undefined);
       const label = GLOSSARY_CATEGORIES.find((c) => c.key === category)?.label ?? category;
       onAdded(source.trim(), target.trim(), label);
     } catch (e) {

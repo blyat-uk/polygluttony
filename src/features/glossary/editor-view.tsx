@@ -39,6 +39,7 @@ import { episodes } from "./episodes";
 import {
   buildRows,
   CATEGORY_LABEL,
+  categoryOf,
   termKey,
   titleCase,
   type Category,
@@ -323,15 +324,18 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
   // Episode window → "Fix in glossary": show that term.
   const pendingFocus = useGlossaryRun((s) => s.pendingFocusTerm);
   useEffect(() => {
-    if (!pendingFocus || pendingFocus.folder !== folder) return;
+    if (!pendingFocus) return;
     useGlossaryRun.getState().clearFocusTerm();
+    if (pendingFocus.folder !== folder) return;
     const source = pendingFocus.source;
-    const row = rows.find((r) => r.source === source);
+    // The cache, not `rows`: the glossary was just reloaded (the term may have
+    // been added in that window) and this render can predate it.
+    const cat = categoryOf(current().doc, source);
     ui.setShow("all");
     ui.setCategory(null);
-    if (row) {
+    if (cat) {
       ui.setSearch(source);
-      flashRow(row.key, true);
+      flashRow(termKey(cat, source), true);
     } else {
       // Not in the glossary yet: start the add row with it.
       ui.setSearch("");
