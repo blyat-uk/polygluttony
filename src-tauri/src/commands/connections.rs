@@ -9,6 +9,7 @@ use crate::config::providers::{self, ModelCapabilities, ProviderInfo};
 use crate::config::store;
 use crate::config::{AppConfig, Connection, Driver, Model, Provider, Step, StepSettings};
 use crate::error::{AppError, AppResult};
+use crate::events::ErrorKind;
 use crate::llm::create_driver;
 use crate::llm::detect::detect_format;
 use crate::llm::error::LlmError;
@@ -225,52 +226,24 @@ fn failed(
     }
 }
 
-/// Words that mean the account is out of credit or over its quota, as
-/// Anthropic ("credit balance is too low"), OpenAI (`insufficient_quota`) and
-/// others put it.
-const BILLING_WORDS: [&str; 6] = ["credit", "quota", "billing", "balance", "payment", "insufficient_funds"];
-
-/// Gemini's per-minute limits also say "quota"; its status names them as limits.
-fn is_resource_exhausted(body: &str) -> bool {
-    body.contains("resource_exhausted") || body.contains("resource has been exhausted")
-}
-
 /// Pure: which field a failed test points at, and whether saving untested is
 /// reasonable — true only when the failure may pass on its own (unreachable,
 /// timed out, rate-limited, server trouble), never for a bad key or model, and
 /// not for an empty account (it needs credit first).
+///
+/// Classified exactly as a run classifies the same error ([`LlmError::kind`]),
+/// so a test and a run never disagree: a 429 counts as billing only when it
+/// says the account is out of credit (`insufficient_quota`), not when a
+/// rate-limit message merely mentions quota or billing.
 pub(crate) fn classify_test_error(err: &LlmError) -> (TestProblem, bool) {
-    if let LlmError::Http { status, body, .. } = err {
-        let body = body.to_ascii_lowercase();
-        match status {
-            402 => return (TestProblem::Billing, false),
-            400 | 403 | 429 if is_resource_exhausted(&body) => return (TestProblem::RateLimit, true),
-            400 | 403 | 429 if BILLING_WORDS.iter().any(|w| body.contains(w)) => {
-                return (TestProblem::Billing, false)
-            }
-            _ => {}
-        }
-    }
-    match err {
-        LlmError::Http { status: 401 | 403, .. } => (TestProblem::Key, false),
-        LlmError::Http { status: 404, .. } => (TestProblem::Model, false),
-        LlmError::Http { status: 400, body, .. } => {
-            let body = body.to_ascii_lowercase();
-            // Gemini answers a bad key with 400 API_KEY_INVALID, not 401.
-            if body.contains("api key") || body.contains("api_key") {
-                (TestProblem::Key, false)
-            } else if body.contains("model") {
-                (TestProblem::Model, false)
-            } else {
-                (TestProblem::Other, false)
-            }
-        }
-        LlmError::Http { status: 408, .. } | LlmError::Transport(_) => (TestProblem::Address, true),
-        LlmError::Http { status: 429, .. } => (TestProblem::RateLimit, true),
-        LlmError::Http { status: 500..=599, .. } => (TestProblem::Server, true),
-        LlmError::Http { .. } | LlmError::Parse(_) | LlmError::Declined(_) | LlmError::Empty => {
-            (TestProblem::Other, false)
-        }
+    match err.kind() {
+        ErrorKind::Auth => (TestProblem::Key, false),
+        ErrorKind::Billing => (TestProblem::Billing, false),
+        ErrorKind::RateLimit => (TestProblem::RateLimit, true),
+        ErrorKind::Model => (TestProblem::Model, false),
+        ErrorKind::Network => (TestProblem::Address, true),
+        ErrorKind::Server => (TestProblem::Server, true),
+        ErrorKind::Other => (TestProblem::Other, false),
     }
 }
 
@@ -576,6 +549,38 @@ mod tests {
         let gemini = r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}"#;
         assert_eq!(classify_test_error(&http(429, gemini)), (RateLimit, true));
         assert_eq!(classify_test_error(&http(429, "Resource has been exhausted (e.g. check quota).")), (RateLimit, true));
+        // OpenAI free tier: a daily request limit that mentions adding a payment method and billing.
+        let openai_free = r#"{"error":{"message":"Rate limit reached for gpt-4o-mini in organization org-abc on requests per day (RPD): Limit 200, Used 200, Requested 1. Please try again in 7m12s. Visit https://platform.openai.com/account/rate-limits to learn more. You can increase your rate limit by adding a payment method to your account at https://platform.openai.com/account/billing.","type":"requests","param":null,"code":"rate_limit_exceeded"}}"#;
+        assert_eq!(classify_test_error(&http(429, openai_free)), (RateLimit, true));
+        // Azure OpenAI: a token-rate limit whose link says "quotaincrease".
+        let azure = r#"{"error":{"code":"429","message":"Requests to the ChatCompletions_Create Operation under Azure OpenAI API version 2024-10-21 have exceeded token rate limit of your current OpenAI S0 pricing tier. Please retry after 6 seconds. Please go here: https://aka.ms/oai/quotaincrease if you would like to further increase the default rate limit."}}"#;
+        assert_eq!(classify_test_error(&http(429, azure)), (RateLimit, true));
+    }
+
+    #[test]
+    fn a_test_classifies_errors_as_a_run_does() {
+        let samples = [
+            http(400, "Your credit balance is too low"),
+            http(429, r#"{"error":{"code":"insufficient_quota"}}"#),
+            http(429, "You exceeded your current quota, please check your plan and billing details."),
+            http(403, "Billing is not enabled for this project"),
+            http(401, "bad key"),
+            http(404, "no such model"),
+            http(503, "overloaded"),
+            LlmError::Transport("dns error".into()),
+        ];
+        for e in &samples {
+            let expected = match e.kind() {
+                ErrorKind::Auth => TestProblem::Key,
+                ErrorKind::Billing => TestProblem::Billing,
+                ErrorKind::RateLimit => TestProblem::RateLimit,
+                ErrorKind::Model => TestProblem::Model,
+                ErrorKind::Network => TestProblem::Address,
+                ErrorKind::Server => TestProblem::Server,
+                ErrorKind::Other => TestProblem::Other,
+            };
+            assert_eq!(classify_test_error(e).0, expected, "{e}");
+        }
     }
 
     #[test]
