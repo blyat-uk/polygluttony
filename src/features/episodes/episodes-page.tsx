@@ -260,11 +260,8 @@ function Episodes({ folder }: { folder: string }) {
           onChange={(next) => void persist(next)}
         />
 
+        {/* The presets come first, so they stay put while the count changes length. */}
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12.5px]">
-          <span className="font-medium text-foreground tabular-nums">
-            {selectionLine(selected, view.files)}
-          </span>
-          <span className="text-muted-foreground/50">·</span>
           <span className="text-muted-foreground">Select:</span>
           {PRESETS.map((p) => (
             <button
@@ -276,6 +273,10 @@ function Episodes({ folder }: { folder: string }) {
               {p.label}
             </button>
           ))}
+          <span className="text-muted-foreground/50">·</span>
+          <span className="font-medium text-foreground tabular-nums">
+            {selectionLine(selected, view.files)}
+          </span>
         </div>
 
         <RunBanner
