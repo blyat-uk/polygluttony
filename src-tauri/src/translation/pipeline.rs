@@ -566,6 +566,7 @@ impl<'j, 'a> FileState<'j, 'a> {
             step,
             who: svc.who().to_string(),
             model: svc.model().to_string(),
+            local: svc.is_local(),
         });
         FileError::Stopped
     }

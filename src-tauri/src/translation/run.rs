@@ -152,10 +152,12 @@ fn kit(app: &AppHandle, folder: &Path) -> AppResult<(Kit, mpsc::Receiver<RunEven
     let concurrency = conn.concurrency.unwrap_or(2).max(1);
     let service = |conn: Connection| {
         let label = who(&conn);
+        let local = conn.provider.is_local();
         let driver: Arc<dyn crate::llm::LlmDriver> = Arc::from(crate::llm::create_driver(conn));
         Arc::new(
             LlmService::new(driver, concurrency, stop.token().clone(), tx.clone())
-                .with_provider(label),
+                .with_provider(label)
+                .with_local(local),
         )
     };
     let svc = service(conn.clone());
@@ -926,6 +928,7 @@ mod tests {
             step: Step::Translate,
             who: "Anthropic".into(),
             model: "m".into(),
+            local: false,
         });
 
         let cases = [
@@ -1196,6 +1199,7 @@ mod tests {
                         step: Step::Translate,
                         who: "Anthropic".into(),
                         model: "m".into(),
+                        local: false,
                     });
                     let _ = tx
                         .send(RunEvent::State {

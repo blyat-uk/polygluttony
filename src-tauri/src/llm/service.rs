@@ -38,6 +38,8 @@ pub struct LlmService {
     driver: Arc<dyn LlmDriver>,
     /// Who answers, for messages: "Anthropic", or "The server" for a custom URL.
     who: String,
+    /// A model on the user's own computer (Ollama, LM Studio): no API key.
+    local: bool,
     cap: u32,
     state: Mutex<PermitState>,
     notify: Notify,
@@ -56,6 +58,7 @@ impl LlmService {
         LlmService {
             driver,
             who: "The provider".into(),
+            local: false,
             cap,
             state: Mutex::new(PermitState {
                 limit: cap,
@@ -77,6 +80,16 @@ impl LlmService {
 
     pub fn who(&self) -> &str {
         &self.who
+    }
+
+    /// Mark the service as a model on the user's own computer.
+    pub fn with_local(mut self, local: bool) -> Self {
+        self.local = local;
+        self
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.local
     }
 
     /// The model id requests go to.

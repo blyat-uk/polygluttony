@@ -19,6 +19,8 @@ pub struct StopCause {
     /// Who answered: "Anthropic", or "The server" for a custom URL.
     pub who: String,
     pub model: String,
+    /// A model on the user's own computer: there's no key to blame.
+    pub local: bool,
 }
 
 impl StopCause {
@@ -26,6 +28,9 @@ impl StopCause {
     pub fn sentence(&self) -> String {
         let (who, step, model) = (&self.who, self.step.label(), &self.model);
         match self.kind {
+            ErrorKind::Auth if self.local => format!(
+                "{who} refused the request for {step}. Check the address, and that the model is installed."
+            ),
             ErrorKind::Auth => format!("{who} rejected the API key used for {step}."),
             ErrorKind::Billing => {
                 format!("{who} says the account used for {step} is out of credit.")
@@ -148,7 +153,19 @@ mod tests {
             step,
             who: "Anthropic".into(),
             model: "claude-x".into(),
+            local: false,
         }
+    }
+
+    #[test]
+    fn a_local_model_is_never_blamed_for_a_key() {
+        let mut c = cause(ErrorKind::Auth, Step::Translate);
+        c.who = "Ollama".into();
+        c.local = true;
+        assert_eq!(
+            c.sentence(),
+            "Ollama refused the request for Translate. Check the address, and that the model is installed."
+        );
     }
 
     #[test]

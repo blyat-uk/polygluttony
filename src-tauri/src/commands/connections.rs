@@ -292,6 +292,9 @@ fn failure_message(conn: &Connection, problem: TestProblem, err: &LlmError) -> S
     let info = providers::provider_info(conn.provider);
     let who = who(conn);
     match problem {
+        TestProblem::Key if conn.provider.is_local() => format!(
+            "{who} refused the request. Check the address, and that the model is installed."
+        ),
         TestProblem::Key => {
             let hint = info.key_hint.map(|h| format!(" ({h})")).unwrap_or_default();
             format!("{who} rejected this key. Check you copied all of it{hint}.")
