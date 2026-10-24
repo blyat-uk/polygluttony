@@ -262,11 +262,6 @@ impl Steps {
         .flatten()
     }
 
-    /// Whether `model_id` does any step.
-    pub fn uses(&self, model_id: &str) -> bool {
-        Step::ALL.into_iter().filter_map(|s| self.get(s)).any(|s| s.model == model_id)
-    }
-
     /// The four text steps share one model and identical settings — what the
     /// one-model view assumes.
     pub fn text_steps_shared(&self) -> bool {
@@ -446,7 +441,6 @@ mod tests {
         steps.set(Step::Translate, None); // text steps can't be switched off
         let ids: Vec<&str> = Step::ALL.iter().map(|s| steps.get(*s).unwrap().model.as_str()).collect();
         assert_eq!(ids, ["a", "a", "b", "a", "c"]);
-        assert!(steps.uses("b") && steps.uses("c") && !steps.uses("d"));
         assert!(!steps.text_steps_shared());
         steps.set(Step::Verify, Some(StepSettings::new("a")));
         assert!(steps.text_steps_shared(), "web search doesn't count");
