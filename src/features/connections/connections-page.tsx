@@ -9,6 +9,7 @@ import type { Steps } from "@/types/generated/Steps";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { findProvider, isUsable, modelLabel, providerName } from "./connection-model";
 import { ConnectionForm, type FormStage } from "./connection-form";
 import { FlowStrip, type WebSearchNode } from "./flow-strip";
@@ -73,17 +74,25 @@ export function ConnectionsPage() {
               className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
               onClick={() => void transfer.startImport()}
             >
-              <UploadSimple className="size-4" /> Import…
+              <UploadSimple className="size-4" /> Import setup…
             </Button>
-            <Button
-              size="sm"
-              variant="secondary"
-              aria-disabled={transfer.busy || undefined}
-              className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
-              onClick={() => void transfer.exportSetup()}
-            >
-              <DownloadSimple className="size-4" /> Export…
-            </Button>
+            {/* Nothing to carry over until a model is set up. */}
+            {config.data && config.data.models.length > 0 ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    aria-disabled={transfer.busy || undefined}
+                    className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
+                    onClick={() => void transfer.exportSetup()}
+                  >
+                    <DownloadSimple className="size-4" /> Export setup…
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Includes your API keys in plain text.</TooltipContent>
+              </Tooltip>
+            ) : null}
           </div>
         }
       />

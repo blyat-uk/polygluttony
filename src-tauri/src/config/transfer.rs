@@ -41,6 +41,10 @@ const MAX_ENTRIES: usize = 256;
 const STAGING_SUFFIX: &str = ".import";
 const OLD_SUFFIX: &str = ".old";
 
+/// Where an import saves the setup it replaces, in the app-data dir: an export
+/// like any other, so importing it is the undo.
+pub const BACKUP_FILE: &str = "setup-backup.zip";
+
 const NOT_AN_EXPORT: &str = "This isn't a Polygluttony export.";
 const NEWER_EXPORT: &str =
     "This export was made by a newer Polygluttony. Update Polygluttony, then import it again.";
@@ -58,6 +62,9 @@ pub struct SetupSummary {
     pub skipped: Vec<String>,
     /// This install already has models or edited prompts, which the import replaces.
     pub replaces_existing: bool,
+    /// After an import that replaced a setup: the export of the replaced setup,
+    /// saved first. Importing it undoes the import. `None` before an import.
+    pub backup: Option<String>,
 }
 
 /// An export file, read and checked: ready to apply.
@@ -264,9 +271,14 @@ pub fn summary(imported: &Imported, current: &AppConfig, overrides_dir: &Path) -
         models: imported.config.models.iter().map(Model::label).collect(),
         edited_prompts: imported.prompts.len() as u32,
         skipped: imported.skipped.clone(),
-        replaces_existing: !current.models.is_empty()
-            || prompts::list_meta(overrides_dir).iter().any(|m| m.modified),
+        replaces_existing: has_setup(current, overrides_dir),
+        backup: None,
     }
+}
+
+/// This install has something an import would replace: models or edited prompts.
+fn has_setup(current: &AppConfig, overrides_dir: &Path) -> bool {
+    !current.models.is_empty() || prompts::list_meta(overrides_dir).iter().any(|m| m.modified)
 }
 
 // ---- import: applying -----------------------------------------------------------
@@ -353,6 +365,31 @@ pub fn apply(
              again to finish."
         ))
     })
+}
+
+/// `apply`, after first saving the setup it replaces to `backup` (when there is
+/// one) with the export code, so the import can be undone by importing the
+/// backup. Returns the backup's path when one was made. A backup that can't be
+/// written stops the import before anything changes.
+pub fn replace_with_backup(
+    imported: &Imported,
+    current: &AppConfig,
+    overrides_dir: &Path,
+    backup: &Path,
+    save: impl FnOnce(&AppConfig) -> AppResult<()>,
+) -> AppResult<Option<PathBuf>> {
+    let made = if has_setup(current, overrides_dir) {
+        export_to(backup, current, overrides_dir).map_err(|e| {
+            AppError::Other(format!(
+                "Couldn't save a backup of your current setup first ({e}), so nothing was replaced."
+            ))
+        })?;
+        Some(backup.to_path_buf())
+    } else {
+        None
+    };
+    apply(imported, current, overrides_dir, save)?;
+    Ok(made)
 }
 
 #[cfg(test)]
@@ -751,6 +788,70 @@ mod tests {
         assert_eq!(names_in(root.path()), ["prompts"]);
     }
 
+    // ---- backup before replacing ----
+
+    #[test]
+    fn replacing_a_setup_saves_the_current_one_first_and_the_backup_brings_it_back() {
+        let (root, dir) = app_data(&[(Verify, "my check")]);
+        let backup = root.path().join(BACKUP_FILE);
+        let incoming = Imported { config: default_config(), prompts: owned(&[(ToneFunny, "funnier")]), skipped: Vec::new() };
+        let current = AppConfig { default_workdir: Some("/here/subs".into()), ..configured() };
+        let mut saved = Vec::new();
+
+        let made = replace_with_backup(&incoming, &current, &dir, &backup, |cfg| {
+            saved.push(cfg.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(made.as_deref(), Some(backup.as_path()));
+        assert_eq!(prompts::resolve(ToneFunny, &dir).unwrap(), "funnier", "the import went through");
+
+        // The backup is an export of what was here, edited prompts and all.
+        let restored = read_file(&backup).unwrap();
+        assert_eq!(restored.config, AppConfig { default_workdir: None, ..configured() }, "without the work folder");
+        assert_eq!(restored.prompts, owned(&[(Verify, "my check")]));
+
+        // Undo: importing the backup puts it all back (and backs up the import in turn).
+        let now = saved.last().unwrap().clone();
+        replace_with_backup(&restored, &now, &dir, &backup, |cfg| {
+            saved.push(cfg.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(saved.last().unwrap(), &current, "same models, steps, keys and work folder");
+        assert_eq!(prompts::resolve(Verify, &dir).unwrap(), "my check");
+        assert_eq!(prompts::resolve(ToneFunny, &dir).unwrap(), prompts::default_text(ToneFunny));
+        assert_eq!(read_file(&backup).unwrap().prompts, owned(&[(ToneFunny, "funnier")]));
+    }
+
+    #[test]
+    fn nothing_to_replace_means_no_backup() {
+        let (root, dir) = app_data(&[]);
+        let backup = root.path().join(BACKUP_FILE);
+        let incoming = read(export(&configured(), &dir)).unwrap();
+        let made = replace_with_backup(&incoming, &default_config(), &dir, &backup, |_| Ok(())).unwrap();
+        assert_eq!(made, None);
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn a_backup_that_cant_be_written_stops_the_import() {
+        let (root, dir) = app_data(&[(Verify, "my check")]);
+        let backup = root.path().join("missing-dir").join(BACKUP_FILE);
+        let incoming = Imported { config: default_config(), prompts: Vec::new(), skipped: Vec::new() };
+        let mut saved = false;
+        let err = replace_with_backup(&incoming, &configured(), &dir, &backup, |_| {
+            saved = true;
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("Couldn't save a backup of your current setup"), "{err}");
+        assert!(err.ends_with("so nothing was replaced."), "{err}");
+        assert!(!saved, "the config wasn't touched");
+        assert_eq!(prompts::resolve(Verify, &dir).unwrap(), "my check");
+    }
+
     // ---- summary ----
 
     #[test]
@@ -768,6 +869,7 @@ mod tests {
                 edited_prompts: 1,
                 skipped: vec!["notes.txt".into()],
                 replaces_existing: false,
+                backup: None,
             }
         );
         assert!(summary(&imported, &configured(), &empty).replaces_existing, "models here");

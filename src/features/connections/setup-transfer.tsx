@@ -23,9 +23,10 @@ const ZIP_FILTER = [{ name: "Polygluttony export", extensions: ["zip"] }];
 type PendingImport = { path: string; summary: SetupSummary };
 
 export type SetupTransfer = {
-  /** Export…: pick where, then write the zip. */
+  /** Export setup…: pick where, then write the zip. */
   exportSetup: () => Promise<void>;
-  /** Import… and the first-run link: pick a zip, confirm if it replaces anything, apply. */
+  /** Import setup… and the first-run link: pick a zip, confirm if it replaces anything,
+   *  apply. A replaced setup is saved first, and the toast's Undo brings it back. */
   startImport: () => Promise<void>;
   /** An export or import is in flight. */
   busy: boolean;
@@ -34,9 +35,10 @@ export type SetupTransfer = {
 };
 
 /**
- * Carry a setup to another computer in one zip: Export… writes it, Import… reads one back —
- * asking first when there's something here to replace — then refreshes every query. One
- * flow for the header buttons and the first-run link.
+ * Carry a setup to another computer in one zip: Export setup… writes it, Import setup… reads
+ * one back — asking first when there's something here to replace, and saving that first so
+ * it can be undone — then refreshes every query. One flow for the header buttons and the
+ * first-run link.
  */
 export function useSetupTransfer(): SetupTransfer {
   const qc = useQueryClient();
@@ -60,10 +62,11 @@ export function useSetupTransfer(): SetupTransfer {
     }
   };
 
-  const apply = async (path: string) => {
-    let skipped: string[];
+  /** Import `path`. `undo`: it's the backup of a setup an import just replaced. */
+  const apply = async (path: string, undo = false) => {
+    let summary: SetupSummary;
     try {
-      ({ skipped } = await ipc.importSetup(path));
+      summary = await ipc.importSetup(path);
     } finally {
       // Everything may have changed: connections (which re-sync the shell store), prompts,
       // web search, the open folder's view — even on a failure, which may come after the
@@ -71,10 +74,18 @@ export function useSetupTransfer(): SetupTransfer {
       // would hold up the toast.
       void qc.invalidateQueries();
     }
-    toast.success(
-      "Setup imported",
-      skipped.length > 0 ? { description: skippedCopy(skipped) } : undefined,
-    );
+    const description = summary.skipped.length > 0 ? skippedCopy(summary.skipped) : undefined;
+    if (undo) {
+      toast.success("Your previous setup is back");
+      return;
+    }
+    const backup = summary.backup;
+    toast.success(backup ? "Setup replaced" : "Setup imported", {
+      description,
+      // Long enough to notice and reach for Undo.
+      duration: backup ? 10_000 : undefined,
+      action: backup ? { label: "Undo", onClick: () => void run(() => apply(backup, true)) } : undefined,
+    });
   };
 
   const exportSetup = () =>
@@ -86,7 +97,7 @@ export function useSetupTransfer(): SetupTransfer {
       if (!dest) return;
       await ipc.exportSetup(dest);
       toast.success("Setup exported", {
-        description: "The file holds your API keys — keep it somewhere private.",
+        description: "It holds your API keys in plain text — keep it somewhere private.",
       });
     });
 
@@ -147,6 +158,9 @@ function ReplaceSetupDialog({
               Your models, API keys, step settings, default languages and edited prompts here
               will be replaced by the ones in the file. Recent folders stay as they are.
               <span className="mt-2 block">The file holds {holdsCopy(shown.summary)}.</span>
+              <span className="mt-2 block">
+                Your current setup is saved first, so you can undo this.
+              </span>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
