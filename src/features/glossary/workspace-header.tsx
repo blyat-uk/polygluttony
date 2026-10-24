@@ -145,13 +145,24 @@ export function WorkspaceHeader({
               <DropdownMenuItem onSelect={improve.pick(actions.onLookup)}>
                 Look up names online…
               </DropdownMenuItem>
-            ) : null}
-            {searchModel || !canRunModel ? <DropdownMenuSeparator /> : null}
+            ) : (
+              // Shown, not hidden: without a model that can search the web, say
+              // where to get one rather than leave the feature undiscoverable.
+              <DropdownMenuItem disabled>Look up names online…</DropdownMenuItem>
+            )}
+            <DropdownMenuSeparator />
             {!canRunModel ? (
               <DropdownMenuLabel className="py-1.5 text-[11px]">Connect a model first, in Models.</DropdownMenuLabel>
             ) : searchModel ? (
               <DropdownMenuLabel className="py-1.5 text-[11px]">Uses {searchModel}</DropdownMenuLabel>
-            ) : null}
+            ) : (
+              <DropdownMenuLabel className="py-1.5 text-[11px] font-normal text-muted-foreground">
+                Looking up names needs a model that can search the web.{" "}
+                <Link to="/connections" className="text-primary hover:underline">
+                  Set one up in Models
+                </Link>
+              </DropdownMenuLabel>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
         <Button variant="outline" size="sm" disabled={busy} onClick={actions.onAddEpisodes}>
