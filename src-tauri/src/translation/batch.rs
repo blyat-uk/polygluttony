@@ -4,7 +4,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::events::ErrorKind;
 use crate::glossary::model::Glossary;
+use crate::llm::error::LlmError;
 use crate::llm::service::LlmService;
 use crate::llm::LlmRequest;
 use crate::models::language_pair::LanguagePair;
@@ -33,12 +35,79 @@ pub enum BatchOutcome {
     /// All lines translated; map id → marker-free text.
     Success(BTreeMap<u32, String>),
     /// Validation broke at `failed_from`; everything before it is salvaged.
-    Partial { translated: BTreeMap<u32, String>, failed_from: u32 },
+    /// `reason` says why in plain words, for the run view's retry note.
+    Partial { translated: BTreeMap<u32, String>, failed_from: u32, reason: &'static str },
     /// Nothing usable (transport error after retries, hopeless JSON).
-    Failure(String),
-    /// Auth error (401/403/404) — the whole run is doomed; the pipeline must
-    /// trip the cancel token instead of halving and retrying.
-    Fatal(String),
+    Failure(BatchFailure),
+    /// A rejected key, an account out of credit, an unknown model — the whole
+    /// run is doomed; the pipeline must stop the run instead of halving and
+    /// retrying.
+    Fatal(BatchFatal),
+}
+
+/// A batch that brought nothing back.
+#[derive(Debug, Clone)]
+pub struct BatchFailure {
+    /// The raw error, for the log.
+    pub message: String,
+    /// Why, in plain words ("a reply came back incomplete").
+    pub reason: &'static str,
+    pub kind: ErrorKind,
+    /// The run stopped while the request was out: nothing really failed.
+    pub cancelled: bool,
+}
+
+/// An error that stops the run.
+#[derive(Debug, Clone)]
+pub struct BatchFatal {
+    /// The raw error, for the log.
+    pub message: String,
+    pub kind: ErrorKind,
+}
+
+impl std::fmt::Display for BatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+pub const REASON_INCOMPLETE: &str = "a reply came back incomplete";
+pub const REASON_MERGED: &str = "lines came back merged";
+pub const REASON_MISMATCH: &str = "the reply didn't match the lines sent";
+pub const REASON_EMPTY_LINES: &str = "a reply left lines empty";
+pub const REASON_UNREADABLE: &str = "a reply couldn't be read";
+
+/// Pure: why a reply failed its checks, in plain words.
+fn validation_reason(a: &alignment::AlignmentCheck, m: &markers::MarkerCheck) -> &'static str {
+    let only_missing = a.extra_ids.is_empty()
+        && a.empty_translations.is_empty()
+        && m.order_mismatches.is_empty()
+        && m.corrupted_markers.is_empty()
+        && m.extra_markers.is_empty();
+    if !m.duplicate_markers.is_empty() {
+        REASON_MERGED
+    } else if !a.missing_ids.is_empty() && only_missing {
+        REASON_INCOMPLETE
+    } else if !a.empty_translations.is_empty() && a.missing_ids.is_empty() && a.extra_ids.is_empty() {
+        REASON_EMPTY_LINES
+    } else {
+        REASON_MISMATCH
+    }
+}
+
+/// Pure: why a request failed, in plain words.
+fn request_reason(e: &LlmError) -> &'static str {
+    match e.kind() {
+        ErrorKind::RateLimit => "the provider kept asking us to slow down",
+        ErrorKind::Network => "the connection to the provider failed",
+        ErrorKind::Server => "the provider had trouble on its side",
+        _ => match e {
+            LlmError::Empty => "a reply came back empty",
+            LlmError::Declined(_) => "the provider declined to answer",
+            LlmError::Parse(_) => REASON_UNREADABLE,
+            _ => "a request failed",
+        },
+    }
 }
 
 /// Core path on pre-stripped lines.
@@ -70,29 +139,48 @@ pub async fn translate_batch(
 
     let resp = match svc.request(LlmRequest { system, user }).await {
         Ok(r) => r,
-        Err(e) if e.is_auth() => return BatchOutcome::Fatal(e.to_string()),
-        Err(e) => return BatchOutcome::Failure(e.to_string()),
+        Err(e) if e.is_auth() || e.is_fatal() => {
+            return BatchOutcome::Fatal(BatchFatal { message: e.to_string(), kind: e.kind() })
+        }
+        Err(e) => {
+            return BatchOutcome::Failure(BatchFailure {
+                message: e.to_string(),
+                reason: request_reason(&e),
+                kind: e.kind(),
+                cancelled: e.is_cancelled(),
+            })
+        }
     };
 
     let pairs: Vec<LinePair> = match parse_response::extract_pairs(&resp.text) {
         Ok(p) => p,
-        Err(e) => return BatchOutcome::Failure(e.to_string()),
+        Err(e) => {
+            return BatchOutcome::Failure(BatchFailure {
+                message: e.to_string(),
+                reason: REASON_UNREADABLE,
+                kind: ErrorKind::Other,
+                cancelled: false,
+            })
+        }
     };
 
     let expected: Vec<u32> = lines.iter().map(|l| l.id).collect();
 
     // Layer 0 then layer 1; either failure salvages the prefix.
-    let first_problem = {
+    let (first_problem, reason) = {
         let a = alignment::check(&expected, &pairs);
         let m = markers::check(&expected, &pairs);
         match (a.is_valid, m.is_valid) {
-            (true, true) => None,
-            _ => Some(
-                a.first_problem_id
-                    .into_iter()
-                    .chain(m.first_mismatch_id)
-                    .min()
-                    .expect("invalid check has a first id"),
+            (true, true) => (None, REASON_MISMATCH),
+            _ => (
+                Some(
+                    a.first_problem_id
+                        .into_iter()
+                        .chain(m.first_mismatch_id)
+                        .min()
+                        .expect("invalid check has a first id"),
+                ),
+                validation_reason(&a, &m),
             ),
         }
     };
@@ -111,10 +199,13 @@ pub async fn translate_batch(
 
     match first_problem {
         None => BatchOutcome::Success(translated),
-        Some(cut) if translated.is_empty() => {
-            BatchOutcome::Failure(format!("validation failed from id {cut}, nothing salvageable"))
-        }
-        Some(cut) => BatchOutcome::Partial { translated, failed_from: cut },
+        Some(cut) if translated.is_empty() => BatchOutcome::Failure(BatchFailure {
+            message: format!("validation failed from id {cut}, nothing salvageable"),
+            reason,
+            kind: ErrorKind::Other,
+            cancelled: false,
+        }),
+        Some(cut) => BatchOutcome::Partial { translated, failed_from: cut, reason },
     }
 }
 
@@ -155,8 +246,8 @@ pub async fn translate_batch_tagged(
 
     match translate_batch(svc, &lines, glossary, context, settings).await {
         BatchOutcome::Success(m) => BatchOutcome::Success(reapply(m)),
-        BatchOutcome::Partial { translated, failed_from } => {
-            BatchOutcome::Partial { translated: reapply(translated), failed_from }
+        BatchOutcome::Partial { translated, failed_from, reason } => {
+            BatchOutcome::Partial { translated: reapply(translated), failed_from, reason }
         }
         f => f, // Failure / Fatal pass through
     }
@@ -230,12 +321,78 @@ mod tests {
         )
         .await;
         match out {
-            BatchOutcome::Partial { translated, failed_from } => {
+            BatchOutcome::Partial { translated, failed_from, reason } => {
                 assert_eq!(translated.get(&1).unwrap(), "Hello");
                 assert_eq!(failed_from, 2);
+                assert_eq!(reason, REASON_INCOMPLETE);
             }
             other => panic!("expected partial, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn merged_lines_say_so() {
+        // Lines 2 and 3 came back as one.
+        let svc = service(vec![
+            r#"[{"id":1,"tgt":"<0001:D> Hello"},{"id":2,"tgt":"<0002:D> Bye <0003:D> now"}]"#,
+        ]);
+        let out = translate_batch(
+            &svc,
+            &lines(&[(1, "你好"), (2, "再见"), (3, "现在")]),
+            &Glossary::default(),
+            &[],
+            &settings(),
+        )
+        .await;
+        match out {
+            BatchOutcome::Partial { reason, .. } => assert_eq!(reason, REASON_MERGED),
+            other => panic!("expected partial, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_and_failed_requests_say_why() {
+        let svc = service(vec!["sorry, no"]);
+        match translate_batch(&svc, &lines(&[(1, "你好")]), &Glossary::default(), &[], &settings()).await {
+            BatchOutcome::Failure(f) => {
+                assert_eq!(f.reason, REASON_UNREADABLE);
+                assert!(!f.cancelled);
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+        let driver = ScriptedDriver::new(
+            (0..3)
+                .map(|_| {
+                    Err(crate::llm::error::LlmError::Http {
+                        status: 503,
+                        body: "x".into(),
+                        retry_after: None,
+                    })
+                })
+                .collect(),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let svc = LlmService::new(driver, 2, CancellationToken::new(), tx);
+        match translate_batch(&svc, &lines(&[(1, "你好")]), &Glossary::default(), &[], &settings()).await {
+            BatchOutcome::Failure(f) => {
+                assert_eq!(f.kind, ErrorKind::Server);
+                assert_eq!(f.reason, "the provider had trouble on its side");
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_credit_is_fatal() {
+        let driver = ScriptedDriver::new(vec![Err(crate::llm::error::LlmError::Http {
+            status: 402,
+            body: "Insufficient credits".into(),
+            retry_after: None,
+        })]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let svc = LlmService::new(driver, 2, CancellationToken::new(), tx);
+        let out = translate_batch(&svc, &lines(&[(1, "你好")]), &Glossary::default(), &[], &settings()).await;
+        assert!(matches!(out, BatchOutcome::Fatal(BatchFatal { kind: ErrorKind::Billing, .. })));
     }
 
     #[tokio::test]
@@ -303,7 +460,7 @@ mod tests {
         let raw = vec![(1u32, r"{\an8}你好".to_string()), (2u32, "再见".to_string())];
         let out = translate_batch_tagged(&svc, &raw, &Glossary::default(), &[], &settings()).await;
         match out {
-            BatchOutcome::Partial { translated, failed_from } => {
+            BatchOutcome::Partial { translated, failed_from, .. } => {
                 assert_eq!(translated.get(&1).unwrap(), r"{\an8}Hello");
                 assert_eq!(failed_from, 2);
             }

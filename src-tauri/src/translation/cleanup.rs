@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::glossary::model::Glossary;
 use crate::llm::service::LlmService;
-use crate::translation::batch::{self, BatchOutcome, BatchSettings};
+use crate::translation::batch::{self, BatchFatal, BatchOutcome, BatchSettings};
 use crate::translation::batching::{MAX_CLEANUP_ITERATIONS, MAX_CLEANUP_LINES};
 use crate::translation::source_detect::SourceDetector;
 
@@ -17,7 +17,7 @@ pub struct CleanupReport {
     pub skipped_too_many: bool,
     /// Auth death mid-cleanup: the pipeline must doom the run, not proceed
     /// to verify on a dead key (carry-forward fix).
-    pub fatal: Option<String>,
+    pub fatal: Option<BatchFatal>,
 }
 
 /// `sources`: id → raw source text (tags intact). `translations`: id → current
@@ -44,7 +44,7 @@ pub async fn cleanup_pass(
     }
 
     let mut cleaned: Vec<u32> = Vec::new();
-    let mut fatal: Option<String> = None;
+    let mut fatal: Option<BatchFatal> = None;
     for _ in 0..MAX_CLEANUP_ITERATIONS {
         let raw: Vec<(u32, String)> =
             dirty.iter().filter_map(|id| sources.get(id).map(|s| (*id, s.clone()))).collect();
@@ -52,9 +52,11 @@ pub async fn cleanup_pass(
         let map = match outcome {
             BatchOutcome::Success(m) => m,
             BatchOutcome::Partial { translated, .. } => translated,
+            // The run stopped: no point asking again.
+            BatchOutcome::Failure(f) if f.cancelled => break,
             BatchOutcome::Failure(_) => continue,
-            BatchOutcome::Fatal(msg) => {
-                fatal = Some(msg);
+            BatchOutcome::Fatal(f) => {
+                fatal = Some(f);
                 break;
             }
         };

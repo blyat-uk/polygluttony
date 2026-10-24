@@ -27,22 +27,32 @@
 //! - **Scoped retranslation is chunked** (`retranslate_scope`): Python sends
 //!   the whole scope as a single request; we chunk by `initial_batch_size` to
 //!   avoid exceeding model context when a scope spans many lines.
+//!
+//! # How a file ends
+//!
+//! Every file ends one honest way ([`FileEnd`]): done, needs a look, failed
+//! on its own (unreadable, no dialogue, nothing usable came back), or
+//! stopped because the run stopped (the user's Stop, or an error no retry
+//! fixes, which stops the whole run through [`RunStop`]). A stopped file keeps
+//! its translations so far; Resume seeds them back ([`FileJob::seed`]) and
+//! sends only the missing lines.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use crate::ass::decode::decode_file;
 use crate::ass::parse::{parse_dialogues, DialogueLine};
 use crate::ass::tags::strip_for_text;
 use crate::ass::writer::write_translated;
+use crate::config::Step;
 use crate::events::{
-    EpisodeActivity, FileResult, FileStateKind, LogLevel, LogPhase, RunEvent, VerifyIssue,
+    EpisodeActivity, ErrorKind, FileResult, FileStateKind, LogLevel, LogPhase, RunEvent,
+    VerifyIssue,
 };
 use crate::glossary::model::Glossary;
-use crate::llm::service::LlmService;
+use crate::llm::service::{LlmService, REQUEST_FILE};
 use crate::models::language_pair::{output_filename, warning_filename, LanguagePair};
 use crate::translation::batch::{translate_batch_tagged, BatchOutcome, BatchSettings};
 use crate::translation::batching::{
@@ -51,7 +61,9 @@ use crate::translation::batching::{
 };
 use crate::translation::cleanup::cleanup_pass;
 use crate::translation::live::episode_sources;
+use crate::translation::results::fingerprint;
 use crate::translation::source_detect::SourceDetector;
+use crate::translation::stop::{RunStop, StopCause};
 use crate::translation::verify::{verify_file, VerifyReport};
 use crate::validation::drift;
 use crate::validation::scopes::{compute_scopes, is_full_file, Scope};
@@ -63,6 +75,10 @@ const SCOPE_PADDING: u32 = 5;
 /// Cap on per-line "untranslated" issues synthesized for the warning panel;
 /// anything beyond folds into one aggregate entry.
 const MAX_UNTRANSLATED_ISSUES: usize = 10;
+
+/// What an untranslated line's issue says.
+pub const UNTRANSLATED_DESCRIPTION: &str =
+    "This line couldn't be translated and was left out of the file.";
 
 /// Everything needed to translate one file. Borrowed pieces (`svc`,
 /// `verify_svc`, `glossary`) are shared across the files of a run.
@@ -79,251 +95,91 @@ pub struct FileJob<'a> {
     pub pair: LanguagePair,
     pub prompts: &'a crate::prompts::TranslationPrompts,
     pub batch_limit: Option<u32>,
-    pub cancel: CancellationToken,
+    /// The run's Stop: watched between requests, tripped by a fatal error.
+    pub stop: RunStop,
     pub tx: mpsc::Sender<RunEvent>,
+    /// Translations an earlier run left for this file. Used only when they
+    /// belong to the source as it is now; only the missing lines are sent.
+    pub seed: Option<Seed>,
 }
 
-/// Translate one `.ass` file end-to-end. Never panics outward: any internal
-/// error is converted into `RunEvent::Error` + `State(Failed)` and a failed
-/// [`FileResult`].
-pub async fn translate_file(job: FileJob<'_>) -> FileResult {
-    let file = job.file_name.clone();
-    let tx = job.tx.clone();
-    match run(job).await {
-        Ok(result) => result,
-        Err(message) => {
-            let _ = tx
-                .send(RunEvent::Error {
-                    file: file.clone(),
-                    message,
-                    error_kind: crate::events::ErrorKind::Other,
-                })
-                .await;
-            let _ = tx
-                .send(RunEvent::State {
-                    file: file.clone(),
-                    state: FileStateKind::Failed,
-                    detail: None,
-                })
-                .await;
-            FileResult {
-                file,
-                success: false,
-                total_lines: 0,
-                translated_lines: 0,
-                has_warnings: false,
-                issues: Vec::new(),
-                output_path: None,
-            }
-        }
-    }
+/// Stored translations to start from.
+#[derive(Debug, Clone, Default)]
+pub struct Seed {
+    /// Fingerprint of the source they were made from.
+    pub source_hash: String,
+    /// Line id → translation as written, tags in.
+    pub translations: BTreeMap<u32, String>,
 }
 
-async fn run(job: FileJob<'_>) -> Result<FileResult, String> {
-    // 1. Parse.
-    let original = decode_file(&job.input).map_err(|e| e.to_string())?;
-    let lines = parse_dialogues(&original);
-    let settings = BatchSettings {
-        pair: job.pair.clone(),
-        template: job.prompts.template.clone(),
-        tone_text: job.prompts.tone.clone(),
-    };
-    let mut st = FileState {
-        job: &job,
-        lines,
-        translations: BTreeMap::new(),
-        context: Vec::new(),
-        retries: 0,
-        settings,
-    };
+/// How one file ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileEnd {
+    Done,
+    NeedsLook,
+    /// It failed on its own; `reason` is one plain sentence.
+    Failed { reason: String, kind: ErrorKind },
+    /// The run stopped before it finished. Its translations so far are kept.
+    Stopped,
+}
 
-    st.emit(RunEvent::EpisodeLines {
-        file: job.file_name.clone(),
-        lines: episode_sources(&st.lines),
-    })
-    .await;
-    st.state(FileStateKind::Translating, None).await;
-    st.log(LogLevel::Info, LogPhase::Parse, format!("{} dialogue lines", st.lines.len())).await;
-    if st.lines.is_empty() {
-        return Err("no dialogue lines".into());
+/// A file's end, with what the results store keeps of it.
+#[derive(Debug)]
+pub struct FileOutcome {
+    pub result: FileResult,
+    pub end: FileEnd,
+    /// Every translation it has (tags in): all of a finished file's, the
+    /// partial ones of a stopped file, none of a failed one.
+    pub translations: BTreeMap<u32, String>,
+    /// Fingerprint of the source, when it could be read.
+    pub source_hash: Option<String>,
+    /// The output written next to the source, if any.
+    pub output_name: Option<String>,
+}
+
+/// Why a file didn't get to the end.
+#[derive(Debug)]
+enum FileError {
+    /// The run stopped (by the user, or by a fatal error here or elsewhere).
+    Stopped,
+    /// This file failed on its own.
+    Failed { message: String, kind: ErrorKind },
+}
+
+/// A finished file, before its events go out.
+struct Finished {
+    has_warnings: bool,
+    issues: Vec<VerifyIssue>,
+    output_name: String,
+    output_path: PathBuf,
+}
+
+/// Translate one `.ass` file end-to-end. Never panics outward: every way it
+/// can end becomes a [`FileOutcome`], with the matching events sent (a
+/// failure also sends `RunEvent::Error`; a stop sends `State(Stopped)`).
+pub async fn translate_file(job: FileJob<'_>) -> FileOutcome {
+    REQUEST_FILE.scope(job.file_name.clone(), translate_in_scope(job)).await
+}
+
+async fn translate_in_scope(job: FileJob<'_>) -> FileOutcome {
+    let original = match decode_file(&job.input) {
+        Ok(text) => text,
+        Err(e) => {
+            let st = FileState::new(&job, Vec::new());
+            let failed = FileError::Failed {
+                message: format!("Couldn't read this file: {e}"),
+                kind: ErrorKind::Other,
+            };
+            return st.finish(Err(failed), None).await;
+        }
+    };
+    let source_hash = fingerprint(&original);
+    let mut st = FileState::new(&job, parse_dialogues(&original));
+    if let Some(seed) = job.seed.as_ref().filter(|s| s.source_hash == source_hash) {
+        st.translations = st.valid(&seed.translations);
     }
-    let detector = SourceDetector::for_language(&job.pair.source);
-
-    // 2. Initial batch loop + 3. cleanup pass.
-    st.translate_all().await?;
-    st.run_cleanup(detector.as_ref()).await?;
-
-    // 4. Verify + scoped retranslation loop (`translator.py:176-311`).
-    let all_ids: Vec<u32> = (1..=st.lines.len() as u32).collect();
-    let mut issues: Vec<VerifyIssue> = Vec::new();
-    let mut has_warnings = false;
-    for attempt in 1..=MAX_RETRANSLATION_ATTEMPTS {
-        if job.cancel.is_cancelled() {
-            return Err("translation cancelled".into());
-        }
-        st.state(FileStateKind::Verifying, None).await;
-        let stripped = st.stripped_pairs();
-        let report =
-            verify_file(job.verify_svc, &stripped, &job.glossary.all_terms(), &job.prompts.verify).await;
-        let report = match report {
-            Ok(r) => r,
-            Err(e) => {
-                // Dead key mid-verify: fail the file and doom the run, mirroring
-                // translation's Fatal handling (pipeline.rs BatchOutcome::Fatal).
-                job.cancel.cancel();
-                return Err(format!("verification aborted: {e}"));
-            }
-        };
-        if report.issues.is_empty() {
-            break; // clean
-        }
-        if attempt == MAX_RETRANSLATION_ATTEMPTS {
-            issues = report.issues;
-            has_warnings = true;
-            break;
-        }
-        let scopes = scopes_for(&report, &all_ids);
-        if scopes.is_empty() {
-            issues = report.issues;
-            has_warnings = true;
-            break;
-        }
-        st.state(
-            FileStateKind::Retranslating,
-            Some(format!("attempt {attempt}/{MAX_RETRANSLATION_ATTEMPTS}")),
-        )
-        .await;
-        if is_full_file(&scopes, &all_ids) {
-            st.log(
-                LogLevel::Info,
-                LogPhase::Retranslate,
-                format!(
-                    "verify found {} issues — full retranslation (attempt {attempt}/{MAX_RETRANSLATION_ATTEMPTS})",
-                    report.issues.len()
-                ),
-            )
-            .await;
-            // Stash the prior (drift-flagged but complete) translations before
-            // clearing. If translate_all() comes back with fewer lines (e.g.
-            // provider outage kills batches mid-run), we backfill the gaps so
-            // the output is never *less* complete than what we already had.
-            // The backfilled lines are still flagged by the verifier, so
-            // has_warnings will be set — correct behaviour.
-            let prior = std::mem::take(&mut st.translations);
-            st.translate_all().await?;
-            // Backfill: keep any id that translate_all() did not produce.
-            for (id, t) in prior {
-                st.translations.entry(id).or_insert(t);
-            }
-        } else {
-            let ranges = scopes
-                .iter()
-                .map(|s| format!("{}-{}", s.start_line, s.end_line))
-                .collect::<Vec<_>>()
-                .join(", ");
-            st.log(
-                LogLevel::Info,
-                LogPhase::Retranslate,
-                format!(
-                    "verify found {} issues — retranslating scopes {ranges} (attempt {attempt}/{MAX_RETRANSLATION_ATTEMPTS})",
-                    report.issues.len()
-                ),
-            )
-            .await;
-            for scope in &scopes {
-                st.retranslate_scope(scope, attempt).await?;
-            }
-        }
-        // Re-run cleanup after any retranslation (`translator.py:307-311`).
-        st.run_cleanup(detector.as_ref()).await?;
-    }
-
-    // 5. Final write.
-    let untranslated = st.lines.len() - st.translations.len();
-    has_warnings |= untranslated > 0 || !issues.is_empty();
-
-    // Warning-only files (untranslated lines, no verify issues) must still be
-    // expandable in the UI: synthesize one issue per untranslated line
-    // (capped) AFTER the real verify issues, plus an aggregate overflow entry.
-    // FileDone and FileResult share this vec, so both stay identical.
-    if untranslated > 0 {
-        let missing: Vec<u32> = (1..=st.lines.len() as u32)
-            .filter(|id| !st.translations.contains_key(id))
-            .collect();
-        for id in missing.iter().take(MAX_UNTRANSLATED_ISSUES) {
-            issues.push(VerifyIssue {
-                line_id: *id,
-                source: strip_for_text(st.raw_text(*id)),
-                translation: String::new(),
-                issue_type: "untranslated".into(),
-                description: "line was not translated".into(),
-                severity: "warning".into(),
-                term: None,
-                expected: None,
-            });
-        }
-        if missing.len() > MAX_UNTRANSLATED_ISSUES {
-            issues.push(VerifyIssue {
-                line_id: 0,
-                source: String::new(),
-                translation: String::new(),
-                issue_type: "untranslated".into(),
-                description: format!(
-                    "…and {} more untranslated lines",
-                    missing.len() - MAX_UNTRANSLATED_ISSUES
-                ),
-                severity: "warning".into(),
-                term: None,
-                expected: None,
-            });
-        }
-    }
-
-    let name = if has_warnings {
-        warning_filename(&job.input, &job.pair)
-    } else {
-        output_filename(&job.input, &job.pair)
-    };
-    let path = match job.input.parent() {
-        Some(parent) => parent.join(name),
-        None => PathBuf::from(name),
-    };
-    // Untranslated lines are dropped, not written back as source text (spec).
-    let out_lines: Vec<DialogueLine> = st
-        .lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, d)| {
-            st.translations.get(&(idx as u32 + 1)).map(|t| {
-                let mut d = d.clone();
-                d.text = t.clone();
-                d
-            })
-        })
-        .collect();
-    write_translated(&path, &original, &out_lines).map_err(|e| e.to_string())?;
-
-    st.emit(RunEvent::FileDone {
-        file: job.file_name.clone(),
-        has_warnings,
-        issues: issues.clone(),
-    })
-    .await;
-    st.state(
-        if has_warnings { FileStateKind::Warning } else { FileStateKind::Done },
-        None,
-    )
-    .await;
-
-    Ok(FileResult {
-        file: job.file_name.clone(),
-        success: true,
-        total_lines: st.lines.len() as u32,
-        translated_lines: st.translations.len() as u32,
-        has_warnings,
-        issues,
-        output_path: Some(path.display().to_string()),
-    })
+    let result = st.run(&original).await;
+    st.finish(result, Some(source_hash)).await
 }
 
 /// Compute retranslation scopes from a verify report (`translator.py:242-251`).
@@ -347,6 +203,23 @@ fn scopes_for(report: &VerifyReport, all_ids: &[u32]) -> Vec<Scope> {
     compute_scopes(all_ids, &report.failed_line_ids, all_ids, SCOPE_PADDING)
 }
 
+/// Pure: the lines a reviewer asked for, as scopes of adjacent ids. Each
+/// scope's context is the translated lines just before it.
+pub fn review_scopes(ids: &[u32]) -> Vec<Scope> {
+    let sorted: BTreeSet<u32> = ids.iter().copied().collect();
+    let mut scopes: Vec<Scope> = Vec::new();
+    for id in sorted {
+        match scopes.last_mut() {
+            Some(s) if s.end_line + 1 == id => {
+                s.end_line = id;
+                s.context_end = id;
+            }
+            _ => scopes.push(Scope { start_line: id, end_line: id, context_start: id, context_end: id }),
+        }
+    }
+    scopes
+}
+
 /// Mutable per-file state threaded through the pipeline stages. Line ids are
 /// 1-based indexes into `lines` (id = index + 1), matching the Python parser.
 struct FileState<'j, 'a> {
@@ -358,10 +231,345 @@ struct FileState<'j, 'a> {
     /// capped at [`CONTEXT_CARRYOVER_LINES`]. Reset on every loop (re)entry.
     context: Vec<(String, String)>,
     retries: u32,
+    /// Why the last retry happened, in plain words.
+    retry_reason: Option<String>,
+    /// The kind of the last batch that brought nothing back.
+    last_failure: Option<ErrorKind>,
     settings: BatchSettings,
 }
 
-impl FileState<'_, '_> {
+impl<'j, 'a> FileState<'j, 'a> {
+    fn new(job: &'j FileJob<'a>, lines: Vec<DialogueLine>) -> Self {
+        Self {
+            job,
+            lines,
+            translations: BTreeMap::new(),
+            context: Vec::new(),
+            retries: 0,
+            retry_reason: None,
+            last_failure: None,
+            settings: BatchSettings {
+                pair: job.pair.clone(),
+                template: job.prompts.template.clone(),
+                tone_text: job.prompts.tone.clone(),
+            },
+        }
+    }
+
+    /// The stored translations that fit this file's lines.
+    fn valid(&self, stored: &BTreeMap<u32, String>) -> BTreeMap<u32, String> {
+        let last = self.lines.len() as u32;
+        stored
+            .iter()
+            .filter(|(id, _)| (1..=last).contains(*id))
+            .map(|(id, t)| (*id, t.clone()))
+            .collect()
+    }
+
+    async fn run(&mut self, original: &str) -> Result<Finished, FileError> {
+        let job = self.job;
+        // 1. Parse.
+        self.emit(RunEvent::EpisodeLines {
+            file: job.file_name.clone(),
+            lines: episode_sources(&self.lines),
+        })
+        .await;
+        if !self.translations.is_empty() {
+            let kept: Vec<u32> = self.translations.keys().copied().collect();
+            self.landed(&kept).await;
+            self.log(
+                LogLevel::Info,
+                LogPhase::Parse,
+                format!("carrying on: {} of {} lines already translated", kept.len(), self.lines.len()),
+            )
+            .await;
+        }
+        self.state(FileStateKind::Translating, None).await;
+        self.log(LogLevel::Info, LogPhase::Parse, format!("{} dialogue lines", self.lines.len())).await;
+        if self.lines.is_empty() {
+            return Err(FileError::Failed {
+                message: "This file has no dialogue lines.".into(),
+                kind: ErrorKind::Other,
+            });
+        }
+        let detector = SourceDetector::for_language(&job.pair.source);
+
+        // 2. Initial batch loop + 3. cleanup pass.
+        self.translate_all().await?;
+        if self.translations.is_empty() {
+            return Err(self.nothing_translated());
+        }
+        self.run_cleanup(detector.as_ref()).await?;
+
+        // 4. Verify + scoped retranslation loop (`translator.py:176-311`).
+        let all_ids: Vec<u32> = (1..=self.lines.len() as u32).collect();
+        let mut issues: Vec<VerifyIssue> = Vec::new();
+        let mut has_warnings = false;
+        for attempt in 1..=MAX_RETRANSLATION_ATTEMPTS {
+            if job.stop.is_stopped() {
+                return Err(FileError::Stopped);
+            }
+            self.state(FileStateKind::Verifying, None).await;
+            let stripped = self.stripped_pairs();
+            let report =
+                verify_file(job.verify_svc, &stripped, &job.glossary.all_terms(), &job.prompts.verify)
+                    .await;
+            let report = match report {
+                Ok(r) => r,
+                Err(e) if e.is_cancelled() || job.stop.is_stopped() => {
+                    return Err(FileError::Stopped)
+                }
+                // A dead key (or credit, or model) mid-verify stops the run,
+                // as it does in translation: never write unverified output.
+                Err(e) => {
+                    return Err(self.fatal(Step::Verify, job.verify_svc, e.kind(), e.to_string()).await)
+                }
+            };
+            if report.issues.is_empty() {
+                break; // clean
+            }
+            if attempt == MAX_RETRANSLATION_ATTEMPTS {
+                issues = report.issues;
+                has_warnings = true;
+                break;
+            }
+            let scopes = scopes_for(&report, &all_ids);
+            if scopes.is_empty() {
+                issues = report.issues;
+                has_warnings = true;
+                break;
+            }
+            self.state(
+                FileStateKind::Retranslating,
+                Some(format!("attempt {attempt}/{MAX_RETRANSLATION_ATTEMPTS}")),
+            )
+            .await;
+            if is_full_file(&scopes, &all_ids) {
+                self.log(
+                    LogLevel::Info,
+                    LogPhase::Retranslate,
+                    format!(
+                        "verify found {} issues — full retranslation (attempt {attempt}/{MAX_RETRANSLATION_ATTEMPTS})",
+                        report.issues.len()
+                    ),
+                )
+                .await;
+                // Stash the prior (drift-flagged but complete) translations before
+                // clearing. If translate_all() comes back with fewer lines (e.g.
+                // provider outage kills batches mid-run), we backfill the gaps so
+                // the output is never *less* complete than what we already had.
+                // The backfilled lines are still flagged by the verifier, so
+                // has_warnings will be set — correct behaviour. A stop mid-redo
+                // keeps them too.
+                let prior = std::mem::take(&mut self.translations);
+                let redo = self.translate_all().await;
+                // Backfill: keep any id that translate_all() did not produce.
+                for (id, t) in prior {
+                    self.translations.entry(id).or_insert(t);
+                }
+                redo?;
+            } else {
+                let ranges = scopes
+                    .iter()
+                    .map(|s| format!("{}-{}", s.start_line, s.end_line))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.log(
+                    LogLevel::Info,
+                    LogPhase::Retranslate,
+                    format!(
+                        "verify found {} issues — retranslating scopes {ranges} (attempt {attempt}/{MAX_RETRANSLATION_ATTEMPTS})",
+                        report.issues.len()
+                    ),
+                )
+                .await;
+                for scope in &scopes {
+                    self.retranslate_scope(scope, attempt, MAX_RETRANSLATION_ATTEMPTS).await?;
+                }
+            }
+            // Re-run cleanup after any retranslation (`translator.py:307-311`).
+            self.run_cleanup(detector.as_ref()).await?;
+        }
+
+        // 5. Final write.
+        let untranslated = self.lines.len() - self.translations.len();
+        has_warnings |= untranslated > 0 || !issues.is_empty();
+
+        // Warning-only files (untranslated lines, no verify issues) must still be
+        // expandable in the UI: synthesize one issue per untranslated line
+        // (capped) AFTER the real verify issues, plus an aggregate overflow entry.
+        // FileDone and FileResult share this vec, so both stay identical.
+        if untranslated > 0 {
+            let missing: Vec<u32> = (1..=self.lines.len() as u32)
+                .filter(|id| !self.translations.contains_key(id))
+                .collect();
+            for id in missing.iter().take(MAX_UNTRANSLATED_ISSUES) {
+                issues.push(VerifyIssue {
+                    line_id: *id,
+                    source: strip_for_text(self.raw_text(*id)),
+                    translation: String::new(),
+                    issue_type: "untranslated".into(),
+                    description: UNTRANSLATED_DESCRIPTION.into(),
+                    severity: "warning".into(),
+                    term: None,
+                    expected: None,
+                });
+            }
+            if missing.len() > MAX_UNTRANSLATED_ISSUES {
+                issues.push(VerifyIssue {
+                    line_id: 0,
+                    source: String::new(),
+                    translation: String::new(),
+                    issue_type: "untranslated".into(),
+                    description: format!(
+                        "…and {} more untranslated lines",
+                        missing.len() - MAX_UNTRANSLATED_ISSUES
+                    ),
+                    severity: "warning".into(),
+                    term: None,
+                    expected: None,
+                });
+            }
+        }
+
+        let output_name = if has_warnings {
+            warning_filename(&job.input, &job.pair)
+        } else {
+            output_filename(&job.input, &job.pair)
+        };
+        let output_path = self.write_output(original, &output_name)?;
+        Ok(Finished { has_warnings, issues, output_name, output_path })
+    }
+
+    /// Write every translated line next to the source. Untranslated lines are
+    /// dropped, not written back as source text (spec).
+    fn write_output(&self, original: &str, name: &str) -> Result<PathBuf, FileError> {
+        let path = match self.job.input.parent() {
+            Some(parent) => parent.join(name),
+            None => PathBuf::from(name),
+        };
+        let out_lines: Vec<DialogueLine> = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, d)| {
+                self.translations.get(&(idx as u32 + 1)).map(|t| {
+                    let mut d = d.clone();
+                    d.text = t.clone();
+                    d
+                })
+            })
+            .collect();
+        write_translated(&path, original, &out_lines).map_err(|e| FileError::Failed {
+            message: format!("Couldn't write {name}: {e}"),
+            kind: ErrorKind::Other,
+        })?;
+        Ok(path)
+    }
+
+    /// Send the file's last events and say how it ended.
+    async fn finish(self, result: Result<Finished, FileError>, source_hash: Option<String>) -> FileOutcome {
+        let file = self.job.file_name.clone();
+        let total_lines = self.lines.len() as u32;
+        let translated_lines = self.translations.len() as u32;
+        match result {
+            Ok(f) => {
+                self.emit(RunEvent::FileDone {
+                    file: file.clone(),
+                    has_warnings: f.has_warnings,
+                    issues: f.issues.clone(),
+                })
+                .await;
+                self.state(
+                    if f.has_warnings { FileStateKind::Warning } else { FileStateKind::Done },
+                    None,
+                )
+                .await;
+                FileOutcome {
+                    result: FileResult {
+                        file,
+                        success: true,
+                        total_lines,
+                        translated_lines,
+                        has_warnings: f.has_warnings,
+                        issues: f.issues,
+                        output_path: Some(f.output_path.display().to_string()),
+                    },
+                    end: if f.has_warnings { FileEnd::NeedsLook } else { FileEnd::Done },
+                    translations: self.translations,
+                    source_hash,
+                    output_name: Some(f.output_name),
+                }
+            }
+            Err(FileError::Stopped) => {
+                self.state(FileStateKind::Stopped, None).await;
+                FileOutcome {
+                    result: FileResult {
+                        file,
+                        success: false,
+                        total_lines,
+                        translated_lines,
+                        has_warnings: false,
+                        issues: Vec::new(),
+                        output_path: None,
+                    },
+                    end: FileEnd::Stopped,
+                    translations: self.translations,
+                    source_hash,
+                    output_name: None,
+                }
+            }
+            Err(FileError::Failed { message, kind }) => {
+                self.log(LogLevel::Error, LogPhase::Error, message.clone()).await;
+                self.emit(RunEvent::Error { file: file.clone(), message: message.clone(), error_kind: kind })
+                    .await;
+                self.state(FileStateKind::Failed, None).await;
+                FileOutcome {
+                    result: FileResult {
+                        file,
+                        success: false,
+                        total_lines,
+                        translated_lines: 0,
+                        has_warnings: false,
+                        issues: Vec::new(),
+                        output_path: None,
+                    },
+                    end: FileEnd::Failed { reason: message, kind },
+                    translations: BTreeMap::new(),
+                    source_hash,
+                    output_name: None,
+                }
+            }
+        }
+    }
+
+    /// An error no retry fixes: log it as it came, stop the run with a plain
+    /// cause, and end this file as stopped like every other unfinished one.
+    async fn fatal(&self, step: Step, svc: &LlmService, kind: ErrorKind, message: String) -> FileError {
+        self.log(LogLevel::Error, LogPhase::Error, format!("{} ({}): {message}", step.label(), svc.who()))
+            .await;
+        self.job.stop.by_error(StopCause {
+            kind,
+            step,
+            who: svc.who().to_string(),
+            model: svc.model().to_string(),
+        });
+        FileError::Stopped
+    }
+
+    /// Every batch came back empty-handed: say why in plain words.
+    fn nothing_translated(&self) -> FileError {
+        let who = self.job.svc.who();
+        let kind = self.last_failure.unwrap_or(ErrorKind::Other);
+        let message = match kind {
+            ErrorKind::RateLimit => format!("{who} kept asking us to slow down, and no line got translated."),
+            ErrorKind::Network => format!("Couldn't reach {who}, so no line got translated."),
+            ErrorKind::Server => format!("{who} kept failing on its side, so no line got translated."),
+            _ => "No reply could be used, so no line got translated.".to_string(),
+        };
+        FileError::Failed { message, kind }
+    }
+
     fn raw_text(&self, id: u32) -> &str {
         &self.lines[(id - 1) as usize].text
     }
@@ -392,9 +600,15 @@ impl FileState<'_, '_> {
             batch,
             total_batches,
             retries: self.retries,
-            retry_reason: None,
+            retry_reason: self.retry_reason.clone(),
         })
         .await;
+    }
+
+    /// A batch has to go again; say why on the next progress.
+    fn retried(&mut self, reason: &str) {
+        self.retries += 1;
+        self.retry_reason = Some(reason.to_string());
     }
 
     /// Live board: these ids just went to the model.
@@ -414,8 +628,8 @@ impl FileState<'_, '_> {
     }
 
     /// Live board: the request announced by the last `sending` is over. Not
-    /// sent after a Fatal outcome: that returns Err, and the Error event
-    /// settles the board instead.
+    /// sent after a fatal outcome or a stop: the file's final state settles
+    /// the board instead.
     async fn idle(&self) {
         self.emit(RunEvent::Idle { file: self.job.file_name.clone() }).await;
     }
@@ -432,8 +646,8 @@ impl FileState<'_, '_> {
     /// The batch loop (`translator.py:399-581`): translate every line not yet
     /// in `translations`, halving the batch size on failure, carrying the last
     /// ≤7 translated pairs forward as context. Also serves the full-redo path
-    /// (caller clears `translations` first).
-    async fn translate_all(&mut self) -> Result<(), String> {
+    /// (caller clears `translations` first) and Resume (seeded lines skip).
+    async fn translate_all(&mut self) -> Result<(), FileError> {
         let mut pending: Vec<u32> = (1..=self.lines.len() as u32)
             .filter(|id| !self.translations.contains_key(id))
             .collect();
@@ -443,8 +657,8 @@ impl FileState<'_, '_> {
         let mut total_batches = pending.len().div_ceil(batch_size as usize) as u32;
 
         while !pending.is_empty() {
-            if self.job.cancel.is_cancelled() {
-                return Err("translation cancelled".into());
+            if self.job.stop.is_stopped() {
+                return Err(FileError::Stopped);
             }
             batch_num += 1;
             let n = (batch_size as usize).min(pending.len());
@@ -511,7 +725,7 @@ impl FileState<'_, '_> {
                         .await;
                     }
                 }
-                BatchOutcome::Partial { translated, failed_from } => {
+                BatchOutcome::Partial { translated, failed_from, reason } => {
                     let merged: Vec<u32> = translated.keys().copied().collect();
                     let merged_count = merged.len();
                     self.translations.extend(translated);
@@ -526,7 +740,7 @@ impl FileState<'_, '_> {
                         .collect();
                     requeue.append(&mut pending);
                     pending = requeue;
-                    self.retries += 1;
+                    self.retried(reason);
                     self.state(
                         FileStateKind::Retranslating,
                         Some(format!("partial batch {batch_num}")),
@@ -549,9 +763,14 @@ impl FileState<'_, '_> {
                         }
                     }
                 }
-                BatchOutcome::Failure(message) => {
-                    self.retries += 1;
-                    self.log(LogLevel::Warning, LogPhase::Batch, message).await;
+                // The run stopped while the request was out: nothing failed.
+                BatchOutcome::Failure(f) if f.cancelled || self.job.stop.is_stopped() => {
+                    return Err(FileError::Stopped);
+                }
+                BatchOutcome::Failure(f) => {
+                    self.retried(f.reason);
+                    self.last_failure = Some(f.kind);
+                    self.log(LogLevel::Warning, LogPhase::Batch, f.message).await;
                     match halved(batch_size) {
                         Some(s) => {
                             batch_size = s;
@@ -573,10 +792,9 @@ impl FileState<'_, '_> {
                         }
                     }
                 }
-                BatchOutcome::Fatal(message) => {
-                    // Auth death: the whole run is doomed — stop everything.
-                    self.job.cancel.cancel();
-                    return Err(message);
+                BatchOutcome::Fatal(f) => {
+                    // A dead key (or credit, or model): the whole run is doomed.
+                    return Err(self.fatal(Step::Translate, self.job.svc, f.kind, f.message).await);
                 }
             }
             self.idle().await;
@@ -586,7 +804,7 @@ impl FileState<'_, '_> {
 
     /// Cleanup pass for residual source text (`translator.py:583-684`). No-op
     /// when the source language has no character pattern (detector is None).
-    async fn run_cleanup(&mut self, detector: Option<&SourceDetector>) -> Result<(), String> {
+    async fn run_cleanup(&mut self, detector: Option<&SourceDetector>) -> Result<(), FileError> {
         let Some(det) = detector else { return Ok(()) };
         self.state(FileStateKind::Cleanup, None).await;
         let sources: BTreeMap<u32, String> = self
@@ -617,9 +835,12 @@ impl FileState<'_, '_> {
         )
         .await;
         self.landed(&report.cleaned).await;
-        if let Some(msg) = report.fatal {
-            self.job.cancel.cancel();
-            return Err(format!("cleanup aborted: {msg}"));
+        if let Some(f) = report.fatal {
+            let message = format!("cleanup: {}", f.message);
+            return Err(self.fatal(Step::Translate, self.job.svc, f.kind, message).await);
+        }
+        if self.job.stop.is_stopped() {
+            return Err(FileError::Stopped);
         }
         if announced {
             self.idle().await;
@@ -645,14 +866,20 @@ impl FileState<'_, '_> {
     /// Retranslate one scope with up-to-7 preceding translated pairs as
     /// context (`translator.py:687-778`, simplified: only the scope lines are
     /// re-sent; the padding region supplies context instead of being
-    /// retranslated and filtered back out).
+    /// retranslated and filtered back out). Returns the ids that got new text.
     ///
     /// Deviation from Python: scope lines are chunked by `initial_batch_size`
     /// (sequential, merging each outcome) so large scopes don't blow the
     /// model's context window.
     ///
-    /// `attempt` is the verify loop's, for the live board's activity line.
-    async fn retranslate_scope(&mut self, scope: &Scope, attempt: u32) -> Result<(), String> {
+    /// `attempt` / `max_attempts` are the verify loop's (1 of 1 for a
+    /// reviewer's request), for the live board's activity line.
+    async fn retranslate_scope(
+        &mut self,
+        scope: &Scope,
+        attempt: u32,
+        max_attempts: u32,
+    ) -> Result<Vec<u32>, FileError> {
         let mut context: Vec<(String, String)> = self
             .translations
             .range(..scope.context_start)
@@ -666,14 +893,18 @@ impl FileState<'_, '_> {
             .filter(|id| *id >= 1 && *id <= last_id)
             .map(|id| (id, self.raw_text(id).to_string()))
             .collect();
+        let mut landed = Vec::new();
         if raw.is_empty() {
-            return Ok(());
+            return Ok(landed);
         }
         let chunk_size = initial_batch_size(self.job.batch_limit) as usize;
         for chunk in raw.chunks(chunk_size) {
+            if self.job.stop.is_stopped() {
+                return Err(FileError::Stopped);
+            }
             self.sending(
                 chunk.iter().map(|(id, _)| *id).collect(),
-                EpisodeActivity::Retranslate { attempt, max_attempts: MAX_RETRANSLATION_ATTEMPTS },
+                EpisodeActivity::Retranslate { attempt, max_attempts },
             )
             .await;
             match translate_batch_tagged(
@@ -690,19 +921,178 @@ impl FileState<'_, '_> {
                     let merged: Vec<u32> = map.keys().copied().collect();
                     self.translations.extend(map);
                     self.landed(&merged).await;
+                    landed.extend(merged);
                 }
-                BatchOutcome::Failure(message) => {
-                    self.log(LogLevel::Warning, LogPhase::Retranslate, message).await;
+                BatchOutcome::Failure(f) if f.cancelled || self.job.stop.is_stopped() => {
+                    return Err(FileError::Stopped);
+                }
+                BatchOutcome::Failure(f) => {
+                    self.retried(f.reason);
+                    self.log(LogLevel::Warning, LogPhase::Retranslate, f.message).await;
                     // Log and continue to the next chunk; don't abort the scope.
                 }
-                BatchOutcome::Fatal(message) => {
-                    self.job.cancel.cancel();
-                    return Err(message);
+                BatchOutcome::Fatal(f) => {
+                    return Err(self.fatal(Step::Translate, self.job.svc, f.kind, f.message).await);
                 }
             }
             self.idle().await;
         }
-        Ok(())
+        Ok(landed)
+    }
+}
+
+// ── review: retranslate chosen lines of a finished episode ──────────────────
+
+/// A reviewer's request to retranslate some lines of a finished episode.
+pub struct ReviewJob<'a> {
+    /// `seed` holds the episode's stored translations (required).
+    pub job: FileJob<'a>,
+    pub line_ids: Vec<u32>,
+    /// The output to rewrite, next to the source.
+    pub output_name: String,
+    /// Issues still open before this; those on lines that get new text go.
+    pub issues: Vec<VerifyIssue>,
+    /// The episode still needs a look (its output is the `.warning` file).
+    pub needs_look: bool,
+}
+
+/// How a review retranslation went.
+#[derive(Debug)]
+pub struct ReviewOutcome {
+    pub result: FileResult,
+    /// Every translation the episode has now (tags in).
+    pub translations: BTreeMap<u32, String>,
+    /// Issues still open.
+    pub issues: Vec<VerifyIssue>,
+    /// Lines that got new text.
+    pub retranslated: Vec<u32>,
+    /// Why nothing could be done (unreadable or changed source, a write
+    /// error), as one plain sentence. Nothing was written or stored.
+    pub failed: Option<String>,
+}
+
+/// Retranslate just `line_ids`, each run of adjacent lines as one scope with
+/// the translated lines before it as context, then rewrite the output with
+/// everything else as it was. Runs as a small run: the episode's events go
+/// out like any file's, ending in its previous state (done or needs a look).
+pub async fn retranslate_episode_lines(review: ReviewJob<'_>) -> ReviewOutcome {
+    REQUEST_FILE.scope(review.job.file_name.clone(), review_in_scope(review)).await
+}
+
+async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
+    let job = &review.job;
+    let fail = |st: &FileState<'_, '_>, message: String| ReviewOutcome {
+        result: FileResult {
+            file: job.file_name.clone(),
+            success: false,
+            total_lines: st.lines.len() as u32,
+            translated_lines: 0,
+            has_warnings: review.needs_look,
+            issues: review.issues.clone(),
+            output_path: None,
+        },
+        translations: BTreeMap::new(),
+        issues: review.issues.clone(),
+        retranslated: Vec::new(),
+        failed: Some(message),
+    };
+    let original = match decode_file(&job.input) {
+        Ok(text) => text,
+        Err(e) => {
+            let st = FileState::new(job, Vec::new());
+            let message = format!("Couldn't read the original file: {e}");
+            st.emit(RunEvent::Error {
+                file: job.file_name.clone(),
+                message: message.clone(),
+                error_kind: ErrorKind::Other,
+            })
+            .await;
+            st.state(FileStateKind::Failed, None).await;
+            return fail(&st, message);
+        }
+    };
+    let mut st = FileState::new(job, parse_dialogues(&original));
+    let prior_state = if review.needs_look { FileStateKind::Warning } else { FileStateKind::Done };
+    let seed = job.seed.as_ref().filter(|s| s.source_hash == fingerprint(&original));
+    let Some(seed) = seed else {
+        let message =
+            "The original file changed since it was translated. Translate it again to review it."
+                .to_string();
+        st.emit(RunEvent::Error {
+            file: job.file_name.clone(),
+            message: message.clone(),
+            error_kind: ErrorKind::Other,
+        })
+        .await;
+        st.state(prior_state, None).await;
+        return fail(&st, message);
+    };
+    st.translations = st.valid(&seed.translations);
+
+    st.emit(RunEvent::EpisodeLines { file: job.file_name.clone(), lines: episode_sources(&st.lines) })
+        .await;
+    let kept: Vec<u32> = st.translations.keys().copied().collect();
+    st.landed(&kept).await;
+
+    let last = st.lines.len() as u32;
+    let ids: Vec<u32> = review.line_ids.iter().copied().filter(|id| (1..=last).contains(id)).collect();
+    let scopes = review_scopes(&ids);
+    let detail = match ids.len() {
+        1 => format!("line {}", ids[0]),
+        n => format!("{n} lines"),
+    };
+    st.state(FileStateKind::Retranslating, Some(detail)).await;
+
+    let mut retranslated: Vec<u32> = Vec::new();
+    let total = scopes.len() as u32;
+    for (i, scope) in scopes.iter().enumerate() {
+        match st.retranslate_scope(scope, 1, 1).await {
+            Ok(ids) => retranslated.extend(ids),
+            // Stopped: keep what landed; the run says why.
+            Err(_) => break,
+        }
+        st.progress(i as u32 + 1, total).await;
+    }
+    retranslated.sort_unstable();
+    retranslated.dedup();
+
+    let fixed: BTreeSet<u32> = retranslated.iter().copied().collect();
+    let issues: Vec<VerifyIssue> =
+        review.issues.iter().filter(|i| !fixed.contains(&i.line_id)).cloned().collect();
+    let mut output_path = None;
+    if !retranslated.is_empty() {
+        match st.write_output(&original, &review.output_name) {
+            Ok(path) => output_path = Some(path.display().to_string()),
+            Err(FileError::Failed { message, kind }) => {
+                st.emit(RunEvent::Error { file: job.file_name.clone(), message: message.clone(), error_kind: kind })
+                    .await;
+                st.state(prior_state, None).await;
+                return fail(&st, message);
+            }
+            Err(FileError::Stopped) => unreachable!("writing never stops"),
+        }
+    }
+    st.emit(RunEvent::FileDone {
+        file: job.file_name.clone(),
+        has_warnings: review.needs_look,
+        issues: issues.clone(),
+    })
+    .await;
+    st.state(prior_state, None).await;
+    ReviewOutcome {
+        result: FileResult {
+            file: job.file_name.clone(),
+            success: true,
+            total_lines: last,
+            translated_lines: st.translations.len() as u32,
+            has_warnings: review.needs_look,
+            issues: issues.clone(),
+            output_path,
+        },
+        translations: st.translations,
+        issues,
+        retranslated,
+        failed: None,
     }
 }
 
@@ -715,7 +1105,6 @@ mod tests {
     use crate::llm::test_support::ScriptedDriver;
     use crate::models::language_pair::LanguagePair;
     use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
 
     fn ass_source(lines: &[&str]) -> String {
         let mut s = String::from(
@@ -740,13 +1129,26 @@ mod tests {
         format!("[{}]", items.join(","))
     }
 
-    async fn run_pipeline(
+    /// One file through the pipeline, with everything a test may look at.
+    struct Ran {
+        outcome: FileOutcome,
+        events: Vec<RunEvent>,
+        driver: std::sync::Arc<ScriptedDriver>,
+        /// Keeps the temp folder (source and output) alive.
+        dir: tempfile::TempDir,
+        stop: RunStop,
+    }
+
+    async fn run_with(
         source: &str,
         responses: Vec<Result<String, crate::llm::error::LlmError>>,
-    ) -> (FileResult, Vec<RunEvent>, std::sync::Arc<ScriptedDriver>, tempfile::TempDir) {
+        seed: Option<Seed>,
+    ) -> Ran {
         let driver = ScriptedDriver::new(responses);
         let (tx, mut rx) = mpsc::channel(256);
-        let svc = LlmService::new(driver.clone(), 2, CancellationToken::new(), tx.clone());
+        let stop = RunStop::default();
+        let svc = LlmService::new(driver.clone(), 2, stop.token().clone(), tx.clone())
+            .with_provider("Anthropic");
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("ep01.ass");
         std::fs::write(&input, source).unwrap();
@@ -756,7 +1158,7 @@ mod tests {
         );
 
         // One scripted driver behind both steps, so a script reads in call order.
-        let result = translate_file(FileJob {
+        let outcome = translate_file(FileJob {
             input: input.clone(),
             file_name: "ep01.ass".into(),
             svc: &svc,
@@ -765,8 +1167,9 @@ mod tests {
             pair: LanguagePair::from_codes("zh", "en").unwrap(),
             prompts: &prompts,
             batch_limit: Some(100),
-            cancel: CancellationToken::new(),
+            stop: stop.clone(),
             tx: tx.clone(),
+            seed,
         })
         .await;
 
@@ -776,9 +1179,17 @@ mod tests {
         while let Some(e) = rx.recv().await {
             events.push(e);
         }
+        Ran { outcome, events, driver, dir, stop }
+    }
+
+    async fn run_pipeline(
+        source: &str,
+        responses: Vec<Result<String, crate::llm::error::LlmError>>,
+    ) -> (FileResult, Vec<RunEvent>, std::sync::Arc<ScriptedDriver>, tempfile::TempDir) {
+        let ran = run_with(source, responses, None).await;
         // Return `dir` so callers keep it alive for as long as needed (e.g.
         // reading the output file). Bind to `_dir` when not needed.
-        (result, events, driver, dir)
+        (ran.outcome.result, ran.events, ran.driver, ran.dir)
     }
 
     #[tokio::test]
@@ -806,11 +1217,13 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, RunEvent::FileDone { has_warnings: false, .. })));
     }
 
-    /// The live-board events, in order, as compact tags.
+    /// The live-board events, in order, as compact tags. The service's
+    /// request timing events are left out (see `requests_tell_the_board…`).
     fn board_events(events: &[RunEvent]) -> Vec<String> {
         events
             .iter()
             .filter(|e| e.is_internal())
+            .filter(|e| !matches!(e, RunEvent::RequestSent { .. } | RunEvent::RequestWaiting { .. }))
             .map(|e| match e {
                 RunEvent::EpisodeLines { lines, .. } => format!("lines {}", lines.len()),
                 RunEvent::Sending { ids, activity, .. } => format!("sending {ids:?} {activity:?}"),
@@ -907,7 +1320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fatal_cleanup_leaves_the_board_to_the_error_event() {
+    async fn fatal_cleanup_leaves_the_board_to_the_stopped_state() {
         let src = ass_source(&["你好"]);
         let (_, events, _, _dir) = run_pipeline(
             &src,
@@ -921,7 +1334,7 @@ mod tests {
             ],
         )
         .await;
-        // No Idle after the cleanup request: the Error event settles the board.
+        // No Idle after the cleanup request: the Stopped state settles the board.
         assert_eq!(
             board_events(&events),
             vec![
@@ -932,7 +1345,7 @@ mod tests {
                 "sending [1] Cleanup".into(),
             ]
         );
-        assert!(matches!(events.last(), Some(RunEvent::State { state: FileStateKind::Failed, .. })));
+        assert!(matches!(events.last(), Some(RunEvent::State { state: FileStateKind::Stopped, .. })));
     }
 
     #[tokio::test]
@@ -1025,9 +1438,9 @@ mod tests {
             Ok(r#"{"issues":[]}"#.into()),
         ]);
         let (tx, _rx) = mpsc::channel(256);
-        let cancel = CancellationToken::new();
-        let svc = LlmService::new(translator.clone(), 2, cancel.clone(), tx.clone());
-        let verify_svc = LlmService::new(verifier.clone(), 2, cancel.clone(), tx.clone());
+        let stop = RunStop::default();
+        let svc = LlmService::new(translator.clone(), 2, stop.token().clone(), tx.clone());
+        let verify_svc = LlmService::new(verifier.clone(), 2, stop.token().clone(), tx.clone());
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("ep01.ass");
         std::fs::write(&input, &src).unwrap();
@@ -1043,10 +1456,12 @@ mod tests {
             pair,
             prompts: &prompts,
             batch_limit: Some(100),
-            cancel,
+            stop,
             tx,
+            seed: None,
         })
-        .await;
+        .await
+        .result;
         assert!(result.success && !result.has_warnings, "{result:?}");
         assert_eq!((translator.call_count(), verifier.call_count()), (2, 2));
         // The redo of line 6 went to Translate; the checks to Verify.
@@ -1190,9 +1605,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dead_key_during_verify_fails_file_not_silent_clean() {
+    async fn dead_key_during_verify_stops_the_run_not_silent_clean() {
         let src = ass_source(&["你好", "再见"]);
-        let (result, events, _, _dir) = run_pipeline(
+        let ran = run_with(
             &src,
             vec![
                 Ok(ok_batch(&[(1, "Hello there friend"), (2, "Goodbye for now")])),
@@ -1202,22 +1617,34 @@ mod tests {
                     retry_after: None,
                 }),
             ],
+            None,
         )
         .await;
+        let result = &ran.outcome.result;
         assert!(!result.success);
         assert!(result.output_path.is_none());
-        assert!(events.iter().any(|e| matches!(
+        assert_eq!(ran.outcome.end, FileEnd::Stopped);
+        // Both lines were translated: kept for Resume.
+        assert_eq!(ran.outcome.translations.len(), 2);
+        assert_eq!(result.translated_lines, 2);
+        let info = ran.stop.info().expect("the run stopped");
+        assert_eq!(info.message, "Anthropic rejected the API key used for Verify.");
+        assert_eq!((info.kind, info.step), (Some(ErrorKind::Auth), Some(Step::Verify)));
+        // Not a failure of this file, and the raw error reaches the log.
+        assert!(!ran.events.iter().any(|e| matches!(e, RunEvent::Error { .. })));
+        assert!(ran.events.iter().any(|e| matches!(
             e,
-            RunEvent::Error { message, .. } if message.contains("verification aborted")
+            RunEvent::Log { level: LogLevel::Error, message, .. } if message.contains("dead key")
         )));
+        assert!(!ran.dir.path().join("ep01.eng.ass").exists());
     }
 
     #[tokio::test]
-    async fn dead_key_during_cleanup_fails_file() {
+    async fn dead_key_during_cleanup_stops_the_run() {
         let src = ass_source(&["你好"]);
         // The translated text still contains source-language characters, so the
         // cleanup pass fires; its single request dies with 401.
-        let (result, events, _, _dir) = run_pipeline(
+        let ran = run_with(
             &src,
             vec![
                 Ok(ok_batch(&[(1, "还是中文 leftover")])),
@@ -1227,12 +1654,16 @@ mod tests {
                     retry_after: None,
                 }),
             ],
+            None,
         )
         .await;
-        assert!(!result.success);
-        assert!(events.iter().any(|e| matches!(
+        assert!(!ran.outcome.result.success);
+        assert_eq!(ran.outcome.end, FileEnd::Stopped);
+        let cause = ran.stop.cause().expect("a cause");
+        assert_eq!((cause.kind, cause.step), (ErrorKind::Auth, Step::Translate));
+        assert!(ran.events.iter().any(|e| matches!(
             e,
-            RunEvent::Error { message, .. } if message.contains("cleanup aborted")
+            RunEvent::Log { level: LogLevel::Error, message, .. } if message.contains("cleanup")
         )));
     }
 
@@ -1301,10 +1732,10 @@ mod tests {
     async fn cancellation_stops_between_batches() {
         let src = ass_source(&["你好", "再见"]);
         let driver = ScriptedDriver::new(vec![Ok(ok_batch(&[(1, "Hello")]))]);
-        let (tx, _rx) = mpsc::channel(256);
-        let cancel = CancellationToken::new();
-        let svc = LlmService::new(driver, 2, cancel.clone(), tx.clone());
-        cancel.cancel();
+        let (tx, mut rx) = mpsc::channel(256);
+        let stop = RunStop::default();
+        let svc = LlmService::new(driver, 2, stop.token().clone(), tx.clone());
+        stop.by_user();
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("ep01.ass");
         std::fs::write(&input, &src).unwrap();
@@ -1312,7 +1743,7 @@ mod tests {
             &LanguagePair::from_codes("zh", "en").unwrap(),
             crate::config::projects::Tone::Standard,
         );
-        let result = translate_file(FileJob {
+        let outcome = translate_file(FileJob {
             input,
             file_name: "ep01.ass".into(),
             svc: &svc,
@@ -1321,12 +1752,22 @@ mod tests {
             pair: LanguagePair::from_codes("zh", "en").unwrap(),
             prompts: &prompts,
             batch_limit: Some(100),
-            cancel,
+            stop,
             tx,
+            seed: None,
         })
         .await;
-        assert!(!result.success);
-        assert!(result.output_path.is_none());
+        assert!(!outcome.result.success);
+        assert!(outcome.result.output_path.is_none());
+        // Stopped, not failed: no Error, a Stopped state.
+        assert_eq!(outcome.end, FileEnd::Stopped);
+        drop(svc);
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::Error { .. })));
+        assert!(matches!(events.last(), Some(RunEvent::State { state: FileStateKind::Stopped, .. })));
     }
 
     #[tokio::test]
@@ -1354,5 +1795,349 @@ mod tests {
             .expect("FileDone with warnings");
         assert_eq!(done_issues.len(), result.issues.len());
         assert_eq!(done_issues[0].issue_type, "meaning");
+    }
+    /// Stops the run (as the user's Stop would) on its `at`-th request.
+    struct StopOnCall {
+        inner: std::sync::Arc<ScriptedDriver>,
+        at: u32,
+        calls: std::sync::atomic::AtomicU32,
+        stop: RunStop,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmDriver for StopOnCall {
+        async fn complete(&self, _s: &str, _u: &str) -> Result<String, crate::llm::error::LlmError> {
+            unreachable!()
+        }
+        async fn stream(
+            &self,
+            req: &crate::llm::LlmRequest,
+        ) -> Result<crate::llm::LlmResponse, crate::llm::error::LlmError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.at {
+                self.stop.by_user();
+                return Err(crate::llm::error::LlmError::Transport(
+                    crate::llm::error::CANCELLED_MSG.into(),
+                ));
+            }
+            self.inner.stream(req).await
+        }
+        async fn list_models(&self) -> Result<Vec<String>, crate::llm::error::LlmError> {
+            Ok(vec![])
+        }
+        fn model(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    fn twelve() -> String {
+        ass_source(&["你好", "再见", "走吧", "好的", "不行", "可以", "什么", "哪里", "怎么", "为何", "真的", "假的"])
+    }
+
+    #[tokio::test]
+    async fn a_stop_mid_run_keeps_the_finished_batch_and_says_stopped() {
+        let src = twelve();
+        let first: Vec<(u32, &str)> = (1..=10).map(|i| (i, "A clean English line here")).collect();
+        let stop = RunStop::default();
+        let driver = std::sync::Arc::new(StopOnCall {
+            inner: ScriptedDriver::new(vec![Ok(ok_batch(&first))]),
+            at: 2,
+            calls: Default::default(),
+            stop: stop.clone(),
+        });
+        let (tx, mut rx) = mpsc::channel(256);
+        let svc = LlmService::new(driver, 2, stop.token().clone(), tx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ep01.ass"), &src).unwrap();
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+        let prompts =
+            crate::prompts::TranslationPrompts::defaults(&pair, crate::config::projects::Tone::Standard);
+        let outcome = translate_file(FileJob {
+            input: dir.path().join("ep01.ass"),
+            file_name: "ep01.ass".into(),
+            svc: &svc,
+            verify_svc: &svc,
+            glossary: &Glossary::default(),
+            pair,
+            prompts: &prompts,
+            batch_limit: Some(10),
+            stop: stop.clone(),
+            tx,
+            seed: None,
+        })
+        .await;
+        drop(svc);
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        assert_eq!(outcome.end, FileEnd::Stopped);
+        assert_eq!(outcome.translations.len(), 10, "the finished batch is kept");
+        assert_eq!((outcome.result.translated_lines, outcome.result.total_lines), (10, 12));
+        assert!(outcome.source_hash.is_some());
+        assert!(outcome.output_name.is_none());
+        assert!(!events.iter().any(|e| matches!(e, RunEvent::Error { .. })), "not a failure");
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            RunEvent::Log { message, .. } if message.contains("cancelled")
+        )));
+        assert!(matches!(events.last(), Some(RunEvent::State { state: FileStateKind::Stopped, .. })));
+        assert!(stop.info().unwrap().by_user);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no output written");
+    }
+
+    #[tokio::test]
+    async fn resume_sends_only_the_missing_lines() {
+        let src = ass_source(&["你好", "再见", "走吧"]);
+        let seed = Seed {
+            source_hash: fingerprint(&src),
+            translations: [(1, "Hello there friend".to_string()), (2, "Goodbye for now".to_string())]
+                .into(),
+        };
+        let ran = run_with(
+            &src,
+            vec![Ok(ok_batch(&[(3, "Off we go now")])), Ok(r#"{"issues":[]}"#.into())],
+            Some(seed),
+        )
+        .await;
+        assert_eq!(ran.outcome.end, FileEnd::Done);
+        assert_eq!(ran.outcome.result.translated_lines, 3);
+        assert_eq!(ran.driver.call_count(), 2);
+        let written =
+            std::fs::read_to_string(ran.dir.path().join("ep01.eng.ass")).unwrap();
+        assert!(written.contains("Hello there friend") && written.contains("Off we go now"));
+        // The window sees the kept lines at once, then only line 3 goes out.
+        assert_eq!(
+            board_events(&ran.events)[..3],
+            [
+                "lines 3".to_string(),
+                r#"landed [(1, "Hello there friend"), (2, "Goodbye for now")]"#.into(),
+                "sending [3] Batch { batch: 1, total_batches: 1 }".into(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seed_from_another_version_of_the_file_is_ignored() {
+        let src = ass_source(&["你好", "再见"]);
+        let seed = Seed {
+            source_hash: fingerprint("an older file"),
+            translations: [(1, "Stale".to_string())].into(),
+        };
+        let ran = run_with(
+            &src,
+            vec![
+                Ok(ok_batch(&[(1, "Hello there friend"), (2, "Goodbye for now")])),
+                Ok(r#"{"issues":[]}"#.into()),
+            ],
+            Some(seed),
+        )
+        .await;
+        assert_eq!(ran.outcome.translations[&1], "Hello there friend");
+        assert!(ran.driver.last_request().is_some());
+    }
+
+    #[tokio::test]
+    async fn retries_say_why() {
+        let src = ass_source(&["你好", "再见", "走吧"]);
+        let (_, events, _, _dir) = run_pipeline(
+            &src,
+            vec![
+                Ok(ok_batch(&[(1, "Hello my good friend")])), // 2 and 3 missing
+                Ok(ok_batch(&[(2, "Goodbye then friend"), (3, "Off we go now")])),
+                Ok(r#"{"issues":[]}"#.into()),
+            ],
+        )
+        .await;
+        let reasons: Vec<Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::Progress { retries, retry_reason, .. } if *retries > 0 => Some(retry_reason.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!reasons.is_empty());
+        assert!(reasons.iter().all(|r| r.as_deref() == Some(crate::translation::batch::REASON_INCOMPLETE)));
+    }
+
+    #[tokio::test]
+    async fn nothing_translated_is_a_failure_with_a_reason() {
+        let src = ass_source(&["你好", "再见"]);
+        let responses: Vec<_> = (0..30).map(|_| Ok("not json at all".to_string())).collect();
+        let ran = run_with(&src, responses, None).await;
+        match &ran.outcome.end {
+            FileEnd::Failed { reason, kind } => {
+                assert_eq!(*kind, ErrorKind::Other);
+                assert!(reason.contains("no line got translated"), "{reason}");
+            }
+            other => panic!("expected failed, got {other:?}"),
+        }
+        assert!(ran.events.iter().any(|e| matches!(
+            e,
+            RunEvent::Error { message, error_kind: ErrorKind::Other, .. } if message.contains("no line got translated")
+        )));
+        assert!(ran.stop.info().is_none(), "one file failing doesn't stop the run");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_file_fails_on_its_own() {
+        let driver = ScriptedDriver::new(vec![]);
+        let (tx, mut rx) = mpsc::channel(64);
+        let stop = RunStop::default();
+        let svc = LlmService::new(driver, 2, stop.token().clone(), tx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+        let prompts =
+            crate::prompts::TranslationPrompts::defaults(&pair, crate::config::projects::Tone::Standard);
+        let outcome = translate_file(FileJob {
+            input: dir.path().join("gone.ass"),
+            file_name: "gone.ass".into(),
+            svc: &svc,
+            verify_svc: &svc,
+            glossary: &Glossary::default(),
+            pair,
+            prompts: &prompts,
+            batch_limit: None,
+            stop,
+            tx,
+            seed: None,
+        })
+        .await;
+        drop(svc);
+        assert!(matches!(&outcome.end, FileEnd::Failed { reason, .. } if reason.starts_with("Couldn't read this file")));
+        assert!(outcome.source_hash.is_none());
+        let mut kinds = Vec::new();
+        while let Some(e) = rx.recv().await {
+            if let RunEvent::Error { error_kind, .. } = e {
+                kinds.push(error_kind);
+            }
+        }
+        assert_eq!(kinds, [ErrorKind::Other]);
+    }
+
+    #[tokio::test]
+    async fn requests_tell_the_board_when_they_really_go_out() {
+        let src = ass_source(&["你好", "再见"]);
+        let (_, events, _, _dir) = run_pipeline(
+            &src,
+            vec![
+                Ok(ok_batch(&[(1, "Hello there friend"), (2, "Goodbye for now")])),
+                Ok(r#"{"issues":[]}"#.into()),
+            ],
+        )
+        .await;
+        let first_sending = events.iter().position(|e| matches!(e, RunEvent::Sending { .. })).unwrap();
+        let first_sent = events.iter().position(|e| matches!(e, RunEvent::RequestSent { .. })).unwrap();
+        let first_landed = events.iter().position(|e| matches!(e, RunEvent::Landed { .. })).unwrap();
+        assert!(first_sending < first_sent && first_sent < first_landed);
+    }
+
+    #[test]
+    fn review_scopes_group_adjacent_lines() {
+        let scopes = review_scopes(&[9, 3, 4, 4, 12]);
+        let spans: Vec<(u32, u32, u32)> =
+            scopes.iter().map(|s| (s.start_line, s.end_line, s.context_start)).collect();
+        assert_eq!(spans, [(3, 4, 3), (9, 9, 9), (12, 12, 12)]);
+    }
+
+    async fn review(
+        src: &str,
+        stored: &[(u32, &str)],
+        hash: String,
+        ids: Vec<u32>,
+        responses: Vec<Result<String, crate::llm::error::LlmError>>,
+    ) -> (ReviewOutcome, Vec<RunEvent>, std::sync::Arc<ScriptedDriver>, tempfile::TempDir) {
+        let driver = ScriptedDriver::new(responses);
+        let (tx, mut rx) = mpsc::channel(256);
+        let stop = RunStop::default();
+        let svc = LlmService::new(driver.clone(), 2, stop.token().clone(), tx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ep01.ass"), src).unwrap();
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+        let prompts =
+            crate::prompts::TranslationPrompts::defaults(&pair, crate::config::projects::Tone::Standard);
+        let issue = |line_id: u32, issue_type: &str| VerifyIssue {
+            line_id,
+            source: String::new(),
+            translation: String::new(),
+            issue_type: issue_type.into(),
+            description: "d".into(),
+            severity: "high".into(),
+            term: None,
+            expected: None,
+        };
+        let outcome = retranslate_episode_lines(ReviewJob {
+            job: FileJob {
+                input: dir.path().join("ep01.ass"),
+                file_name: "ep01.ass".into(),
+                svc: &svc,
+                verify_svc: &svc,
+                glossary: &Glossary::default(),
+                pair,
+                prompts: &prompts,
+                batch_limit: Some(100),
+                stop,
+                tx,
+                seed: Some(Seed {
+                    source_hash: hash,
+                    translations: stored.iter().map(|(id, t)| (*id, t.to_string())).collect(),
+                }),
+            },
+            line_ids: ids,
+            output_name: "ep01.warning.eng.ass".into(),
+            issues: vec![issue(2, "name"), issue(4, "untranslated"), issue(1, "meaning")],
+            needs_look: true,
+        })
+        .await;
+        drop(svc);
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        (outcome, events, driver, dir)
+    }
+
+    #[tokio::test]
+    async fn review_retranslates_only_the_chosen_lines_and_clears_their_issues() {
+        let src = ass_source(&["{\\an8}你好", "叶长生不会走的", "走吧", "你算什么东西"]);
+        let stored = [(1, "{\\an8}Hello"), (2, "Ye Changshen won't leave."), (3, "Let's go.")];
+        let (outcome, events, driver, dir) = review(
+            &src,
+            &stored,
+            fingerprint(&src),
+            vec![2, 4],
+            vec![Ok(ok_batch(&[(2, "Ye Changsheng won't leave.")])), Ok(ok_batch(&[(4, "Who do you think you are?")]))],
+        )
+        .await;
+        assert!(outcome.failed.is_none());
+        assert_eq!(outcome.retranslated, [2, 4]);
+        // Only line 1's issue is left.
+        assert_eq!(outcome.issues.iter().map(|i| i.line_id).collect::<Vec<_>>(), [1]);
+        assert_eq!(driver.call_count(), 2);
+        // Line 4's request carries the lines before it as context.
+        assert!(driver.last_request().unwrap().user.contains("Let's go."));
+        let written = std::fs::read_to_string(dir.path().join("ep01.warning.eng.ass")).unwrap();
+        assert!(written.contains("{\\an8}Hello"), "untouched lines keep their tags");
+        assert!(written.contains("Ye Changsheng won't leave."));
+        assert!(written.contains("Who do you think you are?"));
+        assert!(!written.contains("Changshen won't"));
+        // Ends where it started: needs a look, with the remaining issues.
+        assert!(events.iter().any(|e| matches!(e, RunEvent::FileDone { issues, .. } if issues.len() == 1)));
+        assert!(matches!(events.last(), Some(RunEvent::State { state: FileStateKind::Warning, .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            RunEvent::State { state: FileStateKind::Retranslating, detail: Some(d), .. } if d == "2 lines"
+        )));
+    }
+
+    #[tokio::test]
+    async fn review_refuses_a_changed_source() {
+        let src = ass_source(&["你好"]);
+        let (outcome, events, driver, dir) =
+            review(&src, &[(1, "Hello")], fingerprint("old"), vec![1], vec![]).await;
+        assert!(outcome.failed.unwrap().contains("changed since it was translated"));
+        assert_eq!(driver.call_count(), 0);
+        assert!(!dir.path().join("ep01.warning.eng.ass").exists());
+        assert!(events.iter().any(|e| matches!(e, RunEvent::Error { .. })));
     }
 }

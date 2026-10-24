@@ -92,7 +92,7 @@ pub async fn verify_file(
             // Auth death and user cancellation must NOT degrade gracefully —
             // a dead key or mid-verify cancel would otherwise finish the file
             // as "clean without verification" and write unverified output.
-            Err(e) if e.is_auth() || e.is_cancelled() => return Err(e),
+            Err(e) if e.is_auth() || e.is_fatal() || e.is_cancelled() => return Err(e),
             // Other failures keep degrading gracefully (`verifier.py:399-400`).
             Err(_) => continue,
         };

@@ -18,4 +18,5 @@ pub mod prompts;
 pub mod results;
 pub mod run;
 pub mod source_detect;
+pub mod stop;
 pub mod verify;
