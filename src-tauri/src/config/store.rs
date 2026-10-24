@@ -1133,7 +1133,10 @@ mod tests {
     #[test]
     fn web_search_off_has_no_connection() {
         let cfg = library(&[sample_model(Provider::Ollama, "qwen3")]);
-        assert!(step_connection(&cfg, Step::WebSearch).is_err());
+        assert_eq!(
+            step_connection(&cfg, Step::WebSearch).unwrap_err().to_string(),
+            "Look up names online is off. Turn it on on the Models page."
+        );
         assert_eq!(resolve_web_search(&cfg), None);
         assert_eq!(web_search_label(&cfg), None);
     }

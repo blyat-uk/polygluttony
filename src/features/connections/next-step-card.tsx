@@ -6,9 +6,13 @@ import { OpenFolderButton } from "@/features/welcome/open-folder-button";
  *  folder of subtitles — instead of leaving the page to guess. */
 export function NextStepCard({ tested }: { tested: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
-  // The setup form that had focus is gone; land on the next step.
+  // The setup form that had focus is gone; land on the next step (after the card below
+  // has settled its own focus).
   useEffect(() => {
-    ref.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    const frame = requestAnimationFrame(() =>
+      ref.current?.querySelector<HTMLButtonElement>("button")?.focus(),
+    );
+    return () => cancelAnimationFrame(frame);
   }, []);
   return (
     <div
