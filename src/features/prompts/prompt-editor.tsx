@@ -6,6 +6,7 @@ import type { PromptMeta } from "@/types/generated/PromptMeta";
 import { ipc } from "@/lib/ipc";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { MOD } from "@/features/help/keys";
 import { EditedMark } from "./prompt-list";
@@ -25,7 +26,8 @@ interface Props {
   onSave: (text: string) => Promise<void>;
   /** Drop the unsaved draft, back to the saved text. */
   onDiscard: () => void;
-  /** Back to the default at once; the page offers Undo. */
+  /** Back to the default at once; the page offers Undo (the saved text). Only
+   *  offered without unsaved edits, so Undo brings back what the user had. */
   onReset: () => Promise<void>;
   /** Whether a save mutation is in flight — disables the Save button. */
   saving?: boolean;
@@ -90,6 +92,24 @@ export function PromptEditor({
       toast.error(String(e));
     }
   };
+
+  const restoreButton = (
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={!meta.modified || dirty || resetting}
+      onClick={async () => {
+        setResetting(true);
+        try {
+          await onReset();
+        } finally {
+          setResetting(false);
+        }
+      }}
+    >
+      Restore default
+    </Button>
+  );
 
   return (
     <div className="flex min-w-0 flex-1 flex-col gap-3 p-4">
@@ -188,21 +208,20 @@ export function PromptEditor({
           <Button variant="outline" size="sm" onClick={() => void loadFromFile()}>
             Load from file…
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!meta.modified || resetting}
-            onClick={async () => {
-              setResetting(true);
-              try {
-                await onReset();
-              } finally {
-                setResetting(false);
-              }
-            }}
-          >
-            Restore default
-          </Button>
+          {/* Undo brings back the saved text, so unsaved typing has to be saved
+              or discarded first: Restore default would lose it for good. */}
+          {dirty && meta.modified ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex" tabIndex={0}>
+                  {restoreButton}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top">Save or discard your edits first.</TooltipContent>
+            </Tooltip>
+          ) : (
+            restoreButton
+          )}
           <Button size="sm" disabled={!canSave || saving} onClick={() => void onSave(text)}>
             Save
           </Button>
