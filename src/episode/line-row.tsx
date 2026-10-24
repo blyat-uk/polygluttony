@@ -234,8 +234,17 @@ function Act({
   );
 }
 
-/** Under a flagged line: what's wrong, and what to do about it. */
-function FlagPanel({ line, flag }: { line: EpisodeLine; flag: LineFlag }) {
+/** Under a flagged line: what's wrong, and what to do about it. Only the
+ *  selected line's main action is gold, so a long list keeps one primary. */
+function FlagPanel({
+  line,
+  flag,
+  selected,
+}: {
+  line: EpisodeLine;
+  flag: LineFlag;
+  selected: boolean;
+}) {
   const review = useReview();
   const issues = dismissable(flag);
   const untranslated = flag.untranslated || line.translation === null;
@@ -247,7 +256,7 @@ function FlagPanel({ line, flag }: { line: EpisodeLine; flag: LineFlag }) {
 
   const actions = review ? (
     <>
-      <Act primary disabled={off} onClick={() => review.retranslate([line.id])}>
+      <Act primary={selected} disabled={off} onClick={() => review.retranslate([line.id])}>
         Retranslate line
       </Act>
       {untranslated ? (
@@ -402,7 +411,7 @@ export const LineRow = memo(function LineRow({
         </div>
       </div>
 
-      {flag && !live ? <FlagPanel line={line} flag={flag} /> : null}
+      {flag && !live ? <FlagPanel line={line} flag={flag} selected={selected} /> : null}
     </div>
   );
 });
