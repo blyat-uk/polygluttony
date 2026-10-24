@@ -24,22 +24,24 @@ pub fn inspect_setup(app: AppHandle, path: String) -> AppResult<SetupSummary> {
 }
 
 /// Replace this install's setup with the export at `path`. The setup it
-/// replaces is saved to `<app-data>/setup-backup.zip` first (`summary.backup`;
-/// importing that file is the undo). The config goes through the store plugin,
-/// so its cache stays in step with the file.
+/// replaces is saved first, as it is on disk, to
+/// `<app-data>/setup-backup-<epoch ms>.zip` (the newest three are kept);
+/// `summary.backup` is that file, and importing it is the undo. The config
+/// goes through the store plugin, so its cache stays in step with the file.
 #[tauri::command]
 pub fn import_setup(app: AppHandle, path: String) -> AppResult<SetupSummary> {
     let imported = transfer::read_file(Path::new(&path))?;
     let current = store::load(&app)?;
     let dir = prompts::overrides_dir(&app)?;
-    let backup = app
+    let app_data = app
         .path()
         .app_data_dir()
-        .map_err(|e| AppError::Other(format!("no app-data dir: {e}")))?
-        .join(transfer::BACKUP_FILE);
+        .map_err(|e| AppError::Other(format!("no app-data dir: {e}")))?;
+    let config_file = store::config_file(&app)?;
     let summary = transfer::summary(&imported, &current, &dir);
-    let made = transfer::replace_with_backup(&imported, &current, &dir, &backup, |cfg| {
-        store::save(&app, cfg)
-    })?;
+    let made =
+        transfer::replace_with_backup(&imported, &current, &dir, &config_file, &app_data, |cfg| {
+            store::save(&app, cfg)
+        })?;
     Ok(SetupSummary { backup: made.map(|p| p.to_string_lossy().into_owned()), ..summary })
 }
