@@ -184,6 +184,15 @@ impl LiveBoard {
         });
     }
 
+    /// Translations an episode starts the run with (Resume's kept lines, a
+    /// review's whole episode), tags stripped. Call right after `reset`, so a
+    /// window that looks before the pipeline gets going already sees them.
+    pub fn prime(&self, file: &str, translations: impl IntoIterator<Item = (u32, String)>) {
+        let mut guard = self.lock();
+        let Some(board) = guard.as_mut() else { return };
+        board.update(file, |ep| ep.translations.extend(translations));
+    }
+
     /// Fold one run event into the board.
     pub fn apply(&self, event: &RunEvent) -> Change {
         let mut guard = self.lock();
@@ -734,6 +743,20 @@ mod tests {
 
     fn live_or_unreadable(view: EpisodeView) -> bool {
         matches!(view, EpisodeView::Live(_) | EpisodeView::Unreadable { .. })
+    }
+
+    #[test]
+    fn primed_translations_show_before_the_pipeline_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ep01.ass"), ass_source(&["你好", "再见"])).unwrap();
+        let board = LiveBoard::default();
+        board.reset(dir.path(), &["ep01.ass".into()]);
+        board.prime("ep01.ass", [(1, "Hello".to_string())]);
+        board.prime("other.ass", [(1, "ignored".to_string())]);
+        let snap = live(board.snapshot("ep01.ass"));
+        assert_eq!(snap.lines[0].translation.as_deref(), Some("Hello"));
+        assert_eq!(snap.lines[0].status, LineStatus::Translated);
+        assert_eq!(snap.lines[1].status, LineStatus::Waiting);
     }
 
     #[test]

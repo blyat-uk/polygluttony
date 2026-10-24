@@ -37,7 +37,7 @@
 //! Once (1), (2) for every file, (3) and (4) have all dropped, `rx.recv()` returns
 //! `None` and the forwarder loop exits — triggering state clear.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +45,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, Mutex, MutexGuard, Semaphore};
 
+use crate::ass::tags::strip_for_text;
 use crate::config::projects::Tone;
 use crate::config::store as config_store;
 use crate::config::{Connection, Provider, Step};
@@ -208,10 +209,23 @@ fn spawn_forwarder(app: AppHandle, mut rx: mpsc::Receiver<RunEvent>) {
     });
 }
 
-/// A fresh board before any file task can send to it; open episode windows
-/// refetch and see the new run (or that they are no longer in it).
-fn reset_board(app: &AppHandle, folder: &Path, files: &[String]) {
-    app.state::<LiveBoard>().reset(folder, files);
+/// A fresh board before any file task can send to it, with the translations
+/// episodes start from; open episode windows refetch and see the new run (or
+/// that they are no longer in it).
+fn reset_board<'a>(
+    app: &AppHandle,
+    folder: &Path,
+    files: &[String],
+    primed: impl IntoIterator<Item = (&'a String, &'a BTreeMap<u32, String>)>,
+) {
+    let board = app.state::<LiveBoard>();
+    board.reset(folder, files);
+    for (file, translations) in primed {
+        board.prime(
+            file,
+            translations.iter().map(|(id, t)| (*id, strip_for_text(t))),
+        );
+    }
     let _ = app.emit(EPISODE_CHANGED_EVENT, EpisodeChanged { file: None });
 }
 
@@ -302,6 +316,11 @@ pub fn resume_seeds(
         })
         .filter_map(|f| {
             let lines = store.lines(folder, f)?;
+            // Only lines made from the source as it is now.
+            let source = crate::ass::decode::decode_file(&folder.join(f)).ok()?;
+            if crate::translation::results::fingerprint(&source) != lines.source_hash {
+                return None;
+            }
             Some((
                 f.clone(),
                 Seed {
@@ -470,7 +489,15 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         stop: kit.stop.clone(),
     });
     drop(guard);
-    reset_board(&app, &folder, &args.files);
+    {
+        let seeds = seeds.lock().unwrap_or_else(|e| e.into_inner());
+        reset_board(
+            &app,
+            &folder,
+            &args.files,
+            seeds.iter().map(|(f, s)| (f, &s.translations)),
+        );
+    }
     spawn_forwarder(app.clone(), rx);
 
     let stop = kit.stop.clone();
@@ -592,6 +619,13 @@ fn plan_review(
             "Pick at least one line to retranslate.".into(),
         ));
     }
+    let source = crate::ass::decode::decode_file(&folder.join(file))
+        .map_err(|e| AppError::Other(format!("Couldn't read {file}: {e}")))?;
+    if crate::translation::results::fingerprint(&source) != lines.source_hash {
+        return Err(AppError::Other(format!(
+            "{file} changed since it was translated. Translate it again to review it."
+        )));
+    }
     Ok(ReviewPlan {
         line_ids,
         output_name,
@@ -631,7 +665,14 @@ pub async fn start_review(
         stop: kit.stop.clone(),
     });
     drop(guard);
-    reset_board(&app, &folder_path, &files);
+    reset_board(
+        &app,
+        &folder_path,
+        &files,
+        plans
+            .iter()
+            .map(|(f, (plan, _, _))| (f, &plan.lines.translations)),
+    );
     spawn_forwarder(app.clone(), rx);
 
     let plans = Arc::new(std::sync::Mutex::new(plans));
@@ -755,6 +796,9 @@ mod tests {
         assert_eq!(who(&sample(Provider::Custom, "x")), "The server");
     }
 
+    /// The source every test episode is made from.
+    const SRC: &str = "[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好\n";
+
     fn meta() -> RunMeta {
         RunMeta {
             source_lang: "zh".into(),
@@ -798,7 +842,7 @@ mod tests {
                 .iter()
                 .map(|(id, t)| (*id, t.to_string()))
                 .collect(),
-            source_hash: Some("abc".into()),
+            source_hash: Some(crate::translation::results::fingerprint(SRC)),
         }
     }
 
@@ -901,14 +945,21 @@ mod tests {
         ] {
             store_outcome(&store, folder.path(), &o, &meta(), &stop).unwrap();
         }
+        std::fs::write(folder.path().join("stopped.ass"), SRC).unwrap();
         let files: Vec<String> = ["stopped.ass", "done.ass", "new.ass"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let seeds = resume_seeds(&store, folder.path(), &files);
         assert_eq!(seeds.keys().collect::<Vec<_>>(), ["stopped.ass"]);
-        assert_eq!(seeds["stopped.ass"].source_hash, "abc");
+        assert_eq!(
+            seeds["stopped.ass"].source_hash,
+            crate::translation::results::fingerprint(SRC)
+        );
         assert_eq!(seeds["stopped.ass"].translations.len(), 2);
+        // A source that changed since keeps nothing: it starts over.
+        std::fs::write(folder.path().join("stopped.ass"), "[Events]\n").unwrap();
+        assert!(resume_seeds(&store, folder.path(), &files).is_empty());
     }
 
     #[test]
@@ -944,6 +995,14 @@ mod tests {
         .unwrap();
         assert!(err(plan_review(&store, folder.path(), "look.ass", vec![]))
             .contains("at least one line"));
+        assert!(
+            err(plan_review(&store, folder.path(), "look.ass", vec![3])).contains("Couldn't read")
+        );
+        std::fs::write(folder.path().join("look.ass"), "[Events]\n").unwrap();
+        assert!(
+            err(plan_review(&store, folder.path(), "look.ass", vec![3])).contains("changed since")
+        );
+        std::fs::write(folder.path().join("look.ass"), SRC).unwrap();
         let plan = plan_review(&store, folder.path(), "look.ass", vec![3]).unwrap();
         assert!(plan.needs_look);
         assert_eq!(plan.output_name, "look.ass.out");
