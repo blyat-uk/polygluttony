@@ -251,8 +251,9 @@ export function resolveStatus(inputs: StatusInputs): EpisodeStatus {
     const progress = inFlight ? progressText(live) : null;
     return {
       kind: "live",
-      label: STATE_LABEL[live.state],
-      color: STATE_COLOR[live.state],
+      // A provider asked us to slow down: the episode waits, it isn't translating.
+      label: wait ? "Waiting" : STATE_LABEL[live.state],
+      color: wait ? COLOR.look : STATE_COLOR[live.state],
       live: inFlight,
       detail: wait ?? ([progress, retry].filter(Boolean).join(" ") || null),
       detailTone: wait || retry ? "alert" : "muted",

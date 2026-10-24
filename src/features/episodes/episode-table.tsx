@@ -22,7 +22,18 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { IssuePanel } from "@/features/translate/file-cells";
+import { useDeferredMenu } from "@/features/glossary/use-deferred-menu";
 import type { EpisodeStatus } from "./episode-status";
 import { leftoverNote } from "./episode-status";
 import { collapseQuietRuns } from "./collapse-rows";
@@ -75,6 +86,8 @@ export function EpisodeTable({
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showAll, setShowAll] = useState(false);
+  // "Translate again" on an episode that has a translation asks first.
+  const [again, setAgain] = useState<SourceFile | null>(null);
   const ticked = new Set(selected);
   const allTicked = files.length > 0 && files.every((f) => ticked.has(f.name));
 
@@ -192,9 +205,10 @@ export function EpisodeTable({
                         <StateChip label={status.label} color={status.color} live={status.live} />
                       )}
                       {status.detail ? (
+                        // Wraps (two lines at most) so a retry reason reads in full.
                         <span
                           className={cn(
-                            "min-w-0 truncate text-[12px] tabular-nums",
+                            "line-clamp-2 min-w-0 text-[12px] leading-snug tabular-nums [overflow-wrap:anywhere]",
                             DETAIL_TONE[status.detailTone],
                           )}
                           title={status.detail}
@@ -219,7 +233,9 @@ export function EpisodeTable({
                         file={f}
                         name={name}
                         canTranslate={canTranslate}
-                        onTranslate={() => onTranslateOne(f.name)}
+                        onTranslate={() =>
+                          f.translation === "none" ? onTranslateOne(f.name) : setAgain(f)
+                        }
                         onOpen={() => openEpisode(f.name, folder)}
                       />
                     </div>
@@ -240,6 +256,33 @@ export function EpisodeTable({
           })}
         </tbody>
       </table>
+
+      <AlertDialog
+        open={again !== null}
+        onOpenChange={(open) => {
+          if (!open) setAgain(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Translate {again ? episodeName(again.name) : "this episode"} again?
+            </AlertDialogTitle>
+            <AlertDialogDescription>This replaces its current translation.</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (again) onTranslateOne(again.name);
+                setAgain(null);
+              }}
+            >
+              Translate again
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -257,6 +300,8 @@ function RowMenu({
   onTranslate: () => void;
   onOpen: () => void;
 }) {
+  // Translate may open a dialog: only once the menu has closed.
+  const menu = useDeferredMenu();
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -264,7 +309,7 @@ function RowMenu({
           <DotsThree weight="bold" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-56">
+      <DropdownMenuContent align="end" className="w-56" onCloseAutoFocus={menu.onCloseAutoFocus}>
         <DropdownMenuItem className="py-1.5 focus:bg-muted" onSelect={() => showInFolder(file)}>
           <FolderOpen />
           Show in folder
@@ -272,7 +317,7 @@ function RowMenu({
         <DropdownMenuItem
           className="py-1.5 focus:bg-muted"
           disabled={!canTranslate}
-          onSelect={onTranslate}
+          onSelect={menu.pick(onTranslate)}
         >
           <ArrowClockwise />
           {file.translation === "none" ? "Translate this episode" : "Translate again"}
