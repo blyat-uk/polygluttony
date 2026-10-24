@@ -45,14 +45,18 @@ function isTyping(target: EventTarget | null): boolean {
  * nothing here touches Ctrl+Z / C / V / A.
  */
 export function shortcutFor(
-  e: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "shiftKey" | "altKey" | "repeat" | "isComposing">,
+  e: Pick<
+    KeyboardEvent,
+    "key" | "code" | "ctrlKey" | "metaKey" | "shiftKey" | "altKey" | "repeat" | "isComposing"
+  >,
   typing: boolean,
 ): Shortcut | null {
   if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.isComposing) return null
   if (e.key === "Enter") return e.repeat ? null : { kind: "primary" }
   if (typing || e.repeat) return null
   if (e.key === "o" || e.key === "O") return { kind: "open" }
-  const page = PAGE_SHORTCUTS.find((p) => p.key === e.key)
+  // By key, or by the physical digit row (AZERTY's Ctrl+1 is "&").
+  const page = PAGE_SHORTCUTS.find((p) => p.key === e.key || e.code === `Digit${p.key}`)
   return page ? { kind: "page", to: page.to } : null
 }
 
