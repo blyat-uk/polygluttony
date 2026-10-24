@@ -193,16 +193,28 @@ export function AppLayout({ children }: { children: ReactNode }) {
     }
   }, [openPath])
 
-  // App-wide shortcuts.
+  // Ctrl/Cmd+Enter runs the page's main action. In the capture phase, so a
+  // focused control that handles Enter itself (a checkbox) can't swallow it;
+  // when an action ran, nothing else acts on the same key press.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (dialogOpen()) return
+      if (shortcutFor(e, isTyping(e.target))?.kind !== "primary") return
+      if (runPrimaryAction()) {
+        e.preventDefault()
+        e.stopPropagation()
+      }
+    }
+    window.addEventListener("keydown", onKey, true)
+    return () => window.removeEventListener("keydown", onKey, true)
+  }, [])
+
+  // The other app-wide shortcuts.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || dialogOpen()) return
       const shortcut = shortcutFor(e, isTyping(e.target))
-      if (!shortcut) return
-      if (shortcut.kind === "primary") {
-        if (runPrimaryAction()) e.preventDefault()
-        return
-      }
+      if (!shortcut || shortcut.kind === "primary") return
       e.preventDefault()
       if (shortcut.kind === "open") void pick()
       else void navigate({ to: shortcut.to as never })
