@@ -17,7 +17,8 @@ const now = () => new Date().toLocaleTimeString("en-GB", { hour12: false })
 
 const MAX_LOG_LINES = 500
 
-export type GlossaryOp = "build" | "normalize" | "import"
+/** `normalize` is Tidy up; `lookup` is Look up names online on the glossary as it is. */
+export type GlossaryOp = "build" | "normalize" | "lookup" | "import"
 
 export interface GlossaryLogLine {
   at: string
