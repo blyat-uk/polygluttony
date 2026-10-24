@@ -73,6 +73,12 @@ function FolderGlossary({ folder }: { folder: string }) {
     (s) => s.folder === folder && (s.undo.length > 0 || s.redo.length > 0),
   );
 
+  // Files copied into the folder since it was read show up here (Add new
+  // episodes) without a trip to Episodes → Rescan.
+  useEffect(() => {
+    void qc.invalidateQueries({ queryKey: projectKey(folder) });
+  }, [qc, folder]);
+
   // Workspace state (filters, open panel) belongs to one folder.
   useEffect(() => {
     useGlossaryUi.getState().forFolder(folder);
