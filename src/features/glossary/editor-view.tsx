@@ -206,14 +206,13 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
     return true;
   };
 
-  const commitEdit = (row: TermRow, field: EditField, value: string) => {
+  /** Null when the edit went in (or changed nothing); otherwise why it was
+   *  refused, shown under the field that stays open. */
+  const commitEdit = (row: TermRow, field: EditField, value: string): string | null => {
     const s = current();
     const r = field === "target" ? editTarget(s, refOf(row), value) : renameSource(s, refOf(row), value);
-    if (!r.ok) {
-      toast.error(r.error);
-      return;
-    }
-    if (r.state === s) return;
+    if (!r.ok) return r.error;
+    if (r.state === s) return null;
     const v = value.trim();
     if (field === "target") {
       commit(folder, r.state, { label: `Changed ${row.source}: ${row.target} → ${v}` });
@@ -221,6 +220,7 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
     } else {
       commit(folder, r.state, { label: `Renamed ${row.source} → ${v}` });
     }
+    return null;
   };
 
   const moveRows = (list: TermRow[], to: Category, bulk: boolean) => {

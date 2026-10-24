@@ -61,13 +61,17 @@ export function TermTable({
   /** Room under the last row (the bulk bar floats there). */
   bottomPad?: number;
   actions: Omit<RowActions, "onSelect" | "onStartEdit" | "onCommitEdit" | "onCancelEdit"> & {
-    onCommitEdit: (row: TermRow, field: EditField, value: string) => void;
+    /** Null when the edit went in; otherwise why it was refused. */
+    onCommitEdit: (row: TermRow, field: EditField, value: string) => string | null;
   };
   /** Shown instead of rows when there are none. */
   empty: ReactNode;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [editing, setEditing] = useState<{ key: string; field: EditField } | null>(null);
+  /** The open edit; `error` says why its last save was refused. */
+  const [editing, setEditing] = useState<{ key: string; field: EditField; error?: string } | null>(
+    null,
+  );
   const [flash, setFlash] = useState<string | null>(null);
 
   // Header columns line up with the body whether or not a scrollbar is drawn.
@@ -142,7 +146,13 @@ export function TermTable({
       onCommitEdit: (row, field, value, viaEnter) => {
         const list = rowsRef.current;
         const next = viaEnter ? list[list.findIndex((r) => r.key === row.key) + 1] : undefined;
-        outer.current.onCommitEdit(row, field, value);
+        const error = outer.current.onCommitEdit(row, field, value);
+        if (error) {
+          // Refused (a duplicate, an empty term): the field stays open with
+          // what was typed, and says why.
+          setEditing({ key: row.key, field, error });
+          return false;
+        }
         if (next) {
           setEditing({ key: next.key, field });
           const i = list.indexOf(next);
@@ -150,6 +160,7 @@ export function TermTable({
         } else {
           setEditing(null);
         }
+        return true;
       },
       onMove: (row, to) => outer.current.onMove(row, to),
       onDelete: (row) => outer.current.onDelete(row),
@@ -208,16 +219,19 @@ export function TermTable({
           <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
             {virtualizer.getVirtualItems().map((v) => {
               const row = rows[v.index];
+              const editError = editing?.key === row.key ? (editing.error ?? null) : null;
               return (
                 <div
                   key={v.key}
-                  className="absolute inset-x-0 top-0"
+                  // A refusal note hangs below the row, over the next one.
+                  className={cn("absolute inset-x-0 top-0", editError && "z-10")}
                   style={{ height: ROW_HEIGHT, transform: `translateY(${v.start}px)` }}
                 >
                   <TermRowView
                     row={row}
                     selected={selected.has(row.key)}
                     editing={editing?.key === row.key ? editing.field : null}
+                    editError={editError}
                     flash={flash === row.key}
                     disabled={disabled}
                     actions={actionsForRows}
