@@ -1,6 +1,13 @@
 import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
+import { Check } from "@phosphor-icons/react";
+import { PAGE_SHORTCUTS } from "@/components/app-layout";
 import { PageHeader } from "@/components/page-header";
+import { cn } from "@/lib/utils";
+import { useAppStore } from "@/stores/app-store";
+import { useTranslationRun } from "@/stores/translation-store";
+import { usePickFolder } from "@/features/welcome/use-pick-folder";
+import { MOD } from "./keys";
 
 // ── inline helpers ────────────────────────────────────────────────────────────
 
@@ -31,67 +38,154 @@ function Section({ title, sub, children }: { title: string; sub?: string; childr
 
 // ── getting started ───────────────────────────────────────────────────────────
 
-const STEPS = [
+type StepId = "model" | "folder" | "glossary" | "translate";
+
+const STEPS: {
+  id: StepId;
+  title: string;
+  optional?: boolean;
+  body: string;
+  /** Where the link goes; `null` = the folder dialog. */
+  to: string | null;
+  link: string;
+}[] = [
   {
-    n: 1,
-    title: "Connect an AI model",
+    id: "model",
+    title: "Connect a model",
     body: "Polygluttony needs an AI model to build your glossary and translate. Pick a provider, paste your API key and press Connect — or use a model running on your computer. One model does every step; you can give steps their own models later.",
     to: "/connections",
-    link: "Open Connections",
+    link: "Open Models",
   },
   {
-    n: 2,
+    id: "folder",
     title: "Open a folder",
-    body: "Point Polygluttony at a folder of subtitles. It scans them and shows what’s already translated and what isn’t.",
-    to: "/",
-    link: "Choose a folder",
+    body: "Point Polygluttony at a folder of subtitles, or drag it onto the window. It shows each episode and whether it’s translated yet.",
+    to: null,
+    link: "Open folder",
   },
   {
-    n: 3,
-    title: "Build a glossary",
+    id: "glossary",
+    title: "Build glossary",
     optional: true,
-    body: "A glossary keeps names and terms consistent across every episode. Skip it and translate right away if you like.",
+    body: "A glossary keeps names and terms the same in every episode. Skip it and translate right away if you like.",
     to: "/glossary",
     link: "Open Glossary",
   },
   {
-    n: 4,
+    id: "translate",
     title: "Translate",
-    body: "Pick your files and press Translate. Polygluttony checks its own work as it goes and flags anything that looks off.",
-    to: "/translate",
-    link: "Open Translate",
+    body: "Tick the episodes and press Translate. Polygluttony checks its own work as it goes and marks anything that needs a look.",
+    to: "/episodes",
+    link: "Open Episodes",
   },
-] as const;
+];
+
+/** Which of the getting-started steps are already behind you. */
+function useStepsDone(): Record<StepId, boolean> {
+  const model = useAppStore((s) => s.hasUsableConnection);
+  const folder = useAppStore((s) => s.workdir !== null);
+  const glossary = useAppStore((s) => (s.glossaryTerms ?? 0) > 0);
+  const translated = useTranslationRun((s) => (s.results ?? []).some((r) => r.success));
+  return { model, folder, glossary, translate: translated };
+}
 
 function GettingStarted() {
+  const done = useStepsDone();
+  const { pick } = usePickFolder();
   return (
     <Section title="Getting started">
       <div className="space-y-2">
-        {STEPS.map((s) => (
+        {STEPS.map((s, i) => (
           <div
-            key={s.n}
+            key={s.id}
             className="flex items-start gap-3 rounded-lg border border-border bg-[color:var(--card)] px-3.5 py-3"
           >
-            <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-[color:var(--popover)] text-[12px] text-primary">
-              {s.n}
+            <span
+              className={cn(
+                "mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full text-[12px]",
+                done[s.id]
+                  ? "border border-[color:var(--color-jade)] text-[color:var(--color-jade)]"
+                  : "bg-[color:var(--popover)] text-primary",
+              )}
+            >
+              {done[s.id] ? <Check weight="bold" className="size-3.5" /> : i + 1}
             </span>
             <div className="min-w-0 flex-1">
               <div className="text-[13px] font-semibold text-foreground">
                 {s.title}
-                {"optional" in s && s.optional ? (
+                {done[s.id] ? (
+                  <span className="ml-1.5 text-[11px] font-normal text-[color:var(--color-jade)]">
+                    · done
+                  </span>
+                ) : s.optional ? (
                   <span className="ml-1.5 text-[11px] font-normal text-muted-foreground">
                     — optional
                   </span>
                 ) : null}
               </div>
               <p className="mt-0.5 text-[12.5px] text-foreground/90">{s.body}</p>
-              <Link
-                to={s.to as never}
-                className="mt-1.5 inline-block text-[11.5px] font-medium text-primary hover:underline"
-              >
-                → {s.link}
-              </Link>
+              {s.to === null ? (
+                <button
+                  type="button"
+                  onClick={() => void pick()}
+                  className="mt-1.5 inline-block rounded-sm text-[11.5px] font-medium text-primary outline-none hover:underline focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                >
+                  → {s.link}
+                </button>
+              ) : (
+                <Link
+                  to={s.to as never}
+                  className="mt-1.5 inline-block text-[11.5px] font-medium text-primary hover:underline"
+                >
+                  → {s.link}
+                </Link>
+              )}
             </div>
+          </div>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+// ── keyboard shortcuts ────────────────────────────────────────────────────────
+
+function Key({ children }: { children: ReactNode }) {
+  return (
+    <kbd className="inline-flex min-w-5 items-center justify-center rounded-md border border-border bg-[color:var(--color-raised)] px-1.5 py-px font-mono text-[11px] text-foreground">
+      {children}
+    </kbd>
+  );
+}
+
+const SHORTCUTS: { keys: string[]; does: string }[] = [
+  {
+    keys: [`${MOD}1`, `${MOD}5`],
+    does: PAGE_SHORTCUTS.map((p) => p.label).join(", "),
+  },
+  { keys: [`${MOD}O`], does: "Open a folder" },
+  { keys: [`${MOD}Enter`], does: "The page’s main button, e.g. Translate" },
+  { keys: [`${MOD}S`], does: "Save a prompt" },
+  { keys: [`${MOD}Z`], does: "Undo a glossary change (add Shift to redo)" },
+  { keys: [`${MOD}F`], does: "Search the glossary" },
+  { keys: ["Esc"], does: "Cancel an edit, close a panel" },
+];
+
+function Shortcuts() {
+  return (
+    <Section title="Keyboard shortcuts">
+      <div className="grid grid-cols-[max-content_1fr] items-center gap-x-4 gap-y-2 rounded-lg border border-border bg-[color:var(--card)] px-4 py-3 text-[12.5px]">
+        {SHORTCUTS.map((s) => (
+          <div key={s.does} className="contents">
+            <span className="flex items-center gap-1 text-muted-foreground">
+              <Key>{s.keys[0]}</Key>
+              {s.keys[1] ? (
+                <>
+                  … <Key>{s.keys[1]}</Key>
+                </>
+              ) : null}
+            </span>
+            <span className="text-foreground/90">{s.does}</span>
           </div>
         ))}
       </div>
@@ -134,12 +228,12 @@ function BehindTheScenes() {
             </>
           }
         >
-          Build a glossary once — or pull one from subtitles you’ve already translated — and
+          Build glossary once — or Import from translated episodes you already have — and
           Polygluttony hands those agreed translations to the AI on every episode.
         </Explainer>
 
         <Explainer
-          title="It tunes to the genre"
+          title="It tunes to the world type"
           example={
             <div className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1">
               <span className="font-semibold text-foreground">Xianxia</span>
@@ -164,8 +258,8 @@ function BehindTheScenes() {
             </div>
           }
         >
-          It reads the subtitles, works out the genre, and prioritizes the right kind of
-          terminology. You can override the guess.
+          It reads the subtitles, works out the world type, and picks the right kind of
+          terminology. You can change it if it guessed wrong.
         </Explainer>
 
         <Explainer
@@ -198,15 +292,15 @@ function BehindTheScenes() {
           title="It checks its own work as it goes"
           example={
             <>
-              e.g. if lines start paraphrasing partway through an episode, it flags the ones that
-              drifted and retranslates just those, with a few lines around them for context.
+              e.g. if lines start paraphrasing partway through an episode, it notices and
+              retranslates just those, with a few lines around them for context.
             </>
           }
         >
-          While translating it catches the AI dropping, merging or reordering lines. Then it checks
-          each finished episode for drift off the original meaning, including glossary terms that
-          went missing — and re-does just the part that went wrong. Afterward you get a list of
-          anything still worth a look. It’s issues, not a score.
+          While translating it catches the AI dropping, merging or reordering lines. Then Verify
+          checks each finished episode for lines that wander from the original meaning, including
+          glossary terms that went missing — and redoes just the part that went wrong. Afterward
+          you get a list of anything that still needs a look. It’s issues, not a score.
         </Explainer>
 
         <Explainer
@@ -236,24 +330,24 @@ const TROUBLE: {
 }[] = [
   {
     q: "Translate is greyed out",
-    a: "Either no AI model is connected yet (or it still needs its API key), or every file in the folder is already translated.",
+    a: "Either no model is connected yet (or it still needs its API key), or no episode is ticked.",
     links: [
-      { to: "/connections", label: "Connections" },
-      { to: "/project", label: "Project" },
+      { to: "/connections", label: "Models" },
+      { to: "/episodes", label: "Episodes" },
     ],
   },
   {
-    q: "Look up established names online is disabled",
-    a: "It needs a model that can search the web. In Connections, turn on Web search for your model, or add one that can — Anthropic, OpenAI and Google can search.",
-    links: [{ to: "/connections", label: "Connections" }],
+    q: "Look up names online is greyed out",
+    a: "It needs a model that can search the web. On the Models page, turn on Look up names online for your model, or add one that can — Anthropic, OpenAI and Google can search the web.",
+    links: [{ to: "/connections", label: "Models" }],
   },
   {
     q: "I want to fix a translation by hand",
     a: (
       <>
-        Open the translated .ass file in your subtitle editor. To change how a name or term is
-        translated in every episode, double-click it in the Glossary, or open the whole glossary in
-        your own editor with{" "}
+        Open the episode from Episodes to fix single lines, or open the translated .ass file in
+        your subtitle editor. To change how a name or term is translated in every episode, change
+        it on the Glossary page, or open the whole glossary in your own editor with{" "}
         <span className="font-semibold text-foreground">Glossary ▸ Open in editor</span> —
         Polygluttony reloads it automatically when you save.
       </>
@@ -262,8 +356,8 @@ const TROUBLE: {
   },
   {
     q: "A batch failed or some lines came back wrong",
-    a: "Polygluttony retries automatically and keeps the good lines. If it still fails, the log panel in Translate shows the exact spot.",
-    links: [{ to: "/translate", label: "Translate" }],
+    a: "Polygluttony retries on its own and keeps the good lines. If it still fails, Episodes says what went wrong, and Logs shows the exact spot.",
+    links: [{ to: "/episodes", label: "Episodes" }],
   },
 ];
 
@@ -313,6 +407,7 @@ export function HelpPage() {
       <div className="flex-1 overflow-auto p-5">
         <div className="mx-auto max-w-[640px] space-y-8 pb-10">
           <GettingStarted />
+          <Shortcuts />
           <BehindTheScenes />
           <Troubleshooting />
         </div>
