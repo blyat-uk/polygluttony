@@ -447,7 +447,12 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
   const barShown = (selected.size > 0 || markAll !== null) && !panel;
   const barLift = useBulkBarLift();
 
-  const world = state.doc.world_type || view.prefs.world_override || view.detected_world;
+  // The folder's world type, as Episodes shows it; the glossary's own only as a hint.
+  const world = view.prefs.world_override ?? view.detected_world;
+  const builtAs =
+    state.doc.world_type && state.doc.world_type.toLowerCase() !== world.toLowerCase()
+      ? `Built as ${titleCase(state.doc.world_type)}`
+      : undefined;
   const canLookup = !!searchModel;
 
   return (
@@ -456,6 +461,7 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
         folder={folder}
         count={state.doc.count}
         subtitle={`${folderTitle(folder)} · ${titleCase(world)}`}
+        subtitleHint={builtAs}
         showNext={showNext}
         searchModel={searchModel}
         canRunModel={hasModel}

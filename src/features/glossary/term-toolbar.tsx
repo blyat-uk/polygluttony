@@ -78,12 +78,14 @@ export function TermToolbar({
 
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
+            {/* A fixed width, like the count beside it: the search field
+                keeps its size whatever the Show label says. */}
             <Button
               variant="outline"
               size="sm"
-              className={cn(show !== "all" && "border-primary/60 text-primary")}
+              className={cn("w-[290px] justify-between", show !== "all" && "border-primary/60 text-primary")}
             >
-              Show: {SHOW_LABEL[show]} <CaretDown className="size-3" />
+              <span className="truncate">Show: {SHOW_LABEL[show]}</span> <CaretDown className="size-3" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-72">
@@ -98,7 +100,7 @@ export function TermToolbar({
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <span className="shrink-0 text-[11.5px] tabular-nums text-muted-foreground">
+        <span className="min-w-[13ch] shrink-0 text-right text-[11.5px] tabular-nums text-muted-foreground">
           {shown.toLocaleString()} of {total.toLocaleString()}
         </span>
       </div>
