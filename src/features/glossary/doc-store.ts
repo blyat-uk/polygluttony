@@ -2,8 +2,8 @@
 // rollback on a failed save, and a session undo/redo stack.
 //
 // The react-query cache (`glossaryKey(folder)`) holds what's on screen. A
-// commit writes the cache first, then queues the save. Saves run one at a time
-// so each keeps its own snapshot kind. When one fails, the cache goes back to
+// commit writes the cache first, then queues the save. A folder's saves run one
+// at a time so each keeps its own snapshot kind. When one fails, the cache goes back to
 // the last saved state, the edits that never reached disk leave the undo stack,
 // and the header offers Retry with the latest wanted state.
 
@@ -56,13 +56,44 @@ export const useGlossaryDoc = create<DocStore>(() => ({
 
 // Non-reactive bookkeeping.
 let seq = 0;
-let savedSeq = 0;
-let saved: GlossaryState | null = null;
-let lastWritten: GlossaryState | null = null;
-let generation = 0;
-let inFlight = 0;
-let chain: Promise<void> = Promise.resolve();
 let nextEntryId = 1;
+
+/** One folder's saves. Each folder keeps its own queue, so a failed save in
+ *  one folder never rolls back another folder's cache or drops its saves. */
+interface FolderSaves {
+  /** The last state confirmed on disk: where a failed save rolls back to. */
+  saved: GlossaryState | null;
+  /** The last state put on screen (the cache). */
+  lastWritten: GlossaryState | null;
+  /** The commit `saved` came from. */
+  savedSeq: number;
+  /** Bumped when a save fails: the saves queued behind it are dropped. */
+  generation: number;
+  inFlight: number;
+  chain: Promise<void>;
+  /** A reload came back while saves were going: read the file again once
+   *  they're done, so a change made elsewhere meanwhile still shows. */
+  reloadAfter: boolean;
+}
+
+const folders = new Map<string, FolderSaves>();
+
+function savesFor(folder: string): FolderSaves {
+  let f = folders.get(folder);
+  if (!f) {
+    f = {
+      saved: null,
+      lastWritten: null,
+      savedSeq: 0,
+      generation: 0,
+      inFlight: 0,
+      chain: Promise.resolve(),
+      reloadAfter: false,
+    };
+    folders.set(folder, f);
+  }
+  return f;
+}
 
 const set = useGlossaryDoc.setState;
 const get = useGlossaryDoc.getState;
@@ -76,7 +107,7 @@ export function readState(folder: string): GlossaryState | null {
 function writeState(folder: string, s: GlossaryState) {
   const load: GlossaryLoad = { status: "ok", doc: s.doc, meta: s.meta };
   queryClient.setQueryData<GlossaryLoad>(glossaryKey(folder), load);
-  lastWritten = s;
+  savesFor(folder).lastWritten = s;
   // Rail badge + the cached ProjectView (staleTime: Infinity) stay honest.
   if (useAppStore.getState().workdir === folder) {
     useAppStore.getState().setGlossaryTerms(s.doc.count);
@@ -86,27 +117,40 @@ function writeState(folder: string, s: GlossaryState) {
   );
 }
 
+/** The workspace now edits `folder`, with a fresh undo history. */
+function startHistory(folder: string) {
+  const status: SaveStatus = savesFor(folder).inFlight > 0 ? "saving" : "saved";
+  set({ folder, undo: [], redo: [], status, error: null, failed: null });
+}
+
+/** `loaded` is what's on disk now: it replaces whatever the store held. */
 function resetFor(folder: string, loaded: GlossaryState) {
-  saved = loaded;
-  lastWritten = loaded;
-  savedSeq = seq;
-  set({ folder, undo: [], redo: [], status: "saved", error: null, failed: null });
+  const f = savesFor(folder);
+  f.saved = loaded;
+  f.lastWritten = loaded;
+  f.savedSeq = seq;
+  startHistory(folder);
 }
 
 /**
  * Call whenever the loaded glossary changes. Our own writes are ignored; a
- * different doc from disk (text editor, a scan, Restore, Import) starts a new
- * history, because undoing past it would overwrite that change.
+ * different doc from disk (text editor, a scan, Restore, Import, an episode
+ * window's Add to glossary) starts a new history, because undoing past it
+ * would overwrite that change.
  */
 export function syncLoaded(folder: string, loaded: GlossaryState) {
-  if (get().folder !== folder || !lastWritten) {
-    resetFor(folder, loaded);
+  const f = savesFor(folder);
+  const switched = get().folder !== folder;
+  if (f.lastWritten && sameDoc(f.lastWritten.doc, loaded.doc)) {
+    if (switched) startHistory(folder);
     return;
   }
-  if (sameDoc(lastWritten.doc, loaded.doc)) return;
-  if (inFlight > 0) {
-    // A refetch raced our own save and came back with the older file: keep ours.
-    writeState(folder, lastWritten);
+  if (f.inFlight > 0 && f.lastWritten) {
+    // A refetch raced our own save and came back with the older file: keep
+    // ours, and read the file again once the saves are done.
+    f.reloadAfter = true;
+    writeState(folder, f.lastWritten);
+    if (switched) startHistory(folder);
     return;
   }
   resetFor(folder, loaded);
@@ -132,7 +176,10 @@ export interface CommitOptions {
 export function commit(folder: string, next: GlossaryState, opts: CommitOptions) {
   const prev = readState(folder);
   if (!prev) return;
-  if (get().folder !== folder) resetFor(folder, prev);
+  if (get().folder !== folder) {
+    if (savesFor(folder).lastWritten) startHistory(folder);
+    else resetFor(folder, prev);
+  }
   writeState(folder, next);
   const mySeq = ++seq;
   if (opts.undoable !== false) {
@@ -155,25 +202,26 @@ function enqueueSave(
   snapshot: GlossaryChangeKind | null,
   label: string,
 ) {
-  const gen = generation;
-  inFlight++;
+  const f = savesFor(folder);
+  const gen = f.generation;
+  f.inFlight++;
   if (get().folder === folder) set({ status: "saving", error: null, failed: null });
-  chain = chain.then(async () => {
+  f.chain = f.chain.then(async () => {
     try {
       // A save before this one failed: the cache was rolled back, drop this one.
-      if (gen !== generation) return;
+      if (gen !== f.generation) return;
       markLocalSave();
       await ipc.saveGlossary(folder, state.doc, state.meta, snapshot ?? undefined);
-      savedSeq = mySeq;
-      saved = state;
+      f.savedSeq = mySeq;
+      f.saved = state;
     } catch (e: unknown) {
-      if (gen !== generation) return;
-      generation++;
-      const wanted = lastWritten ?? state;
-      if (saved) writeState(folder, saved);
+      if (gen !== f.generation) return;
+      f.generation++;
+      const wanted = f.lastWritten ?? state;
+      if (f.saved) writeState(folder, f.saved);
       if (get().folder === folder) {
         set((s) => ({
-          undo: s.undo.filter((x) => x.seq <= savedSeq),
+          undo: s.undo.filter((x) => x.seq <= f.savedSeq),
           redo: [],
           status: "error",
           error: String(e),
@@ -185,8 +233,14 @@ function enqueueSave(
         action: { label: "Retry", onClick: () => retrySave(folder) },
       });
     } finally {
-      inFlight--;
-      if (inFlight === 0 && get().status === "saving") set({ status: "saved" });
+      f.inFlight--;
+      if (f.inFlight === 0) {
+        if (get().folder === folder && get().status === "saving") set({ status: "saved" });
+        if (f.reloadAfter) {
+          f.reloadAfter = false;
+          void queryClient.invalidateQueries({ queryKey: glossaryKey(folder) });
+        }
+      }
     }
   });
 }
