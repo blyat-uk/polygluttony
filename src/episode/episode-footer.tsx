@@ -108,7 +108,8 @@ export function EpisodeFooter({
             <Button
               type="button"
               size="sm"
-              variant={nothingLeft ? "default" : "outline"}
+              // One gold button at a time: the banner's Retranslate has it while shown.
+              variant={nothingLeft && !banner ? "default" : "outline"}
               disabled={off || !nothingLeft}
               onClick={onMarkDone}
               className="h-7 rounded-full px-3 text-[12px]"

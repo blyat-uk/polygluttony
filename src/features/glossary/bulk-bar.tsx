@@ -68,7 +68,7 @@ export function BulkBar({
         </Button>
         {onLookup ? (
           <Button variant="outline" size="xs" disabled={disabled} onClick={onLookup}>
-            Look up online
+            Look up names online
           </Button>
         ) : null}
         {anyNew ? (
