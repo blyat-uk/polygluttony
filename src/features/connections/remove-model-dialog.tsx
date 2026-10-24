@@ -89,7 +89,7 @@ export function RemoveModelDialog({
   );
 }
 
-/** "Extract names and Translate will use Claude Haiku 5.5 instead. Web search will turn off.
+/** "Find names and Translate will use Claude Haiku 5.5 instead. Look up names online will turn off.
  *  Your saved Anthropic API key will be forgotten too." */
 function removalCopy(
   model: Model,
@@ -116,11 +116,11 @@ function removalCopy(
       // Until every model's capabilities are in, "none can search" isn't known yet.
       parts.push(
         caps.settled
-          ? "Web search will turn off."
-          : "Web search will move to a model that can search, or turn off.",
+          ? "Look up names online will turn off."
+          : "Look up names online will move to a model that can search the web, or turn off.",
       );
     } else if (webSearch !== null) {
-      parts.push(`Web search will use ${labelOf(webSearch.to, providers)} instead.`);
+      parts.push(`Look up names online will use ${labelOf(webSearch.to, providers)} instead.`);
     }
     if (moved.length === 0 && webSearch === null) parts.push("No step uses it.");
   }

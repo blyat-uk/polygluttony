@@ -42,6 +42,13 @@ pub enum TestProblem {
     Model,
     /// The server couldn't be reached (or didn't answer in time).
     Address,
+    /// The account is out of credit or over its quota.
+    Billing,
+    /// The provider is rate-limiting this key. Named as the run's `ErrorKind` is.
+    #[serde(rename = "rate_limit")]
+    RateLimit,
+    /// The provider's servers failed (5xx).
+    Server,
     Other,
 }
 
@@ -58,6 +65,9 @@ pub struct TestResult {
     /// The failure may be temporary (unreachable, rate-limited, server error),
     /// so saving the connection untested is reasonable. Never for a bad key or model.
     pub can_save_anyway: bool,
+    /// The provider's own words for a failure, for the page's "Details". `None`
+    /// when ok, or when the test failed before reaching the provider.
+    pub detail: Option<String>,
 }
 
 /// O21 — first-run check.

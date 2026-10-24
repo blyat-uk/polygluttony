@@ -117,30 +117,25 @@ export type OneModelOutcome = {
   keepsSettings: boolean;
   /** Web search stays on this other model (the chosen one can't search). */
   webSearchStaysOn: Model | null;
-  /** Models no step will use: they leave the library. */
-  removed: Model[];
-  /** Provider names whose saved key goes with them. */
-  forgotten: string[];
+  /** Models no step will use any more. They stay in the library, keys and all. */
+  idle: Model[];
 };
 
-/** Mirrors `use_one_model`. */
+/** Mirrors `use_one_model`: only the steps move; no model or key leaves. */
 export function oneModelOutcome(
   cfg: ConnectionsConfig,
   chosen: Model,
   caps: LibraryCaps,
-  providers: ProviderInfo[],
 ): OneModelOutcome {
   const ws = cfg.steps?.web_search ?? null;
   const stays =
     ws && ws.model !== chosen.id && !canSearch(caps, chosen)
       ? (cfg.models.find((m) => m.id === ws.model) ?? null)
       : null;
-  const kept = stays ? [chosen, stays] : [chosen];
-  const removed = cfg.models.filter((m) => !kept.some((k) => k.id === m.id));
+  const used = stays ? [chosen, stays] : [chosen];
   return {
     keepsSettings: stepsUsing(cfg, chosen.id).some((s) => s !== "web-search"),
     webSearchStaysOn: stays,
-    removed,
-    forgotten: forgottenKeys(removed, kept, cfg, providers),
+    idle: cfg.models.filter((m) => !used.some((k) => k.id === m.id)),
   };
 }

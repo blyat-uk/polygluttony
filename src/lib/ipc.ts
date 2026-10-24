@@ -67,8 +67,8 @@ export const ipc = {
     invoke<ConnectionsConfig>("set_shared_steps", { settings }),
   /** Switch the page to the per-step view; nothing else changes. */
   showEveryStep: () => invoke<ConnectionsConfig>("show_every_step"),
-  /** Back to one model: every step takes `modelId` and its settings, and models no step
-   *  uses any more leave the library. */
+  /** Back to one model: every step takes `modelId` and its settings. Only the steps move;
+   *  every library model and saved key stays. */
   useOneModel: (modelId: string) => invoke<ConnectionsConfig>("use_one_model", { modelId }),
   /** O5 — send one tiny test request. Custom endpoints get their API format detected.
    *  `webSearch` also exercises the provider's web-search tool. */

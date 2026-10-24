@@ -9,6 +9,8 @@ import type { Steps } from "@/types/generated/Steps";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useAppStore } from "@/stores/app-store";
 import { findProvider, isUsable, modelLabel, providerName } from "./connection-model";
 import { ConnectionForm, type FormStage } from "./connection-form";
 import { FlowStrip, type WebSearchNode } from "./flow-strip";
@@ -16,6 +18,7 @@ import { OneModelCard } from "./one-model-card";
 import { PerStepView } from "./per-step-view";
 import { CardEyebrow, RoleCard, StatusDot } from "./role-card";
 import { useSetupTransfer } from "./setup-transfer";
+import { NextStepCard } from "./next-step-card";
 import { modelById } from "./steps";
 import {
   capabilitiesQuery,
@@ -28,6 +31,9 @@ import {
 /** Nothing set up → connect a model (or import a setup); then one model for every step, or a
  *  model per step. The header carries a whole setup to and from another computer. */
 export function ConnectionsPage() {
+  const workdir = useAppStore((s) => s.workdir);
+  // The first model just connected: the next step is a folder (unless one is open already).
+  const [connected, setConnected] = useState<{ tested: boolean } | null>(null);
   const config = useConnectionsConfig();
   const providers = useProviders();
   const transfer = useSetupTransfer();
@@ -61,8 +67,8 @@ export function ConnectionsPage() {
   return (
     <div className="flex min-h-full flex-col">
       <PageHeader
-        title="Connections"
-        description="The AI models that build your glossary and translate your subtitles."
+        title="Models"
+        description="The AI that builds your glossary and translates."
         actions={
           <div className="flex shrink-0 items-center gap-2">
             {/* aria-disabled, not disabled: a disabled button drops focus to the page. */}
@@ -73,17 +79,25 @@ export function ConnectionsPage() {
               className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
               onClick={() => void transfer.startImport()}
             >
-              <UploadSimple className="size-4" /> Import…
+              <UploadSimple className="size-4" /> Import setup…
             </Button>
-            <Button
-              size="sm"
-              variant="secondary"
-              aria-disabled={transfer.busy || undefined}
-              className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
-              onClick={() => void transfer.exportSetup()}
-            >
-              <DownloadSimple className="size-4" /> Export…
-            </Button>
+            {/* Nothing to carry over until a model is set up. */}
+            {config.data && config.data.models.length > 0 ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    aria-disabled={transfer.busy || undefined}
+                    className="aria-disabled:pointer-events-none aria-disabled:opacity-50"
+                    onClick={() => void transfer.exportSetup()}
+                  >
+                    <DownloadSimple className="size-4" /> Export setup…
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Includes your API keys in plain text.</TooltipContent>
+              </Tooltip>
+            ) : null}
           </div>
         }
       />
@@ -97,6 +111,9 @@ export function ConnectionsPage() {
                 autoFocus={focus === "setup"}
                 importing={transfer.busy}
                 onImport={() => void transfer.startImport()}
+                onConnected={(tested) => {
+                  if (!workdir) setConnected({ tested });
+                }}
               />
             ) : config.data.per_step ? (
               <PerStepView
@@ -106,6 +123,7 @@ export function ConnectionsPage() {
               />
             ) : (
               <>
+                {connected && !workdir ? <NextStepCard tested={connected.tested} /> : null}
                 <FlowStrip
                   usable={isUsable(main)}
                   webSearch={webSearchNode(config.data, steps, main, providers.data)}
@@ -117,7 +135,7 @@ export function ConnectionsPage() {
                   model={main}
                   providers={providers.data}
                   caps={caps.data}
-                  focusEdit={focus === "edit"}
+                  focusEdit={focus === "edit" && !connected}
                   onRemoving={(remaining) => setFocus(remaining ? "edit" : "setup")}
                 />
               </>
@@ -125,7 +143,7 @@ export function ConnectionsPage() {
           ) : error ? (
             <div className="flex items-center gap-3 rounded-2xl border border-border bg-card px-5 py-4 text-[12.5px]">
               <span className="min-w-0 flex-1 text-[color:var(--color-coral)]">
-                Couldn’t load your connections: {String(error)}
+                Couldn’t load your models: {String(error)}
               </span>
               <Button
                 size="sm"
@@ -140,7 +158,7 @@ export function ConnectionsPage() {
             </div>
           ) : (
             <div className="flex items-center gap-2 py-6 text-[12px] text-muted-foreground">
-              <Spinner className="size-3.5" /> Loading connections…
+              <Spinner className="size-3.5" /> Loading your models…
             </div>
           )}
         </div>
@@ -158,6 +176,7 @@ function FirstRunCard({
   autoFocus,
   importing,
   onImport,
+  onConnected,
 }: {
   config: ConnectionsConfig;
   providers: ProviderInfo[];
@@ -165,8 +184,10 @@ function FirstRunCard({
   autoFocus: boolean;
   /** An export or import is in flight. */
   importing: boolean;
-  /** "Import your setup": the header's Import… flow. */
+  /** "Import your setup": the header's Import setup… flow. */
   onImport: () => void;
+  /** Saved; `tested`: the test passed (false for "Save anyway"). */
+  onConnected: (tested: boolean) => void;
 }) {
   const qc = useQueryClient();
   const titleId = useId();
@@ -197,8 +218,14 @@ function FirstRunCard({
           await qc.prefetchQuery(capabilitiesQuery(model.provider, model.model));
           await m.saveModel.mutateAsync({ model });
           const name = providerName(findProvider(providers, model.provider), model);
-          if (tested) toast.success(`Connected to ${name}`);
-          else toast.success(`Saved without confirming — ${name} didn’t answer the test.`);
+          onConnected(tested);
+          // With no folder open, the next-step card says it; otherwise a toast does.
+          if (useAppStore.getState().workdir) {
+            if (tested) toast.success(`Connected to ${name}`);
+            else toast.success(`Saved without confirming — ${name} didn’t answer the test.`);
+          } else if (!tested) {
+            toast.message(`Saved without confirming — ${name} didn’t answer the test.`);
+          }
         }}
       />
       {stage === "pick" ? (

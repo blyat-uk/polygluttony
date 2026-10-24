@@ -82,11 +82,11 @@ fn find_model<'a>(models: &'a [Model], id: &str) -> Option<&'a Model> {
 /// The connection `step` runs on: its library model merged with the step's
 /// settings, ready to run. `NoActiveConnection` while nothing is set up; when
 /// the step's model has no key, a message that names the step the way the
-/// Connections page does, so the user knows which row to fix.
+/// Models page does, so the user knows which row to fix.
 pub fn step_connection(cfg: &AppConfig, step: Step) -> AppResult<Connection> {
     let steps = cfg.steps.as_ref().ok_or(AppError::NoActiveConnection)?;
     let Some(settings) = steps.get(step) else {
-        return Err(AppError::Other("Web search is off. Turn it on on the Connections page.".into()));
+        return Err(AppError::Other("Look up names online is off. Turn it on on the Models page.".into()));
     };
     // `normalize` keeps every step on a library model; a dangling id can only
     // come from a config that skipped it, and runs nothing.
@@ -393,8 +393,9 @@ pub fn show_every_step(cfg: &mut AppConfig) -> AppResult<()> {
 /// settings `model_id` already has on the first of Translate, Extract,
 /// Normalize, Verify that runs on it (else fresh defaults). Web search follows
 /// when it was on and this model can search, stays on another search model it
-/// was already on, and otherwise turns off. Models no step uses then leave the
-/// library, taking their unused keys with them.
+/// was already on, and otherwise turns off. Only the steps move: every library
+/// model and every saved key stays, so going back to a model per step needs
+/// nothing connected again. Removing a model is the only way to delete one.
 pub fn use_one_model(cfg: &mut AppConfig, model_id: &str) -> AppResult<()> {
     let steps = cfg.steps.as_ref().ok_or(AppError::NoActiveConnection)?;
     let searches = library_model(&cfg.models, model_id)?.can_search();
@@ -410,15 +411,8 @@ pub fn use_one_model(cfg: &mut AppConfig, model_id: &str) -> AppResult<()> {
         Some(other) if other.model != model_id => Some(other.clone()),
         _ => None,
     };
-    let steps = Steps::all(source, web_search);
-    let (kept, dropped): (Vec<Model>, Vec<Model>) =
-        std::mem::take(&mut cfg.models).into_iter().partition(|m| steps.uses(&m.id));
-    cfg.models = kept;
-    cfg.steps = Some(steps);
+    cfg.steps = Some(Steps::all(source, web_search));
     cfg.per_step = false;
-    for model in dropped {
-        forget_unused_key(cfg, model.provider);
-    }
     normalize(cfg);
     Ok(())
 }
@@ -1122,24 +1116,27 @@ mod tests {
         ]);
         put(&mut cfg, Step::Normalize, on("m2"));
         let err = step_connection(&cfg, Step::Normalize).unwrap_err().to_string();
-        assert_eq!(err, "Normalize uses Claude Opus 5.5, which needs an API key. Add it on the Connections page.");
+        assert_eq!(err, "Tidy up uses Claude Opus 5.5, which needs an API key. Add it on the Models page.");
         assert!(step_connection(&cfg, Step::Translate).is_ok(), "the other steps still run");
-        // Every step by its name on the Connections page.
+        // Every step by its name on the Models page.
         for s in Step::ALL {
             put(&mut cfg, s, on("m2"));
             let err = step_connection(&cfg, s).unwrap_err().to_string();
             assert_eq!(
                 err,
-                format!("{} uses Claude Opus 5.5, which needs an API key. Add it on the Connections page.", s.label())
+                format!("{} uses Claude Opus 5.5, which needs an API key. Add it on the Models page.", s.label())
             );
         }
-        assert!(step_connection(&cfg, Step::Extract).unwrap_err().to_string().starts_with("Extract names uses"));
+        assert!(step_connection(&cfg, Step::Extract).unwrap_err().to_string().starts_with("Find names uses"));
     }
 
     #[test]
     fn web_search_off_has_no_connection() {
         let cfg = library(&[sample_model(Provider::Ollama, "qwen3")]);
-        assert!(step_connection(&cfg, Step::WebSearch).is_err());
+        assert_eq!(
+            step_connection(&cfg, Step::WebSearch).unwrap_err().to_string(),
+            "Look up names online is off. Turn it on on the Models page."
+        );
         assert_eq!(resolve_web_search(&cfg), None);
         assert_eq!(web_search_label(&cfg), None);
     }
@@ -1704,20 +1701,17 @@ mod tests {
         let mut cfg = mixed();
         use_one_model(&mut cfg, "m1").unwrap();
         assert_eq!(web_search(&cfg), Some(step(&cfg, Step::Translate)));
-        assert_eq!(ids(&cfg), ["m1"], "Gemini does nothing any more");
 
         // The chosen model can't search: web search stays on the model it was on.
         let mut cfg = mixed();
         use_one_model(&mut cfg, "m4").unwrap();
         assert_eq!(web_search(&cfg), Some(&on("m3")));
-        assert_eq!(ids(&cfg), ["m3", "m4"]);
 
         // Even when that was the old shared model.
         let mut cfg = library(&[sample_model(Provider::Anthropic, "claude-sonnet-5-5"), sample_model(Provider::Ollama, "qwen3")]);
         let searching = step(&cfg, Step::WebSearch).clone();
         use_one_model(&mut cfg, "m2").unwrap();
         assert_eq!(web_search(&cfg), Some(&searching));
-        assert_eq!(ids(&cfg), ["m1", "m2"]);
 
         // Off stays off.
         let mut cfg = mixed();
@@ -1727,12 +1721,24 @@ mod tests {
     }
 
     #[test]
-    fn use_one_model_drops_unused_models_and_their_keys() {
+    fn use_one_model_keeps_every_model_and_key() {
         let mut cfg = mixed();
+        let models = cfg.models.clone();
+        let keys = cfg.provider_keys.clone();
         use_one_model(&mut cfg, "m1").unwrap();
-        assert_eq!(ids(&cfg), ["m1"]);
-        assert_eq!(remembered(&cfg, "anthropic").as_deref(), Some("sk-ant"), "Sonnet still uses it");
-        assert_eq!(remembered(&cfg, "google"), None, "gone with Gemini");
+        // Only the steps move: Opus, Gemini and Qwen stay in the library, with
+        // their keys, for when the user goes back to a model per step.
+        assert_eq!(cfg.models, models);
+        assert_eq!(cfg.provider_keys, keys);
+        assert_eq!(remembered(&cfg, "google").as_deref(), Some("AIza"));
+        assert!(Step::TEXT.iter().all(|&s| step(&cfg, s).model == "m1"));
+        assert!(!cfg.per_step);
+
+        // Back to a model per step: nothing has to be connected again.
+        show_every_step(&mut cfg).unwrap();
+        set_step(&mut cfg, Step::Verify, Some(on("m3"))).unwrap();
+        assert_eq!(step(&cfg, Step::Verify).model, "m3");
+        assert!(step_connection(&cfg, Step::Verify).is_ok(), "Gemini still has its key");
     }
 
     #[test]

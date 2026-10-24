@@ -19,4 +19,9 @@ skipped: Array<string>,
 /**
  * This install already has models or edited prompts, which the import replaces.
  */
-replaces_existing: boolean, };
+replaces_existing: boolean, 
+/**
+ * After an import that replaced a setup: the export of the replaced setup,
+ * saved first. Importing it undoes the import. `None` before an import.
+ */
+backup: string | null, };

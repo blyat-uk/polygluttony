@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ArrowSquareOut, WarningCircle, XCircle } from "@phosphor-icons/react";
+import { ArrowSquareOut, CaretRight, WarningCircle, XCircle } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -130,5 +130,20 @@ export function ConnectButton({
               : "Connect"}
       </span>
     </Button>
+  );
+}
+
+/** "Details ▸": the provider's own words for a failure, closed until asked for. */
+export function Details({ text, className }: { text: string; className?: string }) {
+  return (
+    <details className={cn("group text-[11px] leading-4", className)}>
+      <summary className="inline-flex cursor-pointer list-none items-center gap-1 rounded-md text-muted-foreground outline-none select-none hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+        Details
+        <CaretRight weight="fill" className="size-2.5 transition-transform group-open:rotate-90" />
+      </summary>
+      <pre className="mt-1.5 max-h-32 overflow-auto rounded-lg border border-border bg-[color:var(--color-obsidian)] px-2.5 py-2 font-mono text-[11px] whitespace-pre-wrap break-words text-muted-foreground select-text">
+        {text}
+      </pre>
+    </details>
   );
 }

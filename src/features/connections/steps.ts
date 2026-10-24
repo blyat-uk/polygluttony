@@ -20,20 +20,20 @@ export const STEP_INFO: Record<
   { name: string; purpose: string; phase: Phase; tuning: readonly TuningField[] }
 > = {
   extract: {
-    name: "Extract names",
+    name: "Find names",
     purpose: "Finds names and terms in your subtitles",
     phase: "glossary",
     tuning: ["batch_dialogue_limit", "concurrency", "timeout", "max_tokens"],
   },
   normalize: {
-    name: "Normalize",
-    purpose: "Fixes spellings, drops generic terms",
+    name: "Tidy up",
+    purpose: "Fixes spellings and drops generic terms",
     phase: "glossary",
     tuning: ["concurrency", "timeout", "max_tokens"],
   },
   "web-search": {
-    name: "Web search",
-    purpose: "Looks up names fans already use",
+    name: "Look up names online",
+    purpose: "Finds the names fans already use",
     phase: "glossary",
     // One request per glossary build.
     tuning: ["timeout", "max_tokens"],
@@ -46,7 +46,7 @@ export const STEP_INFO: Record<
   },
   verify: {
     name: "Verify",
-    purpose: "Checks each file, flags lines to redo",
+    purpose: "Checks each episode and redoes lines that slipped",
     phase: "translation",
     // Verifies files as Translate finishes them, so it runs as many at once as Translate.
     tuning: ["timeout", "max_tokens"],
@@ -90,7 +90,7 @@ export function listNames(names: readonly string[]): string {
   return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }
 
-/** "Extract names and Translate", "Extract names, Normalize and Verify". */
+/** "Find names and Translate", "Find names, Tidy up and Verify". */
 export function stepNames(steps: Step[]): string {
   return listNames(steps.map((s) => STEP_INFO[s].name));
 }
@@ -107,14 +107,16 @@ export function defaultStepSettings(modelId: string): StepSettings {
   };
 }
 
-/** Model colours, by `Model.color` (fixed when the model joins the library). */
+/** Model colours, by `Model.color` (fixed when the model joins the library). Warm neutral
+ *  tints only: a model's dot must never read as a state (gold live, aqua verifying, jade
+ *  done, amber needs a look, coral failed, muted waiting), nor as violet, rose or sky. */
 const MODEL_PALETTE = [
-  "var(--color-gold)",
-  "#c9a2ff", // violet
-  "var(--color-aqua)",
-  "var(--color-jade)",
-  "#f2a0c4", // rose
-  "#8fb4ff", // sky
+  "#d9b98a", // sand
+  "#b08a5a", // bronze
+  "#e8d7b5", // parchment
+  "#a8998a", // stone
+  "#7f6c5c", // umber
+  "#cfc6b8", // ash
 ] as const;
 
 export function modelColor(model: Pick<Model, "color"> | undefined): string {
