@@ -111,31 +111,41 @@ pub(crate) fn lookup_input(existing: Option<&Glossary>, new_terms: &Glossary) ->
 
 /// Writes the build's glossary. Before the FIRST write it saves the glossary
 /// on disk to the history (reason `scan` or `rebuild`), so the version the
-/// build started from can be restored; a build that never writes leaves no
-/// history entry. When the snapshot fails the write doesn't happen (and the
-/// next write tries the snapshot again): no undo, no overwrite.
+/// build started from can be restored. A save of the terms already on disk is
+/// skipped, so a build that changes nothing leaves no history entry. When the
+/// snapshot fails the write doesn't happen (and the next write tries the
+/// snapshot again): no undo, no overwrite.
 struct BuildWriter<'a> {
     folder: &'a Path,
     snapshot: Option<GlossaryChangeKind>,
+    /// What glossary.json holds, as far as this build knows.
+    on_disk: Option<Glossary>,
+    wrote: bool,
 }
 
 impl<'a> BuildWriter<'a> {
-    fn new(folder: &'a Path, mode: BuildMode) -> Self {
+    fn new(folder: &'a Path, mode: BuildMode, on_disk: Option<Glossary>) -> Self {
         let reason = match mode {
             BuildMode::Append => GlossaryChangeKind::Scan,
             BuildMode::Regenerate => GlossaryChangeKind::Rebuild,
         };
-        BuildWriter { folder, snapshot: Some(reason) }
+        BuildWriter { folder, snapshot: Some(reason), on_disk, wrote: false }
     }
 
     fn save(&mut self, g: &Glossary) -> AppResult<()> {
+        if self.on_disk.as_ref() == Some(g) {
+            return Ok(());
+        }
         if let Some(reason) = self.snapshot {
             history::snapshot(self.folder, reason).map_err(|e| {
                 AppError::Other(format!("couldn't save a copy of the current glossary first ({e})"))
             })?;
             self.snapshot = None;
         }
-        save_folder_glossary(self.folder, g)
+        save_folder_glossary(self.folder, g)?;
+        self.on_disk = Some(g.clone());
+        self.wrote = true;
+        Ok(())
     }
 }
 
@@ -341,7 +351,7 @@ pub async fn build_glossary(
         .collect();
 
     let glossary_path = job.folder.join("glossary.json");
-    let mut writer = BuildWriter::new(&job.folder, job.mode);
+    let mut writer = BuildWriter::new(&job.folder, job.mode, diff_base.clone());
     let mut new_terms = Glossary::new(&job.world_type);
     let mut errors: Vec<String> = reference_errors;
     let mut terms_extracted = 0u32;
@@ -506,8 +516,11 @@ pub async fn build_glossary(
     // Files count as scanned only when every batch made it: batches span
     // files, so after a failed, stopped or aborted batch no file is known to
     // be fully in the glossary. Add new episodes then offers them again.
-    if !result.is_empty() {
-        let scanned: &[String] = if batches_processed == total { &loaded_files } else { &[] };
+    // Recorded when the build wrote something, or scanned everything (a scan
+    // that found nothing new still scanned its files).
+    let complete = batches_processed == total;
+    if !result.is_empty() && (writer.wrote || complete) {
+        let scanned: &[String] = if complete { &loaded_files } else { &[] };
         if let Err(e) =
             record_build(&job.folder, job.mode, diff_base.as_ref(), &result, scanned, diff.clone())
         {
@@ -1459,5 +1472,46 @@ mod tests {
         let saved = load_folder_glossary(dir.path()).unwrap();
         assert_eq!(saved.count(), 1);
         assert_eq!(saved.characters["应欢欢"], "Ying Huanhuan", "the old glossary is intact");
+    }
+
+    /// Add new episodes that finds nothing new rewrites nothing and takes no
+    /// snapshot, but still records the episodes as scanned.
+    #[tokio::test(start_paused = true)]
+    async fn append_that_finds_nothing_new_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hand-formatted on disk: a rewrite would change these bytes.
+        let hand = r#"{"world_type":"xianxia","terms":{"characters":{"林动":"Lin Dong"}}}"#;
+        std::fs::write(dir.path().join("glossary.json"), hand).unwrap();
+        write_ass(dir.path(), "e2.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Ok(r#"{"characters":{"林动":"lin dong"}}"#.into())]);
+        let svc = svc1(d, cancel.clone());
+        let (_events, s) =
+            run_and_collect(job(dir.path(), vec!["e2.ass".into()], cancel), &svc, None).await;
+        assert!(!s.diff.has_changes);
+        assert_eq!(std::fs::read_to_string(dir.path().join("glossary.json")).unwrap(), hand);
+        assert!(history::list(dir.path()).is_empty());
+        let m = load_meta(dir.path());
+        assert_eq!(m.scanned_files, vec!["e2.ass".to_string()]);
+        assert!(m.unreviewed.is_empty());
+    }
+
+    /// A build where every batch failed changes nothing — not even the meta's
+    /// last change.
+    #[tokio::test(start_paused = true)]
+    async fn append_where_every_batch_failed_leaves_meta_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("林动", "Lin Dong")])).unwrap();
+        write_ass(dir.path(), "e2.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Err(LlmError::Http {
+            status: 400,
+            body: "bad".into(),
+            retry_after: None,
+        })]);
+        let svc = svc1(d, cancel.clone());
+        run_and_collect(job(dir.path(), vec!["e2.ass".into()], cancel), &svc, None).await;
+        assert!(history::list(dir.path()).is_empty());
+        assert!(crate::glossary::meta::read_meta(dir.path()).is_none(), "no sidecar written");
     }
 }
