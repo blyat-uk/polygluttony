@@ -33,7 +33,9 @@ export function startBuild(
   useGlossaryUi.setState({
     panel: null,
     improve: null,
-    afterScan: opts.kind === "scan",
+    // A chained scan reports on the Episodes page; the Glossary page mustn't
+    // pick it up later.
+    afterScan: opts.kind === "scan" && !opts.chained,
     firstBuild: opts.kind === "first" && !opts.chained ? view.folder : null,
   });
   run.startOp("build", view.folder);

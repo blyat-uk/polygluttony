@@ -73,6 +73,8 @@ export interface GlossaryNote {
   first: boolean;
   terms: number;
   added: number;
+  /** Some of the episodes couldn't be read; they're offered again next time. */
+  partial: boolean;
 }
 
 export type BannerState =
@@ -149,10 +151,14 @@ function StepTrail({ steps, at }: { steps: TwoSteps; at: 1 | 2 }) {
 
 /** "Glossary built with 12 terms. ", "Glossary updated with 3 new terms. " */
 function glossarySentence(g: GlossaryNote): string {
-  if (g.first) return `Glossary built with ${plural(g.terms, "term")}. `;
-  return g.added > 0
-    ? `Glossary updated with ${plural(g.added, "new term")}. `
-    : "No new names for the glossary. ";
+  const what = g.first
+    ? `Glossary built with ${plural(g.terms, "term")}`
+    : g.added > 0
+      ? `Glossary updated with ${plural(g.added, "new term")}`
+      : "No new names for the glossary";
+  return g.partial
+    ? `${what}, but part of the episodes couldn’t be read; they’ll be offered again next time. `
+    : `${what}. `;
 }
 
 /**

@@ -23,7 +23,7 @@ export interface CombinedPlan {
 
 /** How a glossary step ended. Only `built` goes on to translate. */
 export type GlossaryStepEnd =
-  | { kind: "built"; terms: number; added: number }
+  | { kind: "built"; terms: number; added: number; partial: boolean }
   | { kind: "stopped"; terms: number }
   | { kind: "failed"; message: string; models?: boolean };
 
@@ -70,7 +70,11 @@ export function watchCombinedRuns(): () => void {
   return useGlossaryRun.subscribe((g, prev) => {
     const plan = useCombinedRun.getState().pending;
     if (!plan || prev.busy !== "build" || g.busy !== null || g.folder !== plan.folder) return;
-    const end = stepEnd(g.summary, g.error);
+    let end = stepEnd(g.summary, g.error);
+    // A Stop the build never heard (pressed before it got going) still stops the run.
+    if (end.kind === "built" && useCombinedRun.getState().stopRequested) {
+      end = { kind: "stopped", terms: end.terms };
+    }
     useCombinedRun.setState({ pending: null, stopRequested: false, last: { plan, end } });
     if (end.kind === "built") startTranslationRun(plan.folder, plan.files, plan.prefs);
   });
@@ -93,5 +97,20 @@ function stepEnd(
       models: true,
     };
   }
-  return { kind: "built", terms: summary.terms_final, added: summary.diff.total_added };
+  // Nothing came back: the model is down or unreachable, and translating would fail too.
+  if (summary.batches_total > 0 && summary.batches_processed === 0) {
+    return {
+      kind: "failed",
+      message: "The model didn't answer. Check it on the Models page.",
+      models: true,
+    };
+  }
+  return {
+    kind: "built",
+    terms: summary.terms_final,
+    added: summary.diff.total_added,
+    // Some batches failed: the glossary goes ahead with what came back, and
+    // those episodes aren't on record as read, so they're offered again.
+    partial: summary.batches_processed < summary.batches_total,
+  };
 }

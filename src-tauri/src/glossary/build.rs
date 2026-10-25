@@ -392,8 +392,9 @@ pub async fn build_glossary(
     // ── Extracting: all batches through the LLM, one shared system prompt ──
     let batches = glossary_batches(&all_lines, job.batch_limit);
     let total = batches.len() as u32;
-    // An episode is read once every batch holding its lines is back (answered
-    // or failed). Batches finish in any order, so count down per file.
+    // An episode is read once every batch holding its lines has come back with
+    // an answer; one that failed (or was stopped) leaves it unread. Batches
+    // finish in any order, so count down per file.
     let batch_files = files_per_batch(&loaded_lengths, batch_lines(job.batch_limit));
     let mut left = vec![0u32; loaded_files.len()];
     for files in &batch_files {
@@ -449,7 +450,7 @@ pub async fn build_glossary(
                 let result = svc.request(req).await;
                 let done = completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 let _ = tx.send(GlossaryEvent::Progress { done, total }).await;
-                let read: Vec<String> = {
+                let read: Vec<String> = if result.is_ok() {
                     let mut left = left.lock().unwrap_or_else(|e| e.into_inner());
                     files
                         .iter()
@@ -459,6 +460,8 @@ pub async fn build_glossary(
                         })
                         .map(|&i| loaded[i].clone())
                         .collect()
+                } else {
+                    Vec::new()
                 };
                 for file in read {
                     let _ = tx.send(GlossaryEvent::FileRead { file }).await;
@@ -881,6 +884,33 @@ mod tests {
         assert_eq!(saved.characters.get("应欢欢").unwrap(), "Ying Huanhuan"); // existing preserved
         assert_eq!(saved.characters.get("林动").unwrap(), "Lin Dong"); // partial kept
         assert_eq!(s.diff.total_added, 1); // diff vs pre-build state
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_episode_whose_batch_failed_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ass(dir.path(), "e1.ass", &["一"]); // batch 1
+        write_ass(dir.path(), "e2.ass", &["二"]); // batch 2
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![
+            Ok(r#"{"characters":{"林动":"Lin Dong"}}"#.into()),
+            Err(LlmError::Http { status: 401, body: "bad key".into(), retry_after: None }),
+        ]);
+        let svc = svc1(d, cancel.clone());
+        let (events, _) = run_and_collect(
+            job(dir.path(), vec!["e1.ass".into(), "e2.ass".into()], cancel),
+            &svc,
+            None,
+        )
+        .await;
+        let read: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                GlossaryEvent::FileRead { file } => Some(file.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(read, vec!["e1.ass"]);
     }
 
     #[tokio::test(start_paused = true)]

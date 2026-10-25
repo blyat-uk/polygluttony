@@ -342,7 +342,12 @@ function Episodes({ folder }: { folder: string }) {
           tally,
           glossary:
             chainedHere && end?.kind === "built"
-              ? { first: chainedHere.plan.kind === "first", terms: end.terms, added: end.added }
+              ? {
+                  first: chainedHere.plan.kind === "first",
+                  terms: end.terms,
+                  added: end.added,
+                  partial: end.partial,
+                }
               : undefined,
         };
   } else if (lastHere?.end.kind === "stopped") {
@@ -435,9 +440,7 @@ function Episodes({ folder }: { folder: string }) {
           busy={run.running || glossaryBusy}
           onResume={(files) => startRun(files)}
           onRetry={(files) => startRun(files)}
-          onRetryGlossary={() => {
-            if (lastHere) startCombinedRun(view, { ...lastHere.plan, prefs: view.prefs });
-          }}
+          onRetryGlossary={start}
           onCheckNewTerms={checkNewTerms}
         />
 
