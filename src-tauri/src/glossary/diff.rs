@@ -28,6 +28,8 @@ pub struct TermDiff {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../src/types/generated/")]
 pub struct CategoryDiff {
+    /// Category key ("characters"), as used in `GlossaryDoc::terms`.
+    pub key: String,
     /// Display label ("Characters", "Cultivation", …).
     pub name: String,
     pub terms: Vec<TermDiff>,
@@ -101,6 +103,7 @@ impl GlossaryDiff {
             tr += r;
             tm += m;
             categories.push(CategoryDiff {
+                key: c.to_string(),
                 name: label(c),
                 terms,
                 added: a,

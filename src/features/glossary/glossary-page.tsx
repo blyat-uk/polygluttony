@@ -1,100 +1,142 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { BookOpen } from "@phosphor-icons/react";
 import { ipc } from "@/lib/ipc";
 import { useAppStore } from "@/stores/app-store";
 import { useGlossaryRun } from "@/stores/glossary-store";
-import { useProject, projectKey } from "@/features/project/use-project";
+import { useOpenFolder, useProject, projectKey } from "@/features/project/use-project";
 import type { ProjectView } from "@/types/generated/ProjectView";
 import { EmptyState } from "@/components/empty-state";
+import { Button } from "@/components/ui/button";
 import { CreateView } from "./create-view";
 import { BuildProgress } from "./build-progress";
 import { ImportProgress } from "./import-progress";
 import { EditorView } from "./editor-view";
 import { ReferenceReview } from "./reference-review";
-import { UpdateView } from "./update-view";
+import { UnreadableView } from "./unreadable-view";
+import { syncLoaded, useGlossaryDoc } from "./doc-store";
+import { glossaryKey, recentlySavedLocally } from "./keys";
+import { useGlossaryUi } from "./ui-store";
+import type { GlossaryState } from "./model";
 
-export function glossaryKey(folder: string) {
-  return ["glossary", folder] as const;
-}
-
-// I3 — self-save suppression: every persist() renames the file which fires
-// FileChanged → fileTick → invalidate. That invalidation can resolve after a
-// newer optimistic setQueryData and silently revert the edit. We suppress the
-// invalidation for 1500 ms after an in-app save. External edits (OS editor)
-// cannot coincide with active in-app editing, so this is an accepted blind spot.
-let lastLocalSaveAt = 0;
-export function markLocalSave() {
-  lastLocalSaveAt = Date.now();
-}
+// Kept here for anything that imported them from the page.
+export { glossaryKey, markLocalSave } from "./keys";
 
 export function GlossaryPage() {
   const workdir = useAppStore((s) => s.workdir);
+  if (!workdir) return <NoFolder />;
+  return <FolderGlossary folder={workdir} />;
+}
+
+function NoFolder() {
+  const open = useOpenFolder();
+  const pick = async () => {
+    const path = await openDialog({ directory: true, multiple: false });
+    if (typeof path === "string") open.mutate(path);
+  };
+  return (
+    <EmptyState
+      icon={<BookOpen weight="duotone" className="size-9 text-primary" />}
+      title="Glossary"
+      description="Open a folder of subtitles first. Its glossary lives next to the episodes."
+      action={
+        <Button className="mt-2" onClick={() => void pick()} disabled={open.isPending}>
+          Open folder
+        </Button>
+      }
+    />
+  );
+}
+
+function FolderGlossary({ folder }: { folder: string }) {
   const qc = useQueryClient();
   const busy = useGlossaryRun((s) => s.busy);
   const fileTick = useGlossaryRun((s) => s.fileTick);
   const reviewOpen = useGlossaryRun((s) => s.reviewOpen);
-  const updateOpen = useGlossaryRun((s) => s.updateOpen);
-  const { data: view } = useProject(workdir ?? "");
-  const { data: doc, isPending } = useQuery({
-    queryKey: glossaryKey(workdir ?? ""),
-    queryFn: () => ipc.loadGlossary(workdir ?? ""),
-    enabled: !!workdir,
+  const { data: view } = useProject(folder);
+  // Always reloaded when the page mounts: an episode window, a text editor or
+  // Restore may have changed the file while the page was away, and an edit
+  // made on a stale copy would save over that change.
+  const { data: load, isPending } = useQuery({
+    queryKey: glossaryKey(folder),
+    queryFn: () => ipc.loadGlossary(folder),
+    staleTime: 0,
+    refetchOnMount: "always",
   });
+  const state = useMemo<GlossaryState | null>(
+    () => (load?.status === "ok" ? { doc: load.doc, meta: load.meta } : null),
+    [load],
+  );
+  // An emptied glossary stays in the workspace while there's something to undo.
+  const hasHistory = useGlossaryDoc(
+    (s) => s.folder === folder && (s.undo.length > 0 || s.redo.length > 0),
+  );
+
+  // Files copied into the folder since it was read show up here (Add new
+  // episodes) without a trip to Episodes → Rescan.
+  useEffect(() => {
+    void qc.invalidateQueries({ queryKey: projectKey(folder) });
+  }, [qc, folder]);
+
+  // Workspace state (filters, open panel) belongs to one folder.
+  useEffect(() => {
+    useGlossaryUi.getState().forFolder(folder);
+  }, [folder]);
 
   // Run state is global; a run (or its results) belongs to the folder it was
-  // started in. Reset only when the state belongs to a DIFFERENT folder —
-  // never on plain remounts (results of a run that finished while the user
-  // was on another view must survive), and never mid-run for this folder.
+  // started in. Reset only when the state belongs to a DIFFERENT folder:
+  // never on plain remounts, and never mid-run.
   useEffect(() => {
     const s = useGlossaryRun.getState();
-    if (s.folder !== null && s.folder !== workdir && !s.busy) s.reset();
-  }, [workdir]);
+    if (s.folder !== null && s.folder !== folder && !s.busy) s.reset();
+  }, [folder]);
 
-  // O15 — watch glossary.json for external edits while this view is mounted.
+  // O15: watch glossary.json for external edits while this page is mounted.
   useEffect(() => {
-    if (!workdir) return;
-    void ipc.watchGlossary(workdir);
+    void ipc.watchGlossary(folder);
     return () => {
       void ipc.unwatchGlossary();
     };
-  }, [workdir]);
+  }, [folder]);
 
-  // Build completion / external edits → refetch the glossary.
-  // Self-save suppression (I3): skip if the tick was caused by our own persist()
-  // rename — the optimistic setQueryData is already up to date.
+  // Build completion / external edits → refetch. Our own saves rename the file
+  // too; skip those (I3), the cache already holds what we wrote.
   useEffect(() => {
-    if (!workdir || fileTick === 0) return;
-    if (Date.now() - lastLocalSaveAt < 1500) return;
-    void qc.invalidateQueries({ queryKey: glossaryKey(workdir) });
-  }, [fileTick, workdir, qc]);
+    if (fileTick === 0 || recentlySavedLocally()) return;
+    void qc.invalidateQueries({ queryKey: glossaryKey(folder) });
+  }, [fileTick, folder, qc]);
 
-  // Whenever the glossary doc (re)loads — build Done, external edit, mount —
-  // sync the term count into the rail badge and the cached ProjectView, which
-  // is staleTime-Infinity and would otherwise feed stale counts back to the
-  // shell on the next prefs save.
+  // Tell our own writes from changes on disk (they start a new undo history).
   useEffect(() => {
-    if (!workdir || doc === undefined) return;
-    const n = doc?.count ?? null;
-    useAppStore.getState().setGlossaryTerms(n);
-    qc.setQueryData<ProjectView>(projectKey(workdir), (v) =>
-      v ? { ...v, glossary_terms: n } : v,
-    );
-  }, [doc, workdir, qc]);
+    if (state) syncLoaded(folder, state);
+  }, [state, folder]);
 
-  if (!workdir) return <EmptyState title="Glossary" description="Open a folder first." />;
+  // Whenever the glossary (re)loads, sync the term count into the rail badge
+  // and the cached ProjectView (staleTime: Infinity), which would otherwise
+  // feed a stale count back to the shell.
+  const count = load === undefined ? undefined : load.status === "ok" ? load.doc.count : null;
+  useEffect(() => {
+    if (count === undefined) return;
+    useAppStore.getState().setGlossaryTerms(count);
+    qc.setQueryData<ProjectView>(projectKey(folder), (v) => (v ? { ...v, glossary_terms: count } : v));
+  }, [count, folder, qc]);
+
   if (view && !view.supports_glossary) {
     return (
       <EmptyState
         title="Glossary"
-        description="Glossary extraction isn't available for this source language — it currently supports Chinese sources."
+        description="A glossary can only be built for Chinese subtitles for now."
       />
     );
   }
   if (busy === "build") return <BuildProgress />;
   if (busy === "import") return <ImportProgress />;
-  if (!view || isPending) return null;
+  if (!view || isPending || !load) return null;
   if (reviewOpen) return <ReferenceReview view={view} />;
-  if (!doc || doc.count === 0) return <CreateView view={view} />;
-  if (updateOpen) return <UpdateView view={view} doc={doc} />;
-  return <EditorView view={view} doc={doc} />;
+  if (load.status === "unreadable") {
+    return <UnreadableView folder={folder} message={load.message} line={load.line} />;
+  }
+  if (!state || (state.doc.count === 0 && !hasHistory)) return <CreateView view={view} />;
+  return <EditorView view={view} state={state} />;
 }

@@ -9,6 +9,7 @@ use crate::config::providers::{self, ModelCapabilities, ProviderInfo};
 use crate::config::store;
 use crate::config::{AppConfig, Connection, Driver, Model, Provider, Step, StepSettings};
 use crate::error::{AppError, AppResult};
+use crate::events::ErrorKind;
 use crate::llm::create_driver;
 use crate::llm::detect::detect_format;
 use crate::llm::error::LlmError;
@@ -153,7 +154,7 @@ async fn run_test(model: &Model, web_search: bool) -> TestResult {
         // result rather than an IPC-level error (spec §5.7).
         Err(_) => {
             let message = undetected_message(&connection);
-            return failed(&connection, None, TestProblem::Address, true, message);
+            return failed(&connection, None, TestProblem::Address, true, message, None);
         }
     };
 
@@ -176,14 +177,19 @@ async fn run_test(model: &Model, web_search: bool) -> TestResult {
                 message,
                 problem: None,
                 can_save_anyway: false,
+                detail: None,
             }
         }
-        Err(e) => {
-            let (problem, can_save_anyway) = classify_test_error(&e);
-            let message = failure_message(&connection, problem, &e);
-            failed(&connection, detected, problem, can_save_anyway, message)
-        }
+        Err(e) => failed_from(&connection, detected, &e),
     }
+}
+
+/// A test that reached the provider and failed: what kind of problem, the
+/// message for it, and the provider's own words for "Details".
+fn failed_from(conn: &Connection, detected: Option<Driver>, err: &LlmError) -> TestResult {
+    let (problem, can_save_anyway) = classify_test_error(err);
+    let message = failure_message(conn, problem, err);
+    failed(conn, detected, problem, can_save_anyway, message, Some(err.to_string()))
 }
 
 /// The models the server offers, for the model menu. `Err` (a message fit to
@@ -207,6 +213,7 @@ fn failed(
     problem: TestProblem,
     can_save_anyway: bool,
     message: String,
+    detail: Option<String>,
 ) -> TestResult {
     TestResult {
         ok: false,
@@ -215,32 +222,28 @@ fn failed(
         message,
         problem: Some(problem),
         can_save_anyway,
+        detail,
     }
 }
 
 /// Pure: which field a failed test points at, and whether saving untested is
 /// reasonable — true only when the failure may pass on its own (unreachable,
-/// timed out, rate-limited, server trouble), never for a bad key or model.
+/// timed out, rate-limited, server trouble), never for a bad key or model, and
+/// not for an empty account (it needs credit first).
+///
+/// Classified exactly as a run classifies the same error ([`LlmError::kind`]),
+/// so a test and a run never disagree: a 429 counts as billing only when it
+/// says the account is out of credit (`insufficient_quota`), not when a
+/// rate-limit message merely mentions quota or billing.
 pub(crate) fn classify_test_error(err: &LlmError) -> (TestProblem, bool) {
-    match err {
-        LlmError::Http { status: 401 | 403, .. } => (TestProblem::Key, false),
-        LlmError::Http { status: 404, .. } => (TestProblem::Model, false),
-        LlmError::Http { status: 400, body, .. } => {
-            let body = body.to_ascii_lowercase();
-            // Gemini answers a bad key with 400 API_KEY_INVALID, not 401.
-            if body.contains("api key") || body.contains("api_key") {
-                (TestProblem::Key, false)
-            } else if body.contains("model") {
-                (TestProblem::Model, false)
-            } else {
-                (TestProblem::Other, false)
-            }
-        }
-        LlmError::Http { status: 408, .. } | LlmError::Transport(_) => (TestProblem::Address, true),
-        LlmError::Http { status: 429 | 500..=599, .. } => (TestProblem::Other, true),
-        LlmError::Http { .. } | LlmError::Parse(_) | LlmError::Declined(_) | LlmError::Empty => {
-            (TestProblem::Other, false)
-        }
+    match err.kind() {
+        ErrorKind::Auth => (TestProblem::Key, false),
+        ErrorKind::Billing => (TestProblem::Billing, false),
+        ErrorKind::RateLimit => (TestProblem::RateLimit, true),
+        ErrorKind::Model => (TestProblem::Model, false),
+        ErrorKind::Network => (TestProblem::Address, true),
+        ErrorKind::Server => (TestProblem::Server, true),
+        ErrorKind::Other => (TestProblem::Other, false),
     }
 }
 
@@ -274,17 +277,24 @@ fn undetected_message(conn: &Connection) -> String {
 fn list_failure_message(conn: &Connection, err: &LlmError) -> String {
     match classify_test_error(err).0 {
         problem @ (TestProblem::Key | TestProblem::Address) => failure_message(conn, problem, err),
-        TestProblem::Model | TestProblem::Other => {
-            format!("{} didn't list its models ({err}).", who(conn))
-        }
+        TestProblem::Model
+        | TestProblem::Billing
+        | TestProblem::RateLimit
+        | TestProblem::Server
+        | TestProblem::Other => format!("{} didn't list its models ({err}).", who(conn)),
     }
 }
 
-/// Pure: the message shown with a failed test.
+/// Pure: the message for a failed test. The page words each problem itself
+/// (`error-copy.ts`); this is the fallback, and what logs and the model list
+/// show. Billing, rate-limit and server trouble keep the provider's words.
 fn failure_message(conn: &Connection, problem: TestProblem, err: &LlmError) -> String {
     let info = providers::provider_info(conn.provider);
     let who = who(conn);
     match problem {
+        TestProblem::Key if conn.provider.is_local() => format!(
+            "{who} refused the request. Check the address, and that the model is installed."
+        ),
         TestProblem::Key => {
             let hint = info.key_hint.map(|h| format!(" ({h})")).unwrap_or_default();
             format!("{who} rejected this key. Check you copied all of it{hint}.")
@@ -297,7 +307,9 @@ fn failure_message(conn: &Connection, problem: TestProblem, err: &LlmError) -> S
             "Couldn't reach {}. Check your internet connection or proxy. ({err})",
             host_of(&conn.base_url)
         ),
-        TestProblem::Other => err.to_string(),
+        TestProblem::Billing | TestProblem::RateLimit | TestProblem::Server | TestProblem::Other => {
+            err.to_string()
+        }
     }
 }
 
@@ -509,12 +521,99 @@ mod tests {
         // Possibly temporary: offer "Save anyway".
         assert_eq!(classify_test_error(&LlmError::Transport("connection refused".into())), (Address, true));
         assert_eq!(classify_test_error(&http(408, "timeout")), (Address, true));
-        assert_eq!(classify_test_error(&http(429, "rate limited")), (Other, true));
-        assert_eq!(classify_test_error(&http(500, "boom")), (Other, true));
-        assert_eq!(classify_test_error(&http(529, "overloaded")), (Other, true));
         // Everything else.
         assert_eq!(classify_test_error(&http(422, "unprocessable")), (Other, false));
         assert_eq!(classify_test_error(&LlmError::Parse("html".into())), (Other, false));
+    }
+
+    #[test]
+    fn out_of_credit_is_a_billing_problem() {
+        use TestProblem::Billing;
+        assert_eq!(classify_test_error(&http(402, "payment required")), (Billing, false));
+        // Anthropic: a 400 about the credit balance.
+        let anthropic = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+        assert_eq!(classify_test_error(&http(400, anthropic)), (Billing, false));
+        // OpenAI: a 429 whose code is insufficient_quota.
+        let openai = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+        assert_eq!(classify_test_error(&http(429, openai)), (Billing, false));
+        // A 403 that names billing.
+        assert_eq!(classify_test_error(&http(403, "Billing is not enabled for this project")), (Billing, false));
+    }
+
+    #[test]
+    fn throttling_is_a_rate_limit_problem() {
+        use TestProblem::RateLimit;
+        assert_eq!(classify_test_error(&http(429, "rate limited")), (RateLimit, true));
+        assert_eq!(
+            classify_test_error(&http(429, r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests has exceeded your rate limit"}}"#)),
+            (RateLimit, true)
+        );
+        // Gemini says "quota" for a per-minute limit; RESOURCE_EXHAUSTED marks it as one.
+        let gemini = r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}"#;
+        assert_eq!(classify_test_error(&http(429, gemini)), (RateLimit, true));
+        assert_eq!(classify_test_error(&http(429, "Resource has been exhausted (e.g. check quota).")), (RateLimit, true));
+        // OpenAI free tier: a daily request limit that mentions adding a payment method and billing.
+        let openai_free = r#"{"error":{"message":"Rate limit reached for gpt-4o-mini in organization org-abc on requests per day (RPD): Limit 200, Used 200, Requested 1. Please try again in 7m12s. Visit https://platform.openai.com/account/rate-limits to learn more. You can increase your rate limit by adding a payment method to your account at https://platform.openai.com/account/billing.","type":"requests","param":null,"code":"rate_limit_exceeded"}}"#;
+        assert_eq!(classify_test_error(&http(429, openai_free)), (RateLimit, true));
+        // Azure OpenAI: a token-rate limit whose link says "quotaincrease".
+        let azure = r#"{"error":{"code":"429","message":"Requests to the ChatCompletions_Create Operation under Azure OpenAI API version 2024-10-21 have exceeded token rate limit of your current OpenAI S0 pricing tier. Please retry after 6 seconds. Please go here: https://aka.ms/oai/quotaincrease if you would like to further increase the default rate limit."}}"#;
+        assert_eq!(classify_test_error(&http(429, azure)), (RateLimit, true));
+    }
+
+    #[test]
+    fn a_test_classifies_errors_as_a_run_does() {
+        let samples = [
+            http(400, "Your credit balance is too low"),
+            http(429, r#"{"error":{"code":"insufficient_quota"}}"#),
+            http(429, "You exceeded your current quota, please check your plan and billing details."),
+            http(403, "Billing is not enabled for this project"),
+            http(401, "bad key"),
+            http(404, "no such model"),
+            http(503, "overloaded"),
+            LlmError::Transport("dns error".into()),
+        ];
+        for e in &samples {
+            let expected = match e.kind() {
+                ErrorKind::Auth => TestProblem::Key,
+                ErrorKind::Billing => TestProblem::Billing,
+                ErrorKind::RateLimit => TestProblem::RateLimit,
+                ErrorKind::Model => TestProblem::Model,
+                ErrorKind::Network => TestProblem::Address,
+                ErrorKind::Server => TestProblem::Server,
+                ErrorKind::Other => TestProblem::Other,
+            };
+            assert_eq!(classify_test_error(e).0, expected, "{e}");
+        }
+    }
+
+    #[test]
+    fn server_trouble_is_a_server_problem() {
+        use TestProblem::Server;
+        for status in [500, 502, 503, 504, 529] {
+            assert_eq!(classify_test_error(&http(status, "overloaded")), (Server, true), "{status}");
+        }
+    }
+
+    #[test]
+    fn a_failed_test_keeps_the_providers_own_words_for_details() {
+        let ant = sample(Provider::Anthropic, "claude-sonnet-5-5");
+        let err = http(529, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#);
+        let r = failed_from(&ant, None, &err);
+        assert_eq!((r.problem, r.can_save_anyway), (Some(TestProblem::Server), true));
+        assert_eq!(r.detail.as_deref(), Some(err.to_string().as_str()));
+        // Problems with their own words name them in `message` too; the raw text stays in `detail`.
+        let r = failed_from(&ant, None, &http(401, "invalid x-api-key"));
+        assert!(r.message.starts_with("Anthropic rejected this key."), "{}", r.message);
+        assert_eq!(r.detail.as_deref(), Some("HTTP 401: invalid x-api-key"));
+    }
+
+    #[test]
+    fn problem_kinds_go_over_the_wire_like_run_error_kinds() {
+        let wire = |p: TestProblem| serde_json::to_value(p).unwrap();
+        assert_eq!(wire(TestProblem::Billing), "billing");
+        assert_eq!(wire(TestProblem::RateLimit), "rate_limit");
+        assert_eq!(wire(TestProblem::Server), "server");
+        assert_eq!(wire(TestProblem::Key), "key");
     }
 
     #[test]

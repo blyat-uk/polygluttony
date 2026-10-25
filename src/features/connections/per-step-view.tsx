@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { ConnectionsConfig } from "@/types/generated/ConnectionsConfig";
@@ -14,7 +14,8 @@ import { ModelChips, ModelDot } from "./model-chips";
 import { useLibraryCapabilities } from "./per-step-model";
 import { PipelineCard } from "./pipeline-card";
 import { RemoveModelDialog } from "./remove-model-dialog";
-import { EyebrowNote, StatusDot } from "./role-card";
+import { ModelStatusDot, TestButton, TestOutcome } from "./model-test";
+import { EyebrowNote } from "./role-card";
 import {
   STEP_INFO,
   defaultStepSettings,
@@ -24,6 +25,7 @@ import {
   stepSettings,
   stepsUsing,
 } from "./steps";
+import { modelStatus, useModelTest } from "./test-status";
 import { capabilitiesQuery, connectionsKey, useConnectionMutations } from "./use-connections";
 
 /** Which form is open under the chips: a library model's, or a new one (maybe for a step). */
@@ -34,9 +36,9 @@ type FocusTarget = HTMLElement | "add";
 
 /** The add form's question when it was opened from a step's menu. */
 const ASK: Record<Step, string> = {
-  extract: "Which AI should extract names?",
-  normalize: "Which AI should normalize the glossary?",
-  "web-search": "Which AI should search the web?",
+  extract: "Which AI should find names?",
+  normalize: "Which AI should tidy up the glossary?",
+  "web-search": "Which AI should look up names online?",
   translate: "Which AI should translate?",
   verify: "Which AI should verify translations?",
 };
@@ -155,7 +157,7 @@ export function PerStepView({
     if (assign) parts.push(`${STEP_INFO[assign].name} uses it now.`);
     else if (target.kind === "add") parts.push("Pick it for any step below.");
     if (searchedBefore && cfg.steps?.web_search?.model !== model.id) {
-      parts.push("Web search turned off: this model can’t search the web.");
+      parts.push("Look up names online turned off: this model can’t search the web.");
     }
     toast.success(parts.join(" "));
   };
@@ -249,8 +251,25 @@ function FormCard({
   onRemove?: () => void;
 }) {
   const titleId = useId();
+  // Test checks what the form shows (model, address, key), saved or not.
+  const [formDraft, setFormDraft] = useState<Model | null>(model ?? null);
+  const shown = useMemo(
+    () =>
+      formDraft
+        ? {
+            ...formDraft,
+            model: formDraft.model.trim(),
+            base_url: formDraft.base_url.trim(),
+            api_key: formDraft.api_key.trim(),
+          }
+        : undefined,
+    [formDraft],
+  );
+  const tested = useModelTest(shown);
+  const shownInfo = shown ? findProvider(providers, shown.provider) : undefined;
   const assign = target.kind === "add" ? target.assign : undefined;
   const used = model ? stepsUsing(config, model.id) : [];
+  const info = model ? findProvider(providers, model.provider) : undefined;
   // Search-capable providers only (and a test that also searches) when web search is the
   // model's whole job.
   const role =
@@ -271,7 +290,7 @@ function FormCard({
           className="text-[10.5px] font-semibold tracking-[0.1em] text-muted-foreground uppercase"
         >
           {model
-            ? modelLabel(findProvider(providers, model.provider), model.model)
+            ? modelLabel(info, model.model)
             : assign
               ? `Add a model for ${STEP_INFO[assign].name}`
               : "Add a model"}
@@ -281,18 +300,20 @@ function FormCard({
             <EyebrowNote>
               {used.length > 0 ? `used by ${stepNames(used)}` : "no step uses it yet"}
             </EyebrowNote>
-            {isUsable(model) ? (
-              <StatusDot tone="jade" glow>
-                Connected
-              </StatusDot>
-            ) : (
-              <StatusDot tone="amber" hollow>
-                Needs an API key
-              </StatusDot>
-            )}
+            {shown ? <ModelStatusDot status={modelStatus(shown, tested.test)} /> : null}
+            {shown && isUsable(shown) ? (
+              <TestButton
+                test={tested.test}
+                onTest={() => void tested.run()}
+                label={modelLabel(shownInfo, shown.model)}
+              />
+            ) : null}
           </div>
         ) : null}
       </div>
+      {model && shown ? (
+        <TestOutcome test={tested.test} model={shown} info={shownInfo} className="mt-2" />
+      ) : null}
       <ConnectionForm
         role={role}
         providers={providers}
@@ -301,11 +322,12 @@ function FormCard({
         onSave={onSave}
         onCancel={onCancel}
         onRemove={onRemove}
+        onDraftChange={setFormDraft}
         autoFocus
         heading={assign ? ASK[assign] : model ? undefined : "Which AI do you want to add?"}
         lead={
           assign === "web-search"
-            ? "It looks up the names fans already use, once per glossary build. Anthropic, OpenAI and Google can search."
+            ? "It finds the names fans already use. Anthropic, OpenAI and Google can search the web."
             : assign
               ? `Pick a provider. ${STEP_INFO[assign].name} switches to it once it’s connected.`
               : model

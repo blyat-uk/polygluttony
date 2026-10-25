@@ -20,10 +20,11 @@ import {
   type ProviderKind,
   type Role,
 } from "./connection-model";
-import { commandFailure, problemCopy, type FieldKey } from "./error-copy";
-import { ConnectButton, Field, KeyLink, Msg, TextButton, type Phase } from "./form-parts";
+import { commandFailure, problemCopy, problemDetails, type FieldKey } from "./error-copy";
+import { ConnectButton, Details, Field, KeyLink, Msg, TextButton, type Phase } from "./form-parts";
 import { ModelPicker } from "./model-picker";
 import { ChosenProvider, ProviderTiles } from "./provider-tiles";
+import { recordWorks } from "./test-status";
 import { capabilitiesQuery, useCapabilities, useLiveModels } from "./use-connections";
 
 type Errors = Partial<Record<FieldKey, string>>;
@@ -36,9 +37,9 @@ const COPY: Record<Role, { heading: string; lead: string; remove: string }> = {
     remove: "Remove model",
   },
   "web-search": {
-    heading: "Which AI should search the web?",
-    lead: "It looks up the names fans already use, once per glossary build. Anthropic, OpenAI and Google can search.",
-    remove: "Remove web search model",
+    heading: "Which AI should look up names online?",
+    lead: "It finds the names fans already use. Anthropic, OpenAI and Google can search the web.",
+    remove: "Remove this model",
   },
 };
 
@@ -62,6 +63,7 @@ export function ConnectionForm({
   onCancel,
   onRemove,
   onStageChange,
+  onDraftChange,
   autoFocus = false,
   heading,
   lead,
@@ -77,6 +79,9 @@ export function ConnectionForm({
   /** Edit mode only: the last control on the form. */
   onRemove?: () => void;
   onStageChange?: (stage: FormStage) => void;
+  /** What the fields show now (null while picking a provider), unsaved. Pass a stable
+   *  function, such as a state setter. */
+  onDraftChange?: (draft: Model | null) => void;
   /** Focus the first provider tile on mount (the form was opened by a click). */
   autoFocus?: boolean;
   /** Overrides the role's heading above the provider tiles. */
@@ -108,6 +113,7 @@ export function ConnectionForm({
   const stage: FormStage = draft && info ? "fields" : "pick";
 
   useEffect(() => onStageChange?.(stage), [stage, onStageChange]);
+  useEffect(() => onDraftChange?.(draft), [draft, onDraftChange]);
 
   // Live models: debounced while typing an address or key, then fetched once it settles.
   const probeSource = draft ? `${draft.provider}\n${draft.base_url.trim()}\n${draft.api_key.trim()}` : "";
@@ -206,6 +212,7 @@ export function ConnectionForm({
 
     if (!skipTest) {
       setPhase("testing");
+      const started = performance.now();
       let result: TestResult;
       try {
         // A web-search model is only worth saving if its web-search tool works too.
@@ -218,6 +225,8 @@ export function ConnectionForm({
         setPhase("idle");
         return;
       }
+      // A passing test is what makes a model read "Connected" this session.
+      recordWorks(conn, (performance.now() - started) / 1000);
       // Custom endpoints: use the API format the test detected.
       if (result.detected_driver) conn.driver = result.detected_driver;
     }
@@ -257,6 +266,7 @@ export function ConnectionForm({
   const problem = failure ? problemCopy(failure, p, d) : null;
   const fieldError = (f: FieldKey) => errors[f] ?? (problem?.field === f ? problem.text : undefined);
   const cardError = problem && problem.field === null ? problem.text : undefined;
+  const details = failure && problem ? problemDetails(failure, problem.text) : null;
   const busy = phase !== "idle";
   const ids = { key: `${uid}-key`, address: `${uid}-address`, model: `${uid}-model` };
 
@@ -490,6 +500,7 @@ export function ConnectionForm({
           )}
         </div>
       </div>
+      {details ? <Details text={details} className="mt-1" /> : null}
 
       {onRemove ? (
         <div className="mt-4 border-t border-border pt-3">

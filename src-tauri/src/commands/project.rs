@@ -12,8 +12,8 @@ use crate::config::store as config_store;
 use crate::error::{AppError, AppResult};
 use crate::glossary::world_detector::detect;
 use crate::models::language_pair::LanguagePair;
-use crate::models::{ProjectView, SourceFile};
-use crate::utils::discover::{discover_source_files, has_existing_translation};
+use crate::models::{ProjectView, SourceFile, TranslationState};
+use crate::utils::discover::{discover_source_files, output_on_disk};
 
 #[tauri::command]
 pub fn list_languages() -> Vec<Language> {
@@ -101,18 +101,13 @@ pub async fn open_folder(app: AppHandle, path: String, now: i64) -> AppResult<Pr
 
     let detected_source_lang = detect_source_language(&analyzed.combined_text);
 
-    let had_saved = saved.is_some();
-    let mut prefs = projects::resolve_prefs(
+    let (mut prefs, first_visit) = prefs_for_open(
         saved,
+        &analyzed.files,
         detected_source_lang.as_deref(),
         &app_cfg.default_source,
         &app_cfg.default_target,
     );
-    // A freshly opened folder (no saved prefs) starts with every file selected.
-    // `selected_files` is an explicit list — an empty list means "none selected".
-    if !had_saved {
-        prefs.selected_files = analyzed.files.iter().map(|f| f.name.clone()).collect();
-    }
 
     // Capabilities + world detection follow the *resolved* source language
     // (saved → detected → default), not the pre-detection pair used for discovery.
@@ -127,7 +122,7 @@ pub async fn open_folder(app: AppHandle, path: String, now: i64) -> AppResult<Pr
     // Fresh folders inherit the tone implied by the detected world (xianxia/
     // wuxia → matching tone); saved prefs are never touched. Non-Chinese
     // sources chain to Standard automatically (detect() returns Modern).
-    if !had_saved {
+    if first_visit {
         prefs.tone = projects::tone_for_world(detected_world);
     }
 
@@ -147,7 +142,36 @@ pub async fn open_folder(app: AppHandle, path: String, now: i64) -> AppResult<Pr
         prefs,
         supports_glossary,
         glossary_terms,
+        first_visit,
     })
+}
+
+/// The prefs an open starts from, and whether this is the folder's first
+/// visit (nothing saved yet). Saved languages, world and tone win; the
+/// selection never comes back from an earlier session: every open ticks the
+/// episodes that have no translation yet, so the new episode is the one
+/// that's ticked and nothing gets overwritten by surprise.
+fn prefs_for_open(
+    saved: Option<FolderPrefs>,
+    files: &[SourceFile],
+    detected_source: Option<&str>,
+    default_source: &str,
+    default_target: &str,
+) -> (FolderPrefs, bool) {
+    let first_visit = saved.is_none();
+    let mut prefs =
+        projects::resolve_prefs(saved, detected_source, default_source, default_target);
+    prefs.selected_files = untranslated_names(files);
+    (prefs, first_visit)
+}
+
+/// Names of the files with no translation on disk, in list order.
+fn untranslated_names(files: &[SourceFile]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| f.translation == TranslationState::None)
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 struct Analyzed {
@@ -165,7 +189,12 @@ fn analyze_folder(dir: &Path, pair: &LanguagePair) -> Analyzed {
             combined.push_str(&strip_for_text(&d.text));
             combined.push('\n');
         }
+        let output = output_on_disk(&src, pair);
         files.push(SourceFile {
+            has_translation: output.state != TranslationState::None,
+            translation: output.state,
+            both_variants: output.both_variants,
+            output_path: output.path.map(|p| p.to_string_lossy().into_owned()),
             name: src
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -173,11 +202,118 @@ fn analyze_folder(dir: &Path, pair: &LanguagePair) -> Analyzed {
                 .to_string(),
             path: src.to_string_lossy().into_owned(),
             dialogue_count: dialogues.len() as u32,
-            has_translation: has_existing_translation(&src, pair),
         });
     }
     Analyzed {
         files,
         combined_text: combined,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::projects::Tone;
+    use crate::glossary::world_detector::WorldType;
+    use std::fs;
+
+    const ASS: &str = "[Script Info]\nTitle: t\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好\nDialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,再见\n";
+
+    /// ep01 done, ep02 needs a look, ep03 new, ep04 done with an old warning
+    /// file left over, ep05 new.
+    fn season() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        for name in ["ep01.ass", "ep02.ass", "ep03.ass", "ep04.ass", "ep05.ass"] {
+            fs::write(p.join(name), ASS).unwrap();
+        }
+        for name in [
+            "ep01.eng.ass",
+            "ep02.warning.eng.ass",
+            "ep04.warning.eng.ass",
+            "ep04.eng.ass",
+        ] {
+            fs::write(p.join(name), "x").unwrap();
+        }
+        // The leftover warning file is the older one.
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        fs::File::options()
+            .write(true)
+            .open(p.join("ep04.warning.eng.ass"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        dir
+    }
+
+    fn zh_en() -> LanguagePair {
+        LanguagePair::from_codes("zh", "en").unwrap()
+    }
+
+    #[test]
+    fn analyze_reads_each_episodes_output_from_disk() {
+        let dir = season();
+        let a = analyze_folder(dir.path(), &zh_en());
+        let by_name = |n: &str| a.files.iter().find(|f| f.name == n).unwrap().clone();
+
+        assert_eq!(a.files.len(), 5);
+        assert_eq!(by_name("ep01.ass").translation, TranslationState::Done);
+        assert_eq!(by_name("ep02.ass").translation, TranslationState::NeedsLook);
+        assert_eq!(by_name("ep03.ass").translation, TranslationState::None);
+        assert!(!by_name("ep03.ass").has_translation);
+        assert_eq!(by_name("ep03.ass").output_path, None);
+        assert_eq!(by_name("ep03.ass").dialogue_count, 2);
+
+        let ep02 = by_name("ep02.ass");
+        assert!(ep02.has_translation);
+        assert!(ep02.output_path.unwrap().ends_with("ep02.warning.eng.ass"));
+
+        let ep04 = by_name("ep04.ass");
+        assert_eq!(ep04.translation, TranslationState::Done);
+        assert!(ep04.both_variants);
+        assert!(ep04.output_path.unwrap().ends_with("ep04.eng.ass"));
+    }
+
+    #[test]
+    fn first_open_ticks_only_untranslated_episodes() {
+        let dir = season();
+        let a = analyze_folder(dir.path(), &zh_en());
+        let (prefs, first_visit) = prefs_for_open(None, &a.files, Some("zh"), "zh", "en");
+        assert!(first_visit);
+        assert_eq!(prefs.selected_files, vec!["ep03.ass", "ep05.ass"]);
+    }
+
+    #[test]
+    fn reopening_never_restores_an_old_selection() {
+        // Last session ticked 01–03 and saved it; a new episode (05) has
+        // turned up since. The open ticks what's untranslated instead.
+        let dir = season();
+        let a = analyze_folder(dir.path(), &zh_en());
+        let saved = FolderPrefs {
+            source_lang: "zh".into(),
+            target_lang: "en".into(),
+            world_override: Some(WorldType::Wuxia),
+            tone: Tone::Comedic,
+            selected_files: vec!["ep01.ass".into(), "ep02.ass".into(), "ep03.ass".into()],
+        };
+        let (prefs, first_visit) =
+            prefs_for_open(Some(saved.clone()), &a.files, Some("ja"), "zh", "en");
+        assert!(!first_visit);
+        assert_eq!(prefs.selected_files, vec!["ep03.ass", "ep05.ass"]);
+        // Everything else saved still wins.
+        assert_eq!(prefs.source_lang, "zh");
+        assert_eq!(prefs.world_override, Some(WorldType::Wuxia));
+        assert_eq!(prefs.tone, Tone::Comedic);
+    }
+
+    #[test]
+    fn a_fully_translated_folder_opens_with_nothing_ticked() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        fs::write(p.join("ep01.ass"), ASS).unwrap();
+        fs::write(p.join("ep01.eng.ass"), "x").unwrap();
+        let a = analyze_folder(p, &zh_en());
+        let (prefs, _) = prefs_for_open(None, &a.files, None, "zh", "en");
+        assert!(prefs.selected_files.is_empty());
     }
 }

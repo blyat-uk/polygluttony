@@ -17,19 +17,13 @@ import {
 import { cn } from "@/lib/utils";
 import { findProvider, providerName } from "./connection-model";
 import { ModelDot } from "./model-chips";
-import {
-  forgottenKeysSentence,
-  labelOf,
-  listNames,
-  oneModelOutcome,
-  type LibraryCaps,
-} from "./per-step-model";
+import { labelOf, listNames, oneModelOutcome, type LibraryCaps } from "./per-step-model";
 import { modelColor, stepNames, stepsUsing } from "./steps";
 import { useConnectionMutations } from "./use-connections";
 
 /**
  * "Use one model for everything": pick the model (Translate's, to start), read what will
- * happen — which models leave the list, which saved keys go — then confirm.
+ * happen, then confirm. Only the steps move: every model and saved key stays.
  */
 export function UseOneModelDialog({
   open,
@@ -134,30 +128,29 @@ export function UseOneModelDialog({
   );
 }
 
-/** "Every step will use Claude Sonnet 5.5 with its current settings. Models no step uses are
- *  removed from the list: Claude Opus 5.5 and Claude Haiku 5.5. Your saved Google API key will
- *  be forgotten too." */
+/** "Every step will use Claude Sonnet 5.5 with its current settings. Claude Opus 5.5 and
+ *  Claude Haiku 5.5 stay in your models with their keys, ready if you switch back." */
 function outcomeCopy(
   cfg: ConnectionsConfig,
   chosen: Model,
   caps: LibraryCaps,
   providers: ProviderInfo[],
 ): string {
-  const o = oneModelOutcome(cfg, chosen, caps, providers);
+  const o = oneModelOutcome(cfg, chosen, caps);
   const label = labelOf(chosen, providers);
   const settings = o.keepsSettings ? "with its current settings" : "with recommended settings";
   const parts = [
     o.webSearchStaysOn
-      ? `Every step but Web search will use ${label} ${settings}; Web search stays on ${labelOf(o.webSearchStaysOn, providers)}.`
+      ? `Every step but Look up names online will use ${label} ${settings}; Look up names online stays on ${labelOf(o.webSearchStaysOn, providers)}.`
       : cfg.steps?.web_search
         ? `Every step will use ${label} ${settings}.`
-        : `Every step will use ${label} ${settings}. Web search stays off.`,
+        : `Every step will use ${label} ${settings}. Look up names online stays off.`,
   ];
-  if (o.removed.length > 0) {
-    const names = listNames(o.removed.map((m) => labelOf(m, providers)));
-    parts.push(`Models no step uses are removed from the list: ${names}.`);
+  if (o.idle.length > 0) {
+    const names = listNames(o.idle.map((m) => labelOf(m, providers)));
+    parts.push(
+      `${names} ${o.idle.length === 1 ? "stays" : "stay"} in your models with ${o.idle.length === 1 ? "its key" : "their keys"}, ready if you switch back.`,
+    );
   }
-  const keys = forgottenKeysSentence(o.forgotten);
-  if (keys) parts.push(keys);
   return parts.join(" ");
 }

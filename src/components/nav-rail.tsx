@@ -1,9 +1,8 @@
 import {
   BookOpen,
-  Folder,
+  FilmStrip,
   Lightning,
   NotePencil,
-  Play,
   Question,
   type Icon,
 } from "@phosphor-icons/react";
@@ -18,49 +17,44 @@ interface RailItem {
   label: string;
   icon: Icon;
   group: "workflow" | "setup";
+  /** Ctrl/Cmd + this digit goes here (the key handler lives in the app frame). */
+  key: number;
   needsFolder?: boolean;
 }
 
 const ITEMS: RailItem[] = [
-  { to: "/project", label: "Project", icon: Folder, group: "workflow" },
-  { to: "/glossary", label: "Glossary", icon: BookOpen, group: "workflow", needsFolder: true },
-  { to: "/translate", label: "Translate", icon: Play, group: "workflow", needsFolder: true },
-  { to: "/connections", label: "Connections", icon: Lightning, group: "setup" },
-  { to: "/prompts", label: "Prompts", icon: NotePencil, group: "setup" },
-  { to: "/help", label: "Help", icon: Question, group: "setup" },
+  { to: "/episodes", label: "Episodes", icon: FilmStrip, group: "workflow", key: 1 },
+  { to: "/glossary", label: "Glossary", icon: BookOpen, group: "workflow", key: 2, needsFolder: true },
+  { to: "/connections", label: "Models", icon: Lightning, group: "setup", key: 3 },
+  { to: "/prompts", label: "Prompts", icon: NotePencil, group: "setup", key: 4 },
+  { to: "/help", label: "Help", icon: Question, group: "setup", key: 5 },
 ];
+
+const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
+
+/** "Ctrl+1", or "⌘1" on macOS. */
+const shortcutLabel = (digit: number) => (IS_MAC ? `⌘${digit}` : `Ctrl+${digit}`);
 
 export function NavRail() {
   const workdir = useAppStore((s) => s.workdir);
   const hasUsableConnection = useAppStore((s) => s.hasUsableConnection);
-  const hasUntranslated = useAppStore((s) => s.hasUntranslated);
   const glossaryTerms = useAppStore((s) => s.glossaryTerms);
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-
-  // Returns a gating hint when the destination is disabled, else null.
-  const gateHint = (item: RailItem): string | null => {
-    if (!item.needsFolder) return null;
-    if (!workdir) return "Open a folder first";
-    if (item.to === "/translate") {
-      if (!hasUsableConnection) return "Connect an AI model";
-      if (!hasUntranslated) return "No untranslated files in this folder";
-    }
-    return null;
-  };
 
   const workflow = ITEMS.filter((i) => i.group === "workflow");
   const setup = ITEMS.filter((i) => i.group === "setup");
 
   const render = (item: RailItem) => {
-    const hint = gateHint(item);
+    const hint = item.needsFolder && !workdir ? "Open a folder first" : null;
     const disabled = hint !== null;
-    // Project is dual-role: it opens Welcome ("/") until a folder is picked, the
-    // Project view after — and highlights on both so they read as one place.
-    const isProject = item.to === "/project";
-    const to = isProject && !workdir ? "/" : item.to;
-    const active = isProject
-      ? pathname === "/" || pathname.startsWith("/project")
+    // Episodes is dual-role: it opens Welcome ("/") until a folder is open, the
+    // episode list after, and highlights on both so they read as one place.
+    const isEpisodes = item.to === "/episodes";
+    const to = isEpisodes && !workdir ? "/" : item.to;
+    const active = isEpisodes
+      ? pathname === "/" || pathname.startsWith("/episodes")
       : pathname.startsWith(item.to);
+    const warn = item.to === "/connections" && !hasUsableConnection;
     const Icon = item.icon;
     const body = (
       <div
@@ -72,17 +66,18 @@ export function NavRail() {
             : "hover:bg-[color:var(--color-bg-hover)]",
         )}
       >
-        <Icon weight={active ? "fill" : "regular"} className={cn("size-5", active && "[filter:drop-shadow(0_0_7px_color-mix(in_oklch,var(--color-gold)_75%,transparent))]")} />
+        <Icon
+          weight={active ? "fill" : "regular"}
+          className={cn(
+            "size-5",
+            active &&
+              "[filter:drop-shadow(0_0_7px_color-mix(in_oklch,var(--color-gold)_75%,transparent))]",
+          )}
+        />
         {item.label}
-        {item.to === "/connections" ? (
-          <span
-            className={
-              hasUsableConnection
-                ? "text-[color:var(--color-success)]"
-                : "text-[color:var(--color-alert)]"
-            }
-          >
-            {hasUsableConnection ? "✓" : "⚠"}
+        {warn ? (
+          <span className="text-[color:var(--color-alert)]" aria-label="No model is ready">
+            ⚠
           </span>
         ) : null}
         {item.to === "/glossary" && glossaryTerms ? (
@@ -90,20 +85,27 @@ export function NavRail() {
         ) : null}
       </div>
     );
-    if (disabled) {
-      return (
-        <Tooltip key={item.to}>
-          <TooltipTrigger asChild>
-            <div>{body}</div>
-          </TooltipTrigger>
-          <TooltipContent side="right">{hint}</TooltipContent>
-        </Tooltip>
-      );
-    }
+    const tip = (
+      <TooltipContent side="right" className="flex items-center gap-2">
+        <span>{hint ?? (warn ? "Models · no model is ready yet" : item.label)}</span>
+        <kbd className="rounded border border-border px-1 font-mono text-[10px] opacity-75">
+          {shortcutLabel(item.key)}
+        </kbd>
+      </TooltipContent>
+    );
     return (
-      <Link key={item.to} to={to as never}>
-        {body}
-      </Link>
+      <Tooltip key={item.to}>
+        <TooltipTrigger asChild>
+          {disabled ? (
+            <div aria-disabled="true">{body}</div>
+          ) : (
+            <Link to={to as never} aria-label={item.label}>
+              {body}
+            </Link>
+          )}
+        </TooltipTrigger>
+        {tip}
+      </Tooltip>
     );
   };
 

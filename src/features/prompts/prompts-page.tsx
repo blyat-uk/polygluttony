@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { useBlocker } from "@tanstack/react-router";
-import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import { Warning } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import type { PromptId } from "@/types/generated/PromptId";
@@ -35,19 +34,9 @@ export function PromptsPage() {
   const meta = prompts?.find((p) => p.id === selected);
   const dirty = draft !== null && loaded !== undefined && draft !== loaded;
 
-  // Fix 3: block navigation away when there are unsaved changes
-  // window.confirm is a no-op in WKWebView (Tauri/macOS) — use native dialog instead.
-  useBlocker({
-    shouldBlockFn: async () => {
-      if (!dirty) return false;
-      const leave = await confirmDialog("Discard unsaved prompt changes?", {
-        title: "Unsaved changes",
-        kind: "warning",
-      });
-      return !leave;
-    },
-    disabled: !dirty,
-  });
+  // Leaving with unsaved edits asks first, in the app's own dialog (window.confirm does
+  // nothing in WKWebView on macOS).
+  const leaving = useBlocker({ shouldBlockFn: () => dirty, disabled: !dirty, withResolver: true });
 
   const select = (id: PromptId) => {
     if (id === selected) return;
@@ -106,14 +95,29 @@ export function PromptsPage() {
                 toast.error(String(e));
               }
             }}
+            onDiscard={() => setDraft(null)}
             onReset={async () => {
+              // At once, with Undo: the edited text saved back.
+              const previous = loaded;
+              const { id, name } = meta;
               try {
-                await m.reset.mutateAsync(meta.id);
+                await m.reset.mutateAsync(id);
                 setDraft(null);
-                toast.success(`"${meta.name}" restored to default`);
               } catch (e) {
                 toast.error(String(e));
+                return;
               }
+              toast.success(`Restored "${name}"`, {
+                duration: 10_000,
+                action: {
+                  label: "Undo",
+                  onClick: () =>
+                    void m.save
+                      .mutateAsync({ id, text: previous })
+                      .then(() => toast.success(`Your "${name}" edit is back`))
+                      .catch((e: unknown) => toast.error(String(e))),
+                },
+              });
             }}
           />
         ) : null}
@@ -145,6 +149,28 @@ export function PromptsPage() {
               }}
             >
               Discard changes
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={leaving.status === "blocked"}
+        onOpenChange={(open) => {
+          if (!open) leaving.reset?.();
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Leave without saving?</AlertDialogTitle>
+            <AlertDialogDescription>
+              &ldquo;{meta?.name}&rdquo; has edits you haven&apos;t saved. Leaving discards them.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep editing</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={() => leaving.proceed?.()}>
+              Discard and leave
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

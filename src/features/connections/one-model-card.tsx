@@ -32,6 +32,7 @@ import {
 } from "./connection-model";
 import { ConnectionForm, type FormStage } from "./connection-form";
 import { ModelPicker } from "./model-picker";
+import { ModelStatusDot, TestButton, TestOutcome } from "./model-test";
 import { ProviderMark } from "./provider-tiles";
 import {
   CardEyebrow,
@@ -42,6 +43,7 @@ import {
   useSaveFeedback,
 } from "./role-card";
 import { modelById, stepsUsing } from "./steps";
+import { modelStatus, useModelTest } from "./test-status";
 import { ThinkingControl, thinkingHelp } from "./thinking-control";
 import { TuningSection } from "./tuning-section";
 import { connectionsKey, useConnectionMutations, useLiveModels } from "./use-connections";
@@ -94,6 +96,7 @@ export function OneModelCard({
   // Live models are fetched the first time the menu opens, then stay cached.
   const [menuOpened, setMenuOpened] = useState(false);
   const live = useLiveModels(model, menuOpened);
+  const tested = useModelTest(model);
   const feedback = useSaveFeedback(
     m.updateModel.isPending || m.setSharedSteps.isPending || m.setStep.isPending,
     m.updateModel.isError || m.setSharedSteps.isError || m.setStep.isError,
@@ -185,22 +188,14 @@ export function OneModelCard({
       try {
         await m.removeModel.mutateAsync(target.id);
       } catch (e) {
-        toast.error(`Web search is off, but ${name} couldn’t be removed: ${String(e)}`);
+        toast.error(`Look up names online is off, but ${name} couldn’t be removed: ${String(e)}`);
         return;
       }
     }
-    toast.success(`${name} removed. Web search is off.`);
+    toast.success(`${name} removed. Look up names online is off.`);
   };
 
-  const status = isUsable(model) ? (
-    <StatusDot tone="jade" glow>
-      Connected
-    </StatusDot>
-  ) : (
-    <StatusDot tone="amber" hollow>
-      Needs an API key
-    </StatusDot>
-  );
+  const status = <ModelStatusDot status={modelStatus(model, tested.test)} />;
 
   // ── web search row ─────────────────────────────────────────────────────────
   const openSearchForm = (next: "search-add" | "search-edit") => {
@@ -221,7 +216,7 @@ export function OneModelCard({
     </Button>
   );
   const searchHelp = (
-    <span id={searchHelpId}>Look up names fans already use, for the glossary.</span>
+    <span id={searchHelpId}>Finds the names fans already use, for the glossary.</span>
   );
 
   let searchRow: ReactNode;
@@ -231,7 +226,7 @@ export function OneModelCard({
       <div className="my-1.5 rounded-xl border border-border px-4 pt-1 pb-4">
         {searchStage === "fields" ? (
           <h3 className="pt-3 text-[11.5px] font-semibold text-[color:var(--color-ink-emphasis)]">
-            {editing ? "Web search model" : "A different model for web search"}
+            {editing ? "Model for looking up names online" : "A different model to look up names online"}
           </h3>
         ) : null}
         <ConnectionForm
@@ -248,8 +243,8 @@ export function OneModelCard({
             const nextInfo = findProvider(providers, next.provider);
             toast.success(
               tested
-                ? `Web search connected: ${modelLabel(nextInfo, next.model)}`
-                : `Web search saved without confirming — ${providerName(nextInfo, next)} didn’t answer the test.`,
+                ? `Look up names online uses ${modelLabel(nextInfo, next.model)} now`
+                : `Saved without confirming — ${providerName(nextInfo, next)} didn’t answer the test.`,
             );
           }}
           onCancel={() => backToSummary("search")}
@@ -262,7 +257,7 @@ export function OneModelCard({
     searchRow = (
       <OptionRow
         labelId={searchId}
-        label="Web search"
+        label="Look up names online"
         end={
           <>
             <Button
@@ -307,9 +302,9 @@ export function OneModelCard({
     searchRow = (
       <OptionRow
         labelId={searchId}
-        label="Web search"
+        label="Look up names online"
         help={searchHelp}
-        end={differentModel("Use a different model", "Use a different model for web search")}
+        end={differentModel("Use a different model", "Use a different model to look up names online")}
       >
         <Switch
           aria-labelledby={searchId}
@@ -328,8 +323,8 @@ export function OneModelCard({
     searchRow = (
       <OptionRow
         labelId={searchId}
-        label="Web search"
-        end={differentModel("Add a model that can", "Add a model that can search the web", true)}
+        label="Look up names online"
+        end={differentModel("Add a model that can", "Add a model that can look up names online", true)}
       >
         <span className="min-w-0 flex-1 basis-48 text-[12px]">{label} can’t search the web.</span>
       </OptionRow>
@@ -339,9 +334,9 @@ export function OneModelCard({
     searchRow = (
       <OptionRow
         labelId={searchId}
-        label="Web search"
+        label="Look up names online"
         help={searchHelp}
-        end={differentModel("Use a different model", "Use a different model for web search")}
+        end={differentModel("Use a different model", "Use a different model to look up names online")}
       />
     );
   }
@@ -422,6 +417,9 @@ export function OneModelCard({
               </div>
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
+              {isUsable(model) ? (
+                <TestButton test={tested.test} onTest={() => void tested.run()} label={label} />
+              ) : null}
               <Button
                 ref={editRef}
                 variant="outline"
@@ -443,6 +441,8 @@ export function OneModelCard({
               </Button>
             </div>
           </div>
+
+          <TestOutcome test={tested.test} model={model} info={info} className="mt-2.5 ml-[50px]" />
 
           <div className="mt-3.5 mb-2 h-px bg-border" />
 
@@ -485,7 +485,7 @@ export function OneModelCard({
                 Use different models for different steps
               </span>{" "}
               <span className="text-muted-foreground">
-                · e.g. a stronger model to normalize, a cheaper one to verify
+                · e.g. a stronger model to tidy up, a cheaper one to verify
               </span>
             </button>
           </div>
@@ -506,10 +506,10 @@ export function OneModelCard({
       <ConfirmRemove
         open={confirm === "search" && !!searchTarget}
         onClose={() => setConfirm(null)}
-        title={`Remove ${searchTarget ? modelLabel(targetInfo, searchTarget.model) : "the web search model"}?`}
+        title={`Remove ${searchTarget ? modelLabel(targetInfo, searchTarget.model) : "this model"}?`}
         onConfirm={() => void removeSearchModel()}
       >
-        Web search will turn off, so the glossary won’t look up names online.
+        Look up names online will turn off.
         {searchTarget && targetForgetsKey
           ? ` Your saved ${providerName(targetInfo, searchTarget)} API key will be forgotten too.`
           : null}

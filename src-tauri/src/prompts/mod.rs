@@ -72,7 +72,7 @@ pub struct Entry {
 }
 
 const WORLD_DESC: &str = "Replaced with the story's world type (xianxia, wuxia, \
-historical, modern, …) — auto-detected from the subtitles, overridable in Project.";
+historical, modern, …) — detected from the subtitles; you can change it on the Episodes page.";
 const TONE_DESC: &str = "Replaced with the tone guidelines for the folder's selected \
 tone (Standard, Xianxia, Wuxia, Comedic, Funny — each editable under Tones).";
 const SRC_LANG_DESC: &str = "Replaced with the source language name, e.g. \"Chinese\".";
@@ -150,7 +150,7 @@ reaches the model.",
     },
     Entry {
         id: PromptId::GlossaryExtract,
-        name: "Extraction",
+        name: "Find names",
         group: PromptGroup::Glossary,
         file: "glossary.txt",
         default: include_str!("../../prompts/glossary.txt"),
@@ -160,7 +160,7 @@ reaches the model.",
                 token: "{reference_terminology}",
                 required: false,
                 description: "Replaced with established terms imported from previously \
-translated episodes (the Reference review in Glossary). When none exist, the entire \
+translated episodes (Import from translated episodes, in Glossary). When none exist, the entire \
 \"## REFERENCE TERMINOLOGY\" section is removed before sending.",
             },
             Placeholder { token: "{source_language}", required: false, description: SRC_LANG_DESC },
@@ -169,7 +169,7 @@ translated episodes (the Reference review in Glossary). When none exist, the ent
     },
     Entry {
         id: PromptId::GlossaryNormalizeCharacters,
-        name: "Normalize: Characters",
+        name: "Tidy up: Characters",
         group: PromptGroup::Glossary,
         file: "glossary-normalize-characters.txt",
         default: include_str!("../../prompts/glossary-normalize-characters.txt"),
@@ -177,7 +177,7 @@ translated episodes (the Reference review in Glossary). When none exist, the ent
     },
     Entry {
         id: PromptId::GlossaryNormalizeCultivation,
-        name: "Normalize: Cultivation",
+        name: "Tidy up: Cultivation",
         group: PromptGroup::Glossary,
         file: "glossary-normalize-cultivation.txt",
         default: include_str!("../../prompts/glossary-normalize-cultivation.txt"),
@@ -185,7 +185,7 @@ translated episodes (the Reference review in Glossary). When none exist, the ent
     },
     Entry {
         id: PromptId::GlossaryNormalizeSkills,
-        name: "Normalize: Skills",
+        name: "Tidy up: Skills",
         group: PromptGroup::Glossary,
         file: "glossary-normalize-skills.txt",
         default: include_str!("../../prompts/glossary-normalize-skills.txt"),
@@ -193,7 +193,7 @@ translated episodes (the Reference review in Glossary). When none exist, the ent
     },
     Entry {
         id: PromptId::GlossaryNormalizeLocations,
-        name: "Normalize: Locations",
+        name: "Tidy up: Locations",
         group: PromptGroup::Glossary,
         file: "glossary-normalize-locations.txt",
         default: include_str!("../../prompts/glossary-normalize-locations.txt"),
@@ -201,7 +201,7 @@ translated episodes (the Reference review in Glossary). When none exist, the ent
     },
     Entry {
         id: PromptId::GlossaryNormalizeItems,
-        name: "Normalize: Items",
+        name: "Tidy up: Items",
         group: PromptGroup::Glossary,
         file: "glossary-normalize-items.txt",
         default: include_str!("../../prompts/glossary-normalize-items.txt"),
@@ -209,7 +209,7 @@ translated episodes (the Reference review in Glossary). When none exist, the ent
     },
     Entry {
         id: PromptId::GlossaryNormalizeOrganizations,
-        name: "Normalize: Organizations",
+        name: "Tidy up: Organizations",
         group: PromptGroup::Glossary,
         file: "glossary-normalize-organizations.txt",
         default: include_str!("../../prompts/glossary-normalize-organizations.txt"),
@@ -217,7 +217,7 @@ translated episodes (the Reference review in Glossary). When none exist, the ent
     },
     Entry {
         id: PromptId::GlossaryPersonalize,
-        name: "Personalize",
+        name: "Look up names online",
         group: PromptGroup::Glossary,
         file: "glossary-personalize.txt",
         default: include_str!("../../prompts/glossary-personalize.txt"),
@@ -225,15 +225,15 @@ translated episodes (the Reference review in Glossary). When none exist, the ent
             Placeholder {
                 token: "{donghua_title}",
                 required: true,
-                description: "Replaced with the series title — taken from the first line \
-of the personalize context box in Glossary (\"Unknown\" when empty).",
+                description: "Replaced with the show's name, as entered for Look up names \
+online in Glossary (\"Unknown\" when empty).",
             },
             Placeholder { token: "{world_type}", required: true, description: WORLD_DESC },
         ],
     },
     Entry {
         id: PromptId::ReferenceExtract,
-        name: "Reference extract",
+        name: "Import from translated episodes",
         group: PromptGroup::Glossary,
         file: "reference-extract.txt",
         default: include_str!("../../prompts/reference-extract.txt"),
@@ -241,7 +241,7 @@ of the personalize context box in Glossary (\"Unknown\" when empty).",
     },
     Entry {
         id: PromptId::Verify,
-        name: "Drift check",
+        name: "Verify",
         group: PromptGroup::Verify,
         file: "verify.txt",
         default: include_str!("../../prompts/verify.txt"),
@@ -595,7 +595,28 @@ mod tests {
         // Invalid UTF-8 → read_to_string fails → hard error naming the prompt.
         std::fs::write(dir.path().join("verify.txt"), [0xff, 0xfe, 0xfd]).unwrap();
         let err = resolve(PromptId::Verify, dir.path()).unwrap_err();
-        assert!(err.to_string().contains("Drift check"), "error names the prompt: {err}");
+        assert!(err.to_string().contains("\"Verify\""), "error names the prompt: {err}");
+    }
+
+    #[test]
+    fn prompt_names_use_the_apps_words() {
+        let name = |id| entry(id).name;
+        assert_eq!(name(PromptId::GlossaryExtract), "Find names");
+        assert_eq!(name(PromptId::GlossaryNormalizeCharacters), "Tidy up: Characters");
+        assert_eq!(name(PromptId::GlossaryPersonalize), "Look up names online");
+        assert_eq!(name(PromptId::ReferenceExtract), "Import from translated episodes");
+        assert_eq!(name(PromptId::Verify), "Verify");
+        // The old names never reach the Prompts page, nor do their descriptions.
+        for meta in list_meta(Path::new("/nonexistent")) {
+            let words = std::iter::once(meta.name.clone())
+                .chain(meta.placeholders.iter().map(|p| p.description.clone()))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            for old in ["drift", "normalize", "personalize", "extraction", "reference extract"] {
+                assert!(!words.contains(old), "{:?} still says {old:?}: {words}", meta.id);
+            }
+        }
     }
 
     #[test]

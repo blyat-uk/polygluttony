@@ -3,6 +3,7 @@ import { useGlossaryRun } from "@/stores/glossary-store"
 import { useAppStore } from "@/stores/app-store"
 import { ReactorBar } from "@/features/translate/reactor-bar"
 import type { GlossaryPhase } from "@/types/generated/GlossaryPhase"
+import { titleCase } from "./model"
 
 /** The six real glossary categories (engine: src-tauri/.../glossary/model.rs). */
 const CATS: { key: string; label: string }[] = [
@@ -18,12 +19,13 @@ const CATS: { key: string; label: string }[] = [
  *  yield thousands of terms; uncapped lanes would grow without bound. */
 const LANE_CAP = 10
 
-const PHASE_LABEL: Record<GlossaryPhase, string> = {
+/** What a glossary run is doing, in the app's words (section 8). */
+export const PHASE_LABEL: Record<GlossaryPhase, string> = {
   loading: "Reading subtitles",
-  reference: "Gathering reference terms",
-  extracting: "Extracting terms",
-  normalizing: "Normalizing",
-  personalizing: "Looking up established names",
+  reference: "Reading your translated episodes",
+  extracting: "Finding names",
+  normalizing: "Tidying up",
+  personalizing: "Looking up names",
   saving: "Saving glossary",
 }
 
@@ -93,7 +95,7 @@ export function ExtractionConsole() {
 
   const status =
     phase === "extracting" && total > 0
-      ? `Extracting · batch ${done}/${total}`
+      ? `Finding names · batch ${done} of ${total}`
       : phase
         ? PHASE_LABEL[phase]
         : "Starting…"
@@ -115,13 +117,13 @@ export function ExtractionConsole() {
           <span className="text-[10px] uppercase tracking-[0.2em] text-[color:var(--color-ink-dim)]">World type</span>
           {worldType ? (
             <span
-              className="text-[22px] font-bold uppercase tracking-[0.04em] text-[color:var(--color-gold-hi)]"
+              className="text-[22px] font-bold tracking-[0.02em] text-[color:var(--color-gold-hi)]"
               style={{ textShadow: "0 0 18px color-mix(in oklch, var(--color-gold) 55%, transparent)" }}
             >
-              {worldType}
+              {titleCase(worldType)}
             </span>
           ) : (
-            <span className="text-[13px] text-muted-foreground">detecting…</span>
+            <span className="text-[13px] text-muted-foreground">Detecting…</span>
           )}
         </div>
         <div className="text-right">

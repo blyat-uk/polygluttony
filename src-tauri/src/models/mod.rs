@@ -42,6 +42,13 @@ pub enum TestProblem {
     Model,
     /// The server couldn't be reached (or didn't answer in time).
     Address,
+    /// The account is out of credit or over its quota.
+    Billing,
+    /// The provider is rate-limiting this key. Named as the run's `ErrorKind` is.
+    #[serde(rename = "rate_limit")]
+    RateLimit,
+    /// The provider's servers failed (5xx).
+    Server,
     Other,
 }
 
@@ -58,6 +65,9 @@ pub struct TestResult {
     /// The failure may be temporary (unreachable, rate-limited, server error),
     /// so saving the connection untested is reasonable. Never for a bad key or model.
     pub can_save_anyway: bool,
+    /// The provider's own words for a failure, for the page's "Details". `None`
+    /// when ok, or when the test failed before reaching the provider.
+    pub detail: Option<String>,
 }
 
 /// O21 — first-run check.
@@ -74,7 +84,27 @@ pub struct SourceFile {
     pub path: String,
     pub name: String,
     pub dialogue_count: u32,
+    /// Any translation output exists (clean or `.warning`).
     pub has_translation: bool,
+    /// What's on disk for this file.
+    pub translation: TranslationState,
+    /// Both the clean and the `.warning` output exist (an old leftover).
+    pub both_variants: bool,
+    /// Path of the output that stands for this episode (the clean one when it
+    /// exists, else the `.warning` one); `None` when nothing is on disk.
+    pub output_path: Option<String>,
+}
+
+/// What translation output exists next to a source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub enum TranslationState {
+    None,
+    /// A clean output exists.
+    Done,
+    /// Only a `.warning` output exists.
+    NeedsLook,
 }
 
 /// Result of opening a folder (O6/O7/O8 bundled).
@@ -90,4 +120,7 @@ pub struct ProjectView {
     pub supports_glossary: bool,
     /// Number of glossary terms in `glossary.json`, or `None` if no glossary exists.
     pub glossary_terms: Option<u32>,
+    /// No preferences were saved for this folder yet: the detected settings
+    /// are worth a look, so the Episodes page opens them.
+    pub first_visit: bool,
 }

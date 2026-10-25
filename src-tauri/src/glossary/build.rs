@@ -13,9 +13,9 @@
 //! batches (via the cancel token) but the build still finalizes: merge what
 //! completed → save → `Done { aborted: true }`. User cancel takes the same
 //! finalize path with `cancelled: true`. Partial glossary > no glossary. The
-//! only `Error` event is a final-save IO failure.
+//! only `Error` event is a final-save failure.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use futures::stream::{FuturesOrdered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -24,11 +24,13 @@ use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 
 use crate::ass::{decode::decode_file, parse::parse_dialogues, tags::strip_for_text};
+use crate::error::{AppError, AppResult};
 use crate::events::{GlossaryBuildSummary, GlossaryEvent, GlossaryPhase, LogLevel};
 use crate::glossary::diff::GlossaryDiff;
 use crate::glossary::io::{load_folder_glossary, save_folder_glossary};
+use crate::glossary::meta::{self, GlossaryChange, GlossaryChangeKind};
 use crate::glossary::model::Glossary;
-use crate::glossary::{normalize, personalize, prompts, reference};
+use crate::glossary::{history, normalize, personalize, prompts, reference};
 use crate::llm::service::LlmService;
 use crate::llm::LlmRequest;
 use crate::models::language_pair::LanguagePair;
@@ -45,10 +47,11 @@ pub fn glossary_batches(lines: &[String], batch_limit: Option<u32>) -> Vec<Strin
 
 /// Whether a build merges into the glossary already on disk or replaces it.
 ///
-/// `Append` is the everyday case: existing terms win, new terms fill gaps.
-/// `Regenerate` starts from nothing, which makes it byte-for-byte the
-/// first-time build path — and destructive, so `run::start` takes a backup
-/// first (see `io::backup_folder_glossary`).
+/// `Append` (Add new episodes) is the everyday case: existing terms win, new
+/// terms fill gaps. `Regenerate` (Rebuild from scratch) starts from nothing,
+/// which makes it byte-for-byte the first-time build path — and destructive,
+/// so the current glossary goes to the history before the first write (see
+/// `BuildWriter`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
 #[ts(export, export_to = "../../src/types/generated/")]
@@ -90,6 +93,176 @@ pub(crate) fn merged_with_existing(existing: Option<&Glossary>, new_terms: &Glos
     }
 }
 
+/// What Look up names online sees in a build: the found terms that will
+/// actually land. It runs BEFORE the merge, and existing terms always win, so
+/// a term the glossary already has is never sent: the lookup can't overwrite
+/// it, and nobody pays for an answer the merge would throw away. With no
+/// existing glossary (first build, Rebuild from scratch) that's every term.
+pub(crate) fn lookup_input(existing: Option<&Glossary>, new_terms: &Glossary) -> Glossary {
+    let Some(existing) = existing else {
+        return new_terms.clone();
+    };
+    let mut out = new_terms.clone();
+    for c in crate::glossary::model::CATEGORIES {
+        out.category_mut(c).retain(|source, _| !existing.has_key(source));
+    }
+    out
+}
+
+/// Changes someone else made to glossary.json while a build ran (an edit in
+/// a text editor, say). The build carries them into every later write, so
+/// its saves never undo them: a term set or changed outside wins over the
+/// build's, a term removed outside stays removed.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct OutsideEdits {
+    /// source → (category, translation) as set outside.
+    set: std::collections::BTreeMap<String, (&'static str, String)>,
+    removed: std::collections::BTreeSet<String>,
+    world_type: Option<String>,
+}
+
+impl OutsideEdits {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.set.is_empty() && self.removed.is_empty() && self.world_type.is_none()
+    }
+
+    /// Fold in what changed between `base` (the glossary as the build last
+    /// wrote or read it) and `current` (the file as it is now).
+    pub(crate) fn absorb(&mut self, base: Option<&Glossary>, current: &Glossary) {
+        let in_base = |c: &str, source: &str| base.and_then(|b| b.category(c).get(source));
+        for c in crate::glossary::model::CATEGORIES {
+            for (source, target) in current.category(c) {
+                if in_base(c, source) != Some(target) {
+                    self.removed.remove(source);
+                    self.set.insert(source.clone(), (c, target.clone()));
+                }
+            }
+            if let Some(base) = base {
+                for source in base.category(c).keys() {
+                    if !current.has_key(source) {
+                        self.set.remove(source);
+                        self.removed.insert(source.clone());
+                    }
+                }
+            }
+        }
+        if base.is_some_and(|b| b.world_type != current.world_type) {
+            self.world_type = Some(current.world_type.clone());
+        }
+    }
+
+    /// `g` with these edits on top.
+    pub(crate) fn apply(&self, g: &Glossary) -> Glossary {
+        let mut out = g.clone();
+        let drop_everywhere = |out: &mut Glossary, source: &str| {
+            for c in crate::glossary::model::CATEGORIES {
+                out.category_mut(c).remove(source);
+            }
+        };
+        for source in &self.removed {
+            drop_everywhere(&mut out, source);
+        }
+        for (source, (c, target)) in &self.set {
+            drop_everywhere(&mut out, source);
+            out.category_mut(c).insert(source.clone(), target.clone());
+        }
+        if let Some(world) = &self.world_type {
+            out.world_type = world.clone();
+        }
+        out
+    }
+}
+
+/// Writes the build's glossary. Before the FIRST write it saves the glossary
+/// on disk to the history (reason `scan` or `rebuild`), so the version the
+/// build started from can be restored. A save of the terms already on disk is
+/// skipped, so a build that changes nothing leaves no history entry. When the
+/// snapshot fails the write doesn't happen (and the next write tries the
+/// snapshot again): no undo, no overwrite.
+///
+/// Every save first rereads glossary.json: what someone else changed since
+/// the build last wrote or read it is kept (see [`OutsideEdits`]).
+struct BuildWriter<'a> {
+    folder: &'a Path,
+    snapshot: Option<GlossaryChangeKind>,
+    /// What glossary.json holds, as far as this build knows.
+    on_disk: Option<Glossary>,
+    outside: OutsideEdits,
+    wrote: bool,
+}
+
+impl<'a> BuildWriter<'a> {
+    fn new(folder: &'a Path, mode: BuildMode, on_disk: Option<Glossary>) -> Self {
+        let reason = match mode {
+            BuildMode::Append => GlossaryChangeKind::Scan,
+            BuildMode::Regenerate => GlossaryChangeKind::Rebuild,
+        };
+        BuildWriter {
+            folder,
+            snapshot: Some(reason),
+            on_disk,
+            outside: OutsideEdits::default(),
+            wrote: false,
+        }
+    }
+
+    /// Save `g`, merged into glossary.json as it is now. Returns what the
+    /// file holds afterwards.
+    fn save(&mut self, g: &Glossary) -> AppResult<Glossary> {
+        // A file that's gone or doesn't parse says nothing about edits.
+        if let Some(current) = load_folder_glossary(self.folder) {
+            if self.on_disk.as_ref() != Some(&current) {
+                self.outside.absorb(self.on_disk.as_ref(), &current);
+                self.on_disk = Some(current);
+            }
+        }
+        let next = self.outside.apply(g);
+        if self.on_disk.as_ref() == Some(&next) {
+            return Ok(next);
+        }
+        if let Some(reason) = self.snapshot {
+            history::snapshot(self.folder, reason).map_err(|e| {
+                AppError::Other(format!("couldn't save a copy of the current glossary first ({e})"))
+            })?;
+            self.snapshot = None;
+        }
+        save_folder_glossary(self.folder, &next)?;
+        self.on_disk = Some(next.clone());
+        self.wrote = true;
+        Ok(next)
+    }
+}
+
+/// After the final write: record the build in the sidecar meta. Add new
+/// episodes marks the terms it found as NEW; Rebuild from scratch resets
+/// every origin and marks everything NEW. `scanned` joins (append) or
+/// replaces (rebuild) the scanned files. The show name is kept.
+fn record_build(
+    folder: &Path,
+    mode: BuildMode,
+    before: Option<&Glossary>,
+    after: &Glossary,
+    scanned: &[String],
+    diff: GlossaryDiff,
+) -> AppResult<()> {
+    let mut m = meta::load_meta(folder);
+    let at_ms = meta::now_ms();
+    match mode {
+        BuildMode::Append => m.record_scan(
+            before,
+            after,
+            scanned,
+            GlossaryChange { kind: GlossaryChangeKind::Scan, at_ms, diff },
+        ),
+        BuildMode::Regenerate => m.record_rebuild(
+            after,
+            scanned,
+            GlossaryChange { kind: GlossaryChangeKind::Rebuild, at_ms, diff },
+        ),
+    }
+    meta::save_meta(folder, &m)
+}
+
 async fn phase(tx: &mpsc::Sender<GlossaryEvent>, p: GlossaryPhase, detail: Option<String>) {
     let _ = tx.send(GlossaryEvent::Phase { phase: p, detail }).await;
 }
@@ -100,7 +273,13 @@ async fn log(tx: &mpsc::Sender<GlossaryEvent>, level: LogLevel, message: String)
 
 /// O10 build orchestrator. Always emits `Done {summary}` when a result exists
 /// (including aborted/cancelled/no-text); the only `Error` event is a
-/// final-save IO failure (the last incremental save remains on disk then).
+/// final-save failure — the write itself, or the history copy that must come
+/// before the first write (the last incremental save, if any, remains on
+/// disk then).
+///
+/// After the final write the sidecar meta records the build (see
+/// `record_build`); a meta write that fails is a warning, not an error — the
+/// glossary itself is saved.
 pub async fn build_glossary(
     job: BuildJob,
     svc: &LlmService,
@@ -111,8 +290,8 @@ pub async fn build_glossary(
     // The diff is always against what was on disk before the run — including a
     // regenerate, where the merge base is deliberately empty but the user still
     // needs to see what they lost. `existing` stays the MERGE base only (every
-    // incremental save + the final merge); `run::start` has already copied the
-    // old file to glossary.prev.json.
+    // incremental save + the final merge); `writer` copies the old file to the
+    // history before the first write.
     let diff_base = load_folder_glossary(&job.folder);
     let existing = match job.mode {
         BuildMode::Append => diff_base.clone(),
@@ -123,6 +302,9 @@ pub async fn build_glossary(
     phase(&tx, GlossaryPhase::Loading, None).await;
     let mut all_lines: Vec<String> = Vec::new();
     let mut files_processed = 0u32;
+    // Files whose dialogue went into this build — the scanned files, once
+    // every batch made it.
+    let mut loaded_files: Vec<String> = Vec::new();
     for name in &job.files {
         match decode_file(&job.folder.join(name)) {
             Ok(text) => {
@@ -135,6 +317,7 @@ pub async fn build_glossary(
                 let n = dialogues.len();
                 all_lines.extend(dialogues.iter().map(|d| strip_for_text(&d.text)));
                 files_processed += 1;
+                loaded_files.push(name.clone());
                 log(&tx, LogLevel::Info, format!("loaded {name} ({n} lines)")).await;
             }
             Err(e) => {
@@ -164,7 +347,7 @@ pub async fn build_glossary(
             personalized: false,
             aborted: false,
             cancelled: false,
-            errors: vec!["No text found in files".into()],
+            errors: vec!["No dialogue found in the chosen files.".into()],
             diff: GlossaryDiff::compute(diff_base.as_ref(), &persisted),
         };
         let _ = tx.send(GlossaryEvent::Done { summary }).await;
@@ -252,6 +435,7 @@ pub async fn build_glossary(
         .collect();
 
     let glossary_path = job.folder.join("glossary.json");
+    let mut writer = BuildWriter::new(&job.folder, job.mode, diff_base.clone());
     let mut new_terms = Glossary::new(&job.world_type);
     let mut errors: Vec<String> = reference_errors;
     let mut terms_extracted = 0u32;
@@ -272,7 +456,7 @@ pub async fn build_glossary(
                         log(
                             &tx,
                             LogLevel::Warning,
-                            format!("batch {n}/{total}: unparseable response ({e})"),
+                            format!("batch {n} of {total}: the answer couldn't be read ({e})"),
                         )
                         .await;
                         Glossary::new(&job.world_type)
@@ -285,9 +469,9 @@ pub async fn build_glossary(
                 batches_processed += 1;
                 // Crash-safe incremental save: always merged-with-existing
                 // (the Python bug wrote new-terms-only), never an empty file.
-                let snapshot = merged_with_existing(existing.as_ref(), &new_terms);
-                if !snapshot.is_empty() {
-                    if let Err(e) = save_folder_glossary(&job.folder, &snapshot) {
+                let merged = merged_with_existing(existing.as_ref(), &new_terms);
+                if !merged.is_empty() {
+                    if let Err(e) = writer.save(&merged) {
                         log(
                             &tx,
                             LogLevel::Warning,
@@ -299,7 +483,7 @@ pub async fn build_glossary(
                         .await;
                     }
                 }
-                log(&tx, LogLevel::Info, format!("batch {n}/{total}: {count} terms")).await;
+                log(&tx, LogLevel::Info, format!("batch {n} of {total}: {count} terms")).await;
             }
             Err(e) if e.is_auth() && !aborted => {
                 // Retrying won't fix credentials: stop the REMAINING batches,
@@ -310,18 +494,18 @@ pub async fn build_glossary(
                 log(
                     &tx,
                     LogLevel::Warning,
-                    format!("batch {n}/{total}: auth error — stopping remaining batches"),
+                    format!("batch {n} of {total}: the API key didn't work — stopping the remaining batches"),
                 )
                 .await;
                 errors.push(format!(
-                    "batch {n}/{total}: auth error, remaining batches stopped ({e})"
+                    "batch {n} of {total}: the API key didn't work, so the remaining batches were stopped ({e})"
                 ));
             }
             Err(e) => {
                 let noise = (aborted || job.cancel.is_cancelled()) && e.is_cancelled();
                 if !noise {
-                    log(&tx, LogLevel::Warning, format!("batch {n}/{total} failed: {e}")).await;
-                    errors.push(format!("batch {n}/{total} failed: {e}"));
+                    log(&tx, LogLevel::Warning, format!("batch {n} of {total} failed: {e}")).await;
+                    errors.push(format!("batch {n} of {total} failed: {e}"));
                 }
             }
         }
@@ -350,24 +534,29 @@ pub async fn build_glossary(
         normalized = !job.cancel.is_cancelled();
     }
 
-    // ── Merge: existing terms win (build step 7) ────────────────────────────
-    let mut result = merged_with_existing(existing.as_ref(), &new_terms);
-
-    // ── Personalizing: one call on the web-capable connection (step 8) ──────
+    // ── Looking up names online: on the terms that will land, BEFORE the
+    // merge, so existing terms always win (build step 7). In a rebuild or a
+    // first build that's every found term. ─────────────────────────────────
     let mut personalized = false;
-    if job.personalize && !aborted && !job.cancel.is_cancelled() && !result.is_empty() {
+    let lookup = lookup_input(existing.as_ref(), &new_terms);
+    if job.personalize && !aborted && !job.cancel.is_cancelled() && !lookup.is_empty() {
         if let Some(p_svc) = personalize_svc {
-            phase(&tx, GlossaryPhase::Personalizing, None).await;
+            phase(
+                &tx,
+                GlossaryPhase::Personalizing,
+                Some(format!("{} new terms", lookup.count())),
+            )
+            .await;
             match personalize::personalize_pass(
                 p_svc,
-                &result,
+                &lookup,
                 &job.personalize_context,
                 &job.prompts.personalize,
             )
             .await
             {
                 Ok(g) => {
-                    result = g;
+                    new_terms = g;
                     personalized = true;
                 }
                 // A failure caused by a cancel landing mid-call is a
@@ -379,18 +568,26 @@ pub async fn build_glossary(
         }
     }
 
+    // ── Merge: existing terms win (build step 8) ────────────────────────────
+    let mut result = merged_with_existing(existing.as_ref(), &new_terms);
+
     // ── Saving: final write; empty result writes nothing, ever ──────────────
+    // The writer merges into the file as it is now, so edits made elsewhere
+    // during the build survive; `result` becomes what the file holds.
     phase(&tx, GlossaryPhase::Saving, None).await;
     if !result.is_empty() {
-        if let Err(e) = save_folder_glossary(&job.folder, &result) {
-            // The ONLY Error event in the build. The last incremental save
-            // remains on disk.
-            let _ = tx
-                .send(GlossaryEvent::Error {
-                    message: format!("could not save {}: {e}", glossary_path.display()),
-                })
-                .await;
-            return;
+        match writer.save(&result) {
+            Ok(saved) => result = saved,
+            Err(e) => {
+                // The ONLY Error event in the build. The last incremental save
+                // remains on disk.
+                let _ = tx
+                    .send(GlossaryEvent::Error {
+                        message: format!("Couldn't save {}: {e}", glossary_path.display()),
+                    })
+                    .await;
+                return;
+            }
         }
     }
 
@@ -402,6 +599,31 @@ pub async fn build_glossary(
     } else {
         result.clone()
     };
+    // What changed by this build: edits made elsewhere meanwhile are kept in
+    // the file, but they aren't the build's (nor its NEW terms).
+    let before = if writer.outside.is_empty() || result.is_empty() {
+        diff_base.clone()
+    } else {
+        let base = diff_base.clone().unwrap_or_else(|| Glossary::new(&job.world_type));
+        Some(writer.outside.apply(&base))
+    };
+    let diff = GlossaryDiff::compute(before.as_ref(), &persisted);
+
+    // ── Meta: what this build changed ───────────────────────────────────────
+    // Files count as scanned only when every batch made it: batches span
+    // files, so after a failed, stopped or aborted batch no file is known to
+    // be fully in the glossary. Add new episodes then offers them again.
+    // Recorded when the build wrote something, or scanned everything (a scan
+    // that found nothing new still scanned its files).
+    let complete = batches_processed == total;
+    if !result.is_empty() && (writer.wrote || complete) {
+        let scanned: &[String] = if complete { &loaded_files } else { &[] };
+        if let Err(e) =
+            record_build(&job.folder, job.mode, before.as_ref(), &result, scanned, diff.clone())
+        {
+            log(&tx, LogLevel::Warning, format!("couldn't update the glossary's notes: {e}")).await;
+        }
+    }
 
     // Recompute NOW, not at extraction-loop exit: a cancel that arrived during
     // normalize/personalize must still be reported as a cancel.
@@ -418,7 +640,7 @@ pub async fn build_glossary(
         aborted,
         cancelled,
         errors,
-        diff: GlossaryDiff::compute(diff_base.as_ref(), &persisted),
+        diff,
     };
     let _ = tx.send(GlossaryEvent::Done { summary }).await;
 }
@@ -571,7 +793,7 @@ mod tests {
         assert!(!s.aborted, "non-auth failures must not abort");
         assert_eq!(s.batches_processed, 1);
         assert_eq!(s.errors.len(), 1);
-        assert!(s.errors[0].contains("batch 1"));
+        assert!(s.errors[0].starts_with("batch 1 of 2"), "{}", s.errors[0]);
         assert_eq!(s.terms_final, 1); // half a glossary > no glossary
         assert!(load_folder_glossary(dir.path()).is_some());
     }
@@ -626,7 +848,7 @@ mod tests {
         assert_eq!(s.batches_processed, 0);
         assert_eq!(s.batches_total, 3);
         assert_eq!(s.errors.len(), 1, "queued-batch noise suppressed: {:?}", s.errors);
-        assert!(s.errors[0].contains("auth error"), "{}", s.errors[0]);
+        assert!(s.errors[0].contains("API key didn't work"), "{}", s.errors[0]);
     }
 
     /// The ONLY `Error` event in the build: the final save fails. Unix-only —
@@ -664,7 +886,7 @@ mod tests {
             })
             .collect();
         assert_eq!(error_msgs.len(), 1, "exactly one Error event: {events:?}");
-        assert!(error_msgs[0].contains("could not save"), "{}", error_msgs[0]);
+        assert!(error_msgs[0].starts_with("Couldn't save"), "{}", error_msgs[0]);
         assert!(
             error_msgs[0].contains("glossary.json"),
             "Error names the path: {}",
@@ -715,7 +937,7 @@ mod tests {
         )
         .await;
         assert_eq!(s.files_processed, 0);
-        assert_eq!(s.errors, vec!["No text found in files".to_string()]);
+        assert_eq!(s.errors, vec!["No dialogue found in the chosen files.".to_string()]);
         assert!(load_folder_glossary(dir.path()).is_none());
     }
 
@@ -858,7 +1080,7 @@ mod tests {
         let (_events, s) = run_and_collect(j, &svc, Some(&p_svc)).await;
         assert!(!s.personalized);
         assert_eq!(s.errors.len(), 1);
-        assert!(s.errors[0].contains("personalize"));
+        assert!(s.errors[0].starts_with("Look up names online"), "{}", s.errors[0]);
         assert_eq!(s.terms_final, 1); // glossary intact
     }
 
@@ -1067,5 +1289,442 @@ mod tests {
             "Ying Huanhuan",
             "a failed regenerate must not destroy the glossary"
         );
+    }
+
+    // ── Look up names online in a build (P0: existing terms always win) ────
+
+    fn chars(terms: &[(&str, &str)]) -> Glossary {
+        let mut g = Glossary::new("xianxia");
+        for (k, v) in terms {
+            g.characters.insert(k.to_string(), v.to_string());
+        }
+        g
+    }
+
+    #[test]
+    fn lookup_input_skips_terms_the_glossary_already_has() {
+        let existing = chars(&[("林动", "Lin Dong")]);
+        let mut found = chars(&[("林动", "x"), ("应欢欢", "ying huanhuan")]);
+        found.locations.insert("林动".into(), "cross-category twin".into());
+        found.locations.insert("青阳镇".into(), "Qingyang Town".into());
+
+        let input = lookup_input(Some(&existing), &found);
+        assert_eq!(input.count(), 2);
+        assert!(input.characters.contains_key("应欢欢"));
+        assert!(input.locations.contains_key("青阳镇"));
+        assert!(!input.has_key("林动"), "an existing term is never sent, in any category");
+
+        // First build / Rebuild from scratch: every found term.
+        assert_eq!(lookup_input(None, &found), found);
+    }
+
+    /// The P0: with lookup on, Add new episodes must never change a term the
+    /// glossary already had — not even when the lookup answers about it.
+    #[tokio::test(start_paused = true)]
+    async fn append_lookup_never_overwrites_an_existing_term() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("林动", "Lin Dong (yours)")]))
+            .unwrap();
+        write_ass(dir.path(), "e2.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Ok(
+            r#"{"characters":{"林动":"lin dong","应欢欢":"ying huanhuan"}}"#.into(),
+        )]);
+        // The lookup "corrects" the existing term too, and adds one of its own.
+        let pd = ScriptedDriver::new(vec![Ok(r#"{"terms":{"characters":{
+            "林动":"LOOKUP WINS?","应欢欢":"Ying Huanhuan","小貂":"Little Marten"}}}"#
+            .into())]);
+        let svc = svc1(d, cancel.clone());
+        let p_svc = svc1(pd.clone(), cancel.clone());
+        let mut j = job(dir.path(), vec!["e2.ass".into()], cancel);
+        j.personalize = true;
+        j.personalize_context = "Martial Universe".into();
+        let (_events, s) = run_and_collect(j, &svc, Some(&p_svc)).await;
+
+        assert!(s.personalized);
+        let req = pd.last_request().expect("the lookup ran");
+        assert!(req.user.contains("应欢欢"));
+        assert!(!req.user.contains("林动"), "existing terms are not sent: {}", req.user);
+
+        let saved = load_folder_glossary(dir.path()).unwrap();
+        assert_eq!(saved.characters["林动"], "Lin Dong (yours)", "existing term survives");
+        assert_eq!(saved.characters["应欢欢"], "Ying Huanhuan", "new term looked up");
+        assert_eq!(saved.characters["小貂"], "Little Marten");
+        assert_eq!(s.diff.total_modified, 0);
+        assert_eq!(s.diff.total_added, 2);
+    }
+
+    /// Nothing new to look up → no lookup call at all (the scripted lookup
+    /// driver would panic if called).
+    #[tokio::test(start_paused = true)]
+    async fn append_with_nothing_new_skips_the_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("林动", "Lin Dong")])).unwrap();
+        write_ass(dir.path(), "e2.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Ok(r#"{"characters":{"林动":"lin dong"}}"#.into())]);
+        let pd = ScriptedDriver::new(vec![]);
+        let svc = svc1(d, cancel.clone());
+        let p_svc = svc1(pd.clone(), cancel.clone());
+        let mut j = job(dir.path(), vec!["e2.ass".into()], cancel);
+        j.personalize = true;
+        let (_events, s) = run_and_collect(j, &svc, Some(&p_svc)).await;
+        assert_eq!(pd.call_count(), 0);
+        assert!(!s.personalized);
+        assert_eq!(load_folder_glossary(dir.path()).unwrap().characters["林动"], "Lin Dong");
+    }
+
+    /// Rebuild from scratch keeps the whole-glossary lookup: every found term
+    /// is sent, and the lookup's answers win.
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_lookup_covers_every_found_term() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("林动", "Lin Dong (old)")]))
+            .unwrap();
+        write_ass(dir.path(), "e1.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Ok(
+            r#"{"characters":{"林动":"lin dong","应欢欢":"ying huanhuan"}}"#.into(),
+        )]);
+        let pd = ScriptedDriver::new(vec![Ok(
+            r#"{"characters":{"林动":"Lin Dong","应欢欢":"Ying Huanhuan"}}"#.into(),
+        )]);
+        let svc = svc1(d, cancel.clone());
+        let p_svc = svc1(pd.clone(), cancel.clone());
+        let mut j = job(dir.path(), vec!["e1.ass".into()], cancel);
+        j.mode = BuildMode::Regenerate;
+        j.personalize = true;
+        let (_events, s) = run_and_collect(j, &svc, Some(&p_svc)).await;
+        assert!(s.personalized);
+        let req = pd.last_request().unwrap();
+        assert!(req.user.contains("林动") && req.user.contains("应欢欢"));
+        let saved = load_folder_glossary(dir.path()).unwrap();
+        assert_eq!(saved.characters["林动"], "Lin Dong");
+        assert_eq!(saved.characters["应欢欢"], "Ying Huanhuan");
+    }
+
+    // ── Meta and history after a build ──────────────────────────────────────
+
+    use crate::glossary::history;
+    use crate::glossary::meta::{load_meta, save_meta, GlossaryChangeKind, GlossaryMeta, TermOrigin};
+
+    fn yours(source: &str, show: &str) -> GlossaryMeta {
+        let mut m = GlossaryMeta { show_name: Some(show.into()), ..Default::default() };
+        m.origins.entry("characters".into()).or_default().insert(source.into(), TermOrigin::Yours);
+        m
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn append_snapshots_once_and_records_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("林动", "Lin Dong")])).unwrap();
+        let mut m = yours("林动", "Martial Universe");
+        m.scanned_files = vec!["e1.ass".into()];
+        save_meta(dir.path(), &m).unwrap();
+
+        write_ass(dir.path(), "e2.ass", &["一", "二"]); // 2 batches → 2 incremental saves
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![
+            Ok(r#"{"characters":{"应欢欢":"Ying Huanhuan"}}"#.into()),
+            Ok(r#"{"locations":{"青阳镇":"Qingyang Town"}}"#.into()),
+        ]);
+        let svc = svc1(d, cancel.clone());
+        let (_events, s) =
+            run_and_collect(job(dir.path(), vec!["e2.ass".into()], cancel), &svc, None).await;
+        assert_eq!(s.terms_final, 3);
+
+        // One snapshot for the whole build, holding the glossary it started from.
+        let snaps = history::list(dir.path());
+        assert_eq!(snaps.len(), 1, "{snaps:?}");
+        assert_eq!(snaps[0].reason, GlossaryChangeKind::Scan);
+        assert_eq!(snaps[0].count, 1);
+
+        let m = load_meta(dir.path());
+        assert_eq!(m.origins["characters"]["林动"], TermOrigin::Yours, "origins kept");
+        assert_eq!(m.origins.len(), 1, "new terms stay the AI's");
+        assert_eq!(m.unreviewed["characters"], vec!["应欢欢".to_string()]);
+        assert_eq!(m.unreviewed["locations"], vec!["青阳镇".to_string()]);
+        assert_eq!(m.scanned_files, vec!["e1.ass".to_string(), "e2.ass".to_string()]);
+        assert_eq!(m.show_name.as_deref(), Some("Martial Universe"));
+        let lc = m.last_change.unwrap();
+        assert_eq!(lc.kind, GlossaryChangeKind::Scan);
+        assert_eq!(lc.diff.total_added, 2);
+        assert_eq!(lc.diff.total_removed + lc.diff.total_modified, 0);
+
+        // Restoring the snapshot brings back the glossary and meta from before.
+        history::restore(dir.path(), &snaps[0].id).unwrap();
+        assert_eq!(load_folder_glossary(dir.path()).unwrap().count(), 1);
+        assert_eq!(load_meta(dir.path()).scanned_files, vec!["e1.ass".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_snapshots_and_resets_the_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("应欢欢", "Ying Huanhuan")]))
+            .unwrap();
+        let mut m = yours("应欢欢", "Martial Universe");
+        m.scanned_files = vec!["old.ass".into()];
+        save_meta(dir.path(), &m).unwrap();
+
+        write_ass(dir.path(), "e1.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Ok(
+            r#"{"characters":{"林动":"Lin Dong"},"items":{"祖符":"Ancestral Symbol"}}"#.into(),
+        )]);
+        let svc = svc1(d, cancel.clone());
+        let mut j = job(dir.path(), vec!["e1.ass".into(), "missing.ass".into()], cancel);
+        j.mode = BuildMode::Regenerate;
+        run_and_collect(j, &svc, None).await;
+
+        let snaps = history::list(dir.path());
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].reason, GlossaryChangeKind::Rebuild);
+        assert!(!dir.path().join("glossary.prev.json").exists(), "no more prev file");
+
+        let m = load_meta(dir.path());
+        assert!(m.origins.is_empty(), "origins reset");
+        assert_eq!(m.unreviewed["characters"], vec!["林动".to_string()]);
+        assert_eq!(m.unreviewed["items"], vec!["祖符".to_string()]);
+        assert_eq!(m.scanned_files, vec!["e1.ass".to_string()], "only files that loaded");
+        assert_eq!(m.show_name.as_deref(), Some("Martial Universe"));
+        let lc = m.last_change.unwrap();
+        assert_eq!(lc.kind, GlossaryChangeKind::Rebuild);
+        assert_eq!(lc.diff.total_removed, 1);
+        assert_eq!(lc.diff.total_added, 2);
+    }
+
+    /// A build that writes nothing leaves no history entry and no meta change.
+    #[tokio::test(start_paused = true)]
+    async fn build_that_writes_nothing_leaves_history_and_meta_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("林动", "Lin Dong")])).unwrap();
+        save_meta(dir.path(), &yours("林动", "Martial Universe")).unwrap();
+        write_ass(dir.path(), "e1.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Err(LlmError::Http {
+            status: 400,
+            body: "bad".into(),
+            retry_after: None,
+        })]);
+        let svc = svc1(d, cancel.clone());
+        let mut j = job(dir.path(), vec!["e1.ass".into()], cancel);
+        j.mode = BuildMode::Regenerate;
+        run_and_collect(j, &svc, None).await;
+        assert!(history::list(dir.path()).is_empty());
+        let m = load_meta(dir.path());
+        assert!(m.last_change.is_none() && m.scanned_files.is_empty());
+        assert_eq!(m.origins["characters"]["林动"], TermOrigin::Yours);
+    }
+
+    /// Batches span files, so after a failed batch no file is known to be
+    /// fully scanned: the terms that did land are NEW, the files aren't marked.
+    #[tokio::test(start_paused = true)]
+    async fn partial_build_marks_terms_new_but_no_files_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ass(dir.path(), "e1.ass", &["一", "二"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![
+            Ok(r#"{"characters":{"林动":"Lin Dong"}}"#.into()),
+            Err(LlmError::Http { status: 400, body: "bad".into(), retry_after: None }),
+        ]);
+        let svc = svc1(d, cancel.clone());
+        run_and_collect(job(dir.path(), vec!["e1.ass".into()], cancel), &svc, None).await;
+        let m = load_meta(dir.path());
+        assert!(m.scanned_files.is_empty());
+        assert_eq!(m.unreviewed["characters"], vec!["林动".to_string()]);
+        assert_eq!(m.last_change.unwrap().kind, GlossaryChangeKind::Scan);
+        assert!(history::list(dir.path()).is_empty(), "first build: nothing to snapshot");
+    }
+
+    /// No copy, no overwrite: when the history can't take the snapshot, the
+    /// build doesn't write and says so with its one Error event.
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_failure_blocks_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("应欢欢", "Ying Huanhuan")]))
+            .unwrap();
+        // A FILE where the app's folder should be: the snapshot can't be written.
+        std::fs::write(dir.path().join(".polygluttony"), "in the way").unwrap();
+        write_ass(dir.path(), "e1.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Ok(r#"{"characters":{"林动":"Lin Dong"}}"#.into())]);
+        let svc = svc1(d, cancel.clone());
+        let mut j = job(dir.path(), vec!["e1.ass".into()], cancel);
+        j.mode = BuildMode::Regenerate;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        build_glossary(j, &svc, &svc, None, tx).await;
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        let errors: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                GlossaryEvent::Error { message } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "{events:?}");
+        assert!(errors[0].contains("copy of the current glossary"), "{}", errors[0]);
+        let saved = load_folder_glossary(dir.path()).unwrap();
+        assert_eq!(saved.count(), 1);
+        assert_eq!(saved.characters["应欢欢"], "Ying Huanhuan", "the old glossary is intact");
+    }
+
+    /// Add new episodes that finds nothing new rewrites nothing and takes no
+    /// snapshot, but still records the episodes as scanned.
+    #[tokio::test(start_paused = true)]
+    async fn append_that_finds_nothing_new_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hand-formatted on disk: a rewrite would change these bytes.
+        let hand = r#"{"world_type":"xianxia","terms":{"characters":{"林动":"Lin Dong"}}}"#;
+        std::fs::write(dir.path().join("glossary.json"), hand).unwrap();
+        write_ass(dir.path(), "e2.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Ok(r#"{"characters":{"林动":"lin dong"}}"#.into())]);
+        let svc = svc1(d, cancel.clone());
+        let (_events, s) =
+            run_and_collect(job(dir.path(), vec!["e2.ass".into()], cancel), &svc, None).await;
+        assert!(!s.diff.has_changes);
+        assert_eq!(std::fs::read_to_string(dir.path().join("glossary.json")).unwrap(), hand);
+        assert!(history::list(dir.path()).is_empty());
+        let m = load_meta(dir.path());
+        assert_eq!(m.scanned_files, vec!["e2.ass".to_string()]);
+        assert!(m.unreviewed.is_empty());
+    }
+
+    /// A build where every batch failed changes nothing — not even the meta's
+    /// last change.
+    #[tokio::test(start_paused = true)]
+    async fn append_where_every_batch_failed_leaves_meta_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("林动", "Lin Dong")])).unwrap();
+        write_ass(dir.path(), "e2.ass", &["一"]);
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![Err(LlmError::Http {
+            status: 400,
+            body: "bad".into(),
+            retry_after: None,
+        })]);
+        let svc = svc1(d, cancel.clone());
+        run_and_collect(job(dir.path(), vec!["e2.ass".into()], cancel), &svc, None).await;
+        assert!(history::list(dir.path()).is_empty());
+        assert!(crate::glossary::meta::read_meta(dir.path()).is_none(), "no sidecar written");
+    }
+
+    // ── edits made elsewhere while a build runs ─────────────────────────────
+
+    #[test]
+    fn outside_edits_are_what_changed_since_the_build_last_looked() {
+        let base = chars(&[("林动", "Lin Dong"), ("应欢欢", "Ying Huanhuan"), ("小貂", "Little Marten")]);
+        let mut current = chars(&[("林动", "Lin Dong (yours)"), ("小炎", "Little Flame")]);
+        current.locations.insert("小貂".into(), "Little Marten".into()); // moved category
+        let mut edits = OutsideEdits::default();
+        edits.absorb(Some(&base), &current);
+        assert!(!edits.is_empty());
+
+        // The build's own version: it never saw any of that.
+        let mut build = base.clone();
+        build.characters.insert("青檀".into(), "Qing Tan".into());
+        let merged = edits.apply(&build);
+        assert_eq!(merged.characters.get("林动").map(String::as_str), Some("Lin Dong (yours)"));
+        assert_eq!(merged.characters.get("小炎").map(String::as_str), Some("Little Flame"));
+        assert!(!merged.has_key("应欢欢"), "removed elsewhere stays removed");
+        assert_eq!(merged.locations.get("小貂").map(String::as_str), Some("Little Marten"));
+        assert!(!merged.characters.contains_key("小貂"));
+        assert_eq!(merged.characters.get("青檀").map(String::as_str), Some("Qing Tan"), "the build's term lands");
+
+        // Nothing changed: nothing to carry.
+        let mut none = OutsideEdits::default();
+        none.absorb(Some(&base), &base);
+        assert!(none.is_empty());
+        assert_eq!(none.apply(&build), build);
+    }
+
+    #[test]
+    fn the_build_writer_keeps_edits_made_since_its_last_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = chars(&[("林动", "Lin Dong")]);
+        crate::glossary::io::save_folder_glossary(dir.path(), &start).unwrap();
+        let mut writer = BuildWriter::new(dir.path(), BuildMode::Append, Some(start.clone()));
+
+        // Someone adds a term while the build works.
+        let mut edited = start.clone();
+        edited.characters.insert("应欢欢".into(), "Ying Huanhuan".into());
+        crate::glossary::io::save_folder_glossary(dir.path(), &edited).unwrap();
+
+        let mut found = start.clone();
+        found.locations.insert("青阳镇".into(), "Qingyang Town".into());
+        let saved = writer.save(&found).unwrap();
+        assert!(saved.has_key("应欢欢") && saved.has_key("青阳镇"));
+        assert_eq!(load_folder_glossary(dir.path()).as_ref(), Some(&saved));
+
+        // A later save of the build's own result (which never had it) keeps it too.
+        let mut more = found.clone();
+        more.items.insert("祖石".into(), "Ancestral Stone".into());
+        let saved = writer.save(&more).unwrap();
+        assert!(saved.has_key("应欢欢") && saved.has_key("祖石"));
+        assert_eq!(load_folder_glossary(dir.path()).as_ref(), Some(&saved));
+    }
+
+    /// Edits glossary.json (as a text editor would) on its `at`-th request.
+    struct EditOnCall {
+        inner: Arc<ScriptedDriver>,
+        at: u32,
+        calls: std::sync::atomic::AtomicU32,
+        folder: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmDriver for EditOnCall {
+        async fn complete(&self, _s: &str, _u: &str) -> Result<String, LlmError> {
+            unreachable!()
+        }
+        async fn stream(&self, req: &crate::llm::LlmRequest) -> Result<crate::llm::LlmResponse, LlmError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.at {
+                let mut g = load_folder_glossary(&self.folder).unwrap();
+                g.characters.insert("应欢欢".into(), "Ying Huanhuan".into());
+                crate::glossary::io::save_folder_glossary(&self.folder, &g).unwrap();
+            }
+            self.inner.stream(req).await
+        }
+        async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+            Ok(vec![])
+        }
+        fn model(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_term_added_during_a_build_survives_its_final_save() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::glossary::io::save_folder_glossary(dir.path(), &chars(&[("林动", "Lin Dong")])).unwrap();
+        write_ass(dir.path(), "e2.ass", &["一", "二"]); // 2 batches
+        let cancel = CancellationToken::new();
+        let driver = Arc::new(EditOnCall {
+            inner: ScriptedDriver::new(vec![
+                Ok(r#"{"locations":{"青阳镇":"Qingyang Town"}}"#.into()),
+                Ok(r#"{"characters":{"应笑笑":"Ying Xiaoxiao"}}"#.into()),
+            ]),
+            at: 2,
+            calls: Default::default(),
+            folder: dir.path().to_path_buf(),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let svc = LlmService::new(driver, 1, cancel.clone(), tx);
+        let (_events, s) =
+            run_and_collect(job(dir.path(), vec!["e2.ass".into()], cancel), &svc, None).await;
+
+        let saved = load_folder_glossary(dir.path()).unwrap();
+        for term in ["林动", "青阳镇", "应笑笑", "应欢欢"] {
+            assert!(saved.has_key(term), "{term} missing from {saved:?}");
+        }
+        assert_eq!(s.terms_final, 4);
+        // The build reports (and marks NEW) only what it found itself.
+        assert_eq!(s.diff.total_added, 2);
+        let unreviewed = load_meta(dir.path()).unreviewed;
+        assert!(!unreviewed.values().flatten().any(|t| t == "应欢欢"), "{unreviewed:?}");
     }
 }

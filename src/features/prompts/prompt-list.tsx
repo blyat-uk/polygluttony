@@ -42,18 +42,28 @@ export function PromptList({ prompts, selected, onSelect }: Props) {
                 )}
               >
                 <span className="truncate">{p.name}</span>
-                {p.modified ? (
-                  <span
-                    className="ml-2 size-1.5 shrink-0 rounded-full bg-[color:var(--color-alert)]"
-                    title="Customized"
-                    aria-label="Customized"
-                  />
-                ) : null}
+                {p.modified ? <EditedMark className="ml-2" /> : null}
               </button>
             ))}
           </div>
         );
       })}
     </div>
+  );
+}
+
+/** A prompt you've changed from its default: gold dot and the word, so it reads twice. */
+export function EditedMark({ className }: { className?: string }) {
+  return (
+    <span
+      title="Changed from the default"
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1 text-[10.5px] font-medium text-primary",
+        className,
+      )}
+    >
+      <span aria-hidden className="size-1.5 rounded-full bg-current" />
+      edited
+    </span>
   );
 }

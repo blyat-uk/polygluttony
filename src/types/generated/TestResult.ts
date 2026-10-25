@@ -14,4 +14,9 @@ problem: TestProblem | null,
  * The failure may be temporary (unreachable, rate-limited, server error),
  * so saving the connection untested is reasonable. Never for a bad key or model.
  */
-can_save_anyway: boolean, };
+can_save_anyway: boolean, 
+/**
+ * The provider's own words for a failure, for the page's "Details". `None`
+ * when ok, or when the test failed before reaching the provider.
+ */
+detail: string | null, };

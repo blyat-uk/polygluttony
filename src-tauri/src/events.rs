@@ -55,6 +55,43 @@ pub enum FileStateKind {
     Done,
     Warning,
     Failed,
+    /// The run stopped (by the user or an error) before this file finished.
+    /// Finished batches are kept, so Resume carries on from here.
+    Stopped,
+}
+
+/// What kind of failure an error was, so the UI can say what to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub enum ErrorKind {
+    /// The provider rejected the API key (401/403).
+    Auth,
+    /// Out of credit or over quota.
+    Billing,
+    /// Rate-limited and the retries ran out.
+    RateLimit,
+    /// The provider doesn't know the model.
+    Model,
+    /// Couldn't reach the provider at all.
+    Network,
+    /// The provider's servers failed (5xx).
+    Server,
+    Other,
+}
+
+/// Why a run ended early. Sent once, before `RunFinished`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct StopInfo {
+    /// True when the user pressed Stop.
+    pub by_user: bool,
+    /// One plain sentence for the banner, e.g. "Anthropic rejected the API
+    /// key used for Translate." Empty when `by_user`.
+    pub message: String,
+    pub kind: Option<ErrorKind>,
+    /// The step whose model failed, when known.
+    pub step: Option<crate::config::Step>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -89,6 +126,12 @@ pub struct VerifyIssue {
     pub issue_type: String,
     pub description: String,
     pub severity: String,
+    /// For `name` issues: the glossary source term the line should use.
+    #[serde(default)]
+    pub term: Option<String>,
+    /// For `name` issues: the translation the glossary expects.
+    #[serde(default)]
+    pub expected: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -114,11 +157,28 @@ pub struct FileResult {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "../../src/types/generated/")]
 pub enum RunEvent {
+    /// A run began: always its first event, for translation runs and for
+    /// review runs (retranslating lines or a glossary term's lines) alike.
+    /// `folder` as the run was given it; `files` in run order.
+    RunStarted { folder: String, files: Vec<String>, resume: bool },
     State { file: String, state: FileStateKind, detail: Option<String> },
-    Progress { file: String, translated: u32, total: u32, batch: u32, total_batches: u32, retries: u32 },
+    Progress {
+        file: String,
+        translated: u32,
+        total: u32,
+        batch: u32,
+        total_batches: u32,
+        retries: u32,
+        /// Why the last retry happened, in plain words ("a reply came back incomplete").
+        retry_reason: Option<String>,
+    },
     Log { file: Option<String>, level: LogLevel, phase: LogPhase, message: String },
     FileDone { file: String, has_warnings: bool, issues: Vec<VerifyIssue> },
-    Error { file: String, message: String },
+    Error { file: String, message: String, error_kind: ErrorKind },
+    /// The run is ending early; sent once, before `RunFinished`.
+    Stopped { info: StopInfo },
+    /// A provider asked us to slow down; requests wait `seconds` first.
+    Throttled { seconds: u32, provider: String },
     RunFinished { results: Vec<FileResult> },
     /// The episode's dialogue lines, once parsed.
     #[ts(skip)]
@@ -132,6 +192,14 @@ pub enum RunEvent {
     /// The request announced by the last `Sending` is over, whatever came back.
     #[ts(skip)]
     Idle { file: String },
+    /// The announced request actually went out to the provider (it may wait
+    /// for a free slot or a rate-limit pause first). Sent by the LLM service
+    /// once per attempt.
+    #[ts(skip)]
+    RequestSent { file: String },
+    /// The announced request is waiting again before a retry.
+    #[ts(skip)]
+    RequestWaiting { file: String },
 }
 
 impl RunEvent {
@@ -142,12 +210,17 @@ impl RunEvent {
             RunEvent::EpisodeLines { .. }
             | RunEvent::Sending { .. }
             | RunEvent::Landed { .. }
-            | RunEvent::Idle { .. } => true,
-            RunEvent::State { .. }
+            | RunEvent::Idle { .. }
+            | RunEvent::RequestSent { .. }
+            | RunEvent::RequestWaiting { .. } => true,
+            RunEvent::RunStarted { .. }
+            | RunEvent::State { .. }
             | RunEvent::Progress { .. }
             | RunEvent::Log { .. }
             | RunEvent::FileDone { .. }
             | RunEvent::Error { .. }
+            | RunEvent::Stopped { .. }
+            | RunEvent::Throttled { .. }
             | RunEvent::RunFinished { .. } => false,
         }
     }
@@ -238,6 +311,46 @@ pub struct EpisodeSnapshot {
     pub lines: Vec<EpisodeLine>,
     /// Final verify issues; empty until the episode finishes.
     pub issues: Vec<VerifyIssue>,
+    /// Set while this episode's next request is held back because a
+    /// provider asked us to slow down.
+    #[serde(default)]
+    pub throttle: Option<EpisodeThrottle>,
+}
+
+/// A rate-limit wait an episode is sitting out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct EpisodeThrottle {
+    /// Who asked us to wait ("Anthropic", or "The server" for a custom URL).
+    pub provider: String,
+    /// Epoch ms the wait ends.
+    #[ts(type = "number")]
+    pub until_ms: u64,
+}
+
+/// Channel that says a folder's stored results changed (an episode finished,
+/// a run stopped, or a review action saved). Payload `ResultsChanged`; refetch
+/// `get_folder_results`.
+pub const RESULTS_CHANGED_EVENT: &str = "results://changed";
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct ResultsChanged {
+    /// The folder as the run or command was given it.
+    pub folder: String,
+    pub file: String,
+}
+
+/// Channel that asks an open episode window to scroll to and select a line.
+pub const EPISODE_GO_TO_LINE_EVENT: &str = "episode://go-to-line";
+
+/// Payload of `EPISODE_GO_TO_LINE_EVENT` (typed in `src/lib/ipc.ts`).
+/// `folder` is the one the window was opened with (`None` = the run's).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeGoToLine {
+    pub folder: Option<String>,
+    pub file: String,
+    pub line: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -249,6 +362,8 @@ pub enum EpisodeView {
     /// In the run, but its source file couldn't be read.
     Unreadable { message: String },
     Live(EpisodeSnapshot),
+    /// A finished episode read back from the stored results, outside any run.
+    Stored(EpisodeSnapshot),
 }
 
 /// Channel for all step-4 glossary events.

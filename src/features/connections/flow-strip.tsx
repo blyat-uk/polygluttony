@@ -77,7 +77,7 @@ const WEB_SEARCH: Record<WebSearchNode["state"], { tone: Tone; text: string }> =
 
 /**
  * The one-model view's live readout, in workflow order:
- * `.ass subtitles ─▶ Glossary · extract → normalize ─▶ Web search · <state> ─▶
+ * `.ass subtitles ─▶ Glossary · find names → tidy up ─▶ Look up names online · <state> ─▶
  *  Translate → verify ─▶ translated lines`. Wraps between hops on narrow widths.
  */
 export function FlowStrip({ usable, webSearch }: { usable: boolean; webSearch: WebSearchNode }) {
@@ -96,14 +96,14 @@ export function FlowStrip({ usable, webSearch }: { usable: boolean; webSearch: W
         </span>
         <Hop>
           <Node tone={model} note={keyNote}>
-            Glossary · extract
+            Glossary · find names
             <Then />
-            normalize
+            tidy up
           </Node>
         </Hop>
         <Hop>
           <Node tone={ws.tone}>
-            Web search · {webSearch.state === "separate" ? webSearch.label : ws.text}
+            Look up names online · {webSearch.state === "separate" ? webSearch.label : ws.text}
           </Node>
         </Hop>
       </span>

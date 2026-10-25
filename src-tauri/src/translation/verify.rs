@@ -65,16 +65,8 @@ pub async fn verify_file(
     let d = drift::detect(&pairs, glossary_terms);
     if d.has_suspected_drift {
         let start = d.suspected_drift_start_id.unwrap_or(1);
-        let (src, tgt) = lines.get(&start).cloned().unwrap_or_default();
         return Ok(VerifyReport {
-            issues: vec![VerifyIssue {
-                line_id: start,
-                source: src,
-                translation: tgt,
-                issue_type: "drift".into(),
-                description: "the translation starts drifting from the original here".into(),
-                severity: "high".into(),
-            }],
+            issues: drift_issues(lines, glossary_terms, start),
             sampled_line_ids: Vec::new(),
             failed_line_ids: d.flagged_line_ids.into_iter().collect(),
         });
@@ -100,7 +92,7 @@ pub async fn verify_file(
             // Auth death and user cancellation must NOT degrade gracefully —
             // a dead key or mid-verify cancel would otherwise finish the file
             // as "clean without verification" and write unverified output.
-            Err(e) if e.is_auth() || e.is_cancelled() => return Err(e),
+            Err(e) if e.is_auth() || e.is_fatal() || e.is_cancelled() => return Err(e),
             // Other failures keep degrading gracefully (`verifier.py:399-400`).
             Err(_) => continue,
         };
@@ -118,22 +110,97 @@ pub async fn verify_file(
             };
             let Some((src, tgt)) = lines.get(&id) else { continue };
             failed.insert(id);
-            issues.push(VerifyIssue {
-                line_id: id,
-                source: src.clone(),
-                translation: tgt.clone(),
-                issue_type: "drift".into(),
-                description: item
-                    .get("reason")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("flagged by verifier")
-                    .to_string(),
-                severity: "high".into(),
-            });
+            let reason = item.get("reason").and_then(|r| r.as_str());
+            issues.push(meaning_issue(id, src, tgt, reason));
         }
     }
 
     Ok(VerifyReport { issues, sampled_line_ids, failed_line_ids: failed })
+}
+
+/// What users see for a line that may have lost the original's meaning. The
+/// check is called drift inside the engine; users never see that word.
+pub const MEANING_DESCRIPTION: &str = "This line may not say what the original says.";
+
+/// A `meaning` issue; the verifier's reason, when it gave one, follows in
+/// brackets (unless it talks about "drift").
+fn meaning_issue(line_id: u32, source: &str, translation: &str, reason: Option<&str>) -> VerifyIssue {
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty() && !r.to_lowercase().contains("drift"));
+    VerifyIssue {
+        line_id,
+        source: source.to_string(),
+        translation: translation.to_string(),
+        issue_type: "meaning".into(),
+        description: match reason {
+            Some(r) => format!("{} ({r})", MEANING_DESCRIPTION),
+            None => MEANING_DESCRIPTION.into(),
+        },
+        severity: "high".into(),
+        term: None,
+        expected: None,
+    }
+}
+
+/// One `name` issue per (line, glossary term) where the line's source holds
+/// the term and its translation doesn't hold the glossary's translation
+/// (case-insensitive; `lines` come with their tags stripped). The same check
+/// the drift score counts, but on every line, whatever the score: these are
+/// review issues only and never decide what gets translated again.
+pub fn name_issues(
+    lines: &BTreeMap<u32, (String, String)>,
+    glossary_terms: &BTreeMap<String, String>,
+) -> Vec<VerifyIssue> {
+    let pairs: Vec<LinePair> = lines
+        .iter()
+        .map(|(id, (s, t))| LinePair { id: *id, src: s.clone(), tgt: t.clone() })
+        .collect();
+    drift::signals::glossary_misses(&pairs, glossary_terms)
+        .into_iter()
+        .map(|miss| {
+            let (src, tgt) = lines.get(&miss.line_id).cloned().unwrap_or_default();
+            VerifyIssue {
+                line_id: miss.line_id,
+                source: src,
+                translation: tgt,
+                issue_type: "name".into(),
+                description: format!(
+                    "\"{}\" should be \"{}\" here, per your glossary.",
+                    miss.term, miss.expected
+                ),
+                severity: "high".into(),
+                term: Some(miss.term),
+                expected: Some(miss.expected),
+            }
+        })
+        .collect()
+}
+
+/// Put `extra` into `issues` by line, each after the issues already there
+/// for its line. Line 0 (a summary such as "…and 12 more untranslated
+/// lines") stays last.
+pub fn insert_by_line(issues: &mut Vec<VerifyIssue>, extra: Vec<VerifyIssue>) {
+    for issue in extra {
+        let at = issues.partition_point(|i| i.line_id != 0 && i.line_id <= issue.line_id);
+        issues.insert(at, issue);
+    }
+}
+
+/// Stage 1's issues: one `name` issue per glossary term a line is missing,
+/// then a `meaning` issue where the drift starts unless a name issue already
+/// covers that line. Retranslation still follows the drift flags; this only
+/// says what is wrong where.
+fn drift_issues(
+    lines: &BTreeMap<u32, (String, String)>,
+    glossary_terms: &BTreeMap<String, String>,
+    start: u32,
+) -> Vec<VerifyIssue> {
+    let mut issues = name_issues(lines, glossary_terms);
+    if !issues.iter().any(|i| i.line_id == start) {
+        let (src, tgt) = lines.get(&start).cloned().unwrap_or_default();
+        let at = issues.partition_point(|i| i.line_id < start);
+        issues.insert(at, meaning_issue(start, &src, &tgt, None));
+    }
+    issues
 }
 
 /// Sampling: thirds by sorted id; 50% per region clamped [5, 80]; priority
@@ -287,8 +354,46 @@ mod tests {
         let svc = LlmService::new(driver.clone(), 2, CancellationToken::new(), tx);
         let r = verify_file(&svc, &p, &BTreeMap::new(), tpl()).await.unwrap();
         assert!(!r.issues.is_empty());
-        assert_eq!(r.issues[0].issue_type, "drift");
+        // No glossary: the one issue says what's wrong in plain words.
+        assert_eq!(r.issues[0].issue_type, "meaning");
+        assert_eq!(r.issues[0].description, MEANING_DESCRIPTION);
         assert_eq!(driver.call_count(), 0); // stage 2 skipped
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_glossary_names_become_one_issue_per_line() {
+        let mut terms = BTreeMap::new();
+        terms.insert("叶长生".to_string(), "Ye Changsheng".to_string());
+        terms.insert("凌天门".to_string(), "Lingtian Sect".to_string());
+        let mut p = BTreeMap::new();
+        p.insert(1, ("叶长生你要去哪里？".to_string(), "Where are you going, Ye Changshen.".to_string()));
+        p.insert(2, ("凌天门在吗？".to_string(), "Is anyone there.".to_string()));
+        p.insert(3, ("叶长生不会走的".to_string(), "Ye Changsheng won't leave".to_string()));
+        p.insert(4, ("好。".to_string(), String::new()));
+        let driver = ScriptedDriver::new(vec![]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let svc = LlmService::new(driver.clone(), 2, CancellationToken::new(), tx);
+        let r = verify_file(&svc, &p, &terms, tpl()).await.unwrap();
+        assert_eq!(driver.call_count(), 0, "drift fired; no model call");
+
+        let names: Vec<_> = r.issues.iter().filter(|i| i.issue_type == "name").collect();
+        assert_eq!(names.len(), 2, "{:?}", r.issues);
+        assert_eq!(names[0].line_id, 1);
+        assert_eq!(names[0].term.as_deref(), Some("叶长生"));
+        assert_eq!(names[0].expected.as_deref(), Some("Ye Changsheng"));
+        assert_eq!(
+            names[0].description,
+            "\"叶长生\" should be \"Ye Changsheng\" here, per your glossary."
+        );
+        assert_eq!(names[0].translation, "Where are you going, Ye Changshen.");
+        assert_eq!((names[1].line_id, names[1].term.as_deref()), (2, Some("凌天门")));
+        // Line 3 uses the name: no issue. The drift starts on line 1, which a
+        // name issue already explains: no extra meaning issue.
+        assert!(r.issues.iter().all(|i| i.line_id != 3));
+        assert!(r.issues.iter().all(|i| i.issue_type != "drift"));
+        assert!(r.issues.iter().all(|i| !i.description.to_lowercase().contains("drift")));
+        // Retranslation still follows every drift flag.
+        assert!(r.failed_line_ids.contains(&1) && r.failed_line_ids.contains(&2));
     }
 
     #[tokio::test(start_paused = true)]
@@ -301,6 +406,16 @@ mod tests {
         assert_eq!(r.failed_line_ids, [3].into());
         assert_eq!(r.issues.len(), 1);
         assert_eq!(r.issues[0].line_id, 3);
+        assert_eq!(r.issues[0].issue_type, "meaning");
+        assert_eq!(r.issues[0].description, format!("{MEANING_DESCRIPTION} (unrelated)"));
+    }
+
+    #[test]
+    fn meaning_issues_never_say_drift() {
+        let i = meaning_issue(1, "s", "t", Some("Line drift: unrelated topics"));
+        assert_eq!(i.description, MEANING_DESCRIPTION);
+        let i = meaning_issue(1, "s", "t", Some("  "));
+        assert_eq!(i.description, MEANING_DESCRIPTION);
     }
 
     #[tokio::test(start_paused = true)]
@@ -360,5 +475,47 @@ mod tests {
         cancel.cancel();
         let err = verify_file(&svc, &pairs(12), &BTreeMap::new(), tpl()).await.unwrap_err();
         assert!(err.is_cancelled());
+    }
+
+    #[test]
+    fn every_line_missing_a_name_gets_a_name_issue_whatever_the_score() {
+        let mut terms = BTreeMap::new();
+        terms.insert("元清".to_string(), "Yuan Qing".to_string());
+        let mut p = BTreeMap::new();
+        for i in 1..=80u32 {
+            p.insert(i, (format!("第{i}句。"), format!("Line {i}.")));
+        }
+        p.insert(74, ("元清，我不信。".to_string(), "Follow them.".to_string()));
+        p.insert(75, ("元清来了。".to_string(), "yuan qing is here.".to_string()));
+        let pairs: Vec<LinePair> =
+            p.iter().map(|(id, (s, t))| LinePair { id: *id, src: s.clone(), tgt: t.clone() }).collect();
+        assert!(!drift::detect(&pairs, &terms).has_suspected_drift, "the score alone wouldn't show it");
+
+        let issues = name_issues(&p, &terms);
+        assert_eq!(issues.len(), 1, "case doesn't matter: {issues:?}");
+        assert_eq!((issues[0].line_id, issues[0].term.as_deref()), (74, Some("元清")));
+        assert_eq!(issues[0].expected.as_deref(), Some("Yuan Qing"));
+        assert_eq!(issues[0].description, "\"元清\" should be \"Yuan Qing\" here, per your glossary.");
+    }
+
+    #[test]
+    fn issues_go_in_by_line_with_the_summary_last() {
+        let issue = |line_id: u32, issue_type: &str| VerifyIssue {
+            line_id,
+            source: String::new(),
+            translation: String::new(),
+            issue_type: issue_type.into(),
+            description: String::new(),
+            severity: "high".into(),
+            term: None,
+            expected: None,
+        };
+        let mut issues = vec![issue(2, "meaning"), issue(5, "untranslated"), issue(0, "untranslated")];
+        insert_by_line(&mut issues, vec![issue(1, "name"), issue(2, "name"), issue(9, "name")]);
+        let order: Vec<(u32, &str)> = issues.iter().map(|i| (i.line_id, i.issue_type.as_str())).collect();
+        assert_eq!(
+            order,
+            [(1, "name"), (2, "meaning"), (2, "name"), (5, "untranslated"), (9, "name"), (0, "untranslated")]
+        );
     }
 }

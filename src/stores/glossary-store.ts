@@ -17,7 +17,8 @@ const now = () => new Date().toLocaleTimeString("en-GB", { hour12: false })
 
 const MAX_LOG_LINES = 500
 
-export type GlossaryOp = "build" | "normalize" | "import"
+/** `normalize` is Tidy up; `lookup` is Look up names online on the glossary as it is. */
+export type GlossaryOp = "build" | "normalize" | "lookup" | "import"
 
 export interface GlossaryLogLine {
   at: string
@@ -64,10 +65,26 @@ interface GlossaryRunStore {
   closeReview: () => void
   openUpdate: (folder: string) => void
   closeUpdate: () => void
+  /** Cross-page request: open "Add new episodes" with these files ticked. Set by
+   *  the Episodes page, consumed (and cleared) by the Glossary page. */
+  pendingAddEpisodes: { folder: string; files: string[] } | null
+  requestAddEpisodes: (folder: string, files: string[]) => void
+  clearAddEpisodes: () => void
+  /** Cross-page request: show this term in the glossary (search + highlight). Set
+   *  from "Fix in glossary" in an episode window, consumed by the Glossary page. */
+  pendingFocusTerm: { folder: string; source: string } | null
+  requestFocusTerm: (folder: string, source: string) => void
+  clearFocusTerm: () => void
   reset: () => void
 }
 
 export const useGlossaryRun = create<GlossaryRunStore>((set) => ({
+  pendingAddEpisodes: null,
+  requestAddEpisodes: (folder, files) => set({ pendingAddEpisodes: { folder, files } }),
+  clearAddEpisodes: () => set({ pendingAddEpisodes: null }),
+  pendingFocusTerm: null,
+  requestFocusTerm: (folder, source) => set({ pendingFocusTerm: { folder, source } }),
+  clearFocusTerm: () => set({ pendingFocusTerm: null }),
   busy: null,
   folder: null,
   phase: null,

@@ -10,4 +10,9 @@ export type ProjectView = { folder: string, files: Array<SourceFile>, total_dial
 /**
  * Number of glossary terms in `glossary.json`, or `None` if no glossary exists.
  */
-glossary_terms: number | null, };
+glossary_terms: number | null, 
+/**
+ * No preferences were saved for this folder yet: the detected settings
+ * are worth a look, so the Episodes page opens them.
+ */
+first_visit: boolean, };

@@ -5,9 +5,9 @@ export function ImportProgress() {
   const opDetail = useGlossaryRun((s) => s.opDetail);
   return (
     <RunScreen
-      title="Importing reference terms"
-      description={`Lifting established terminology from ${opDetail ?? "your translated files"}.`}
-      cancelNote="Partial results are kept — cancelling never throws away terms."
+      title="Importing from translated episodes"
+      description={`Reading the names and terms in ${opDetail ?? "your translated files"}.`}
+      cancelNote="Stopping keeps the terms found so far."
     />
   );
 }

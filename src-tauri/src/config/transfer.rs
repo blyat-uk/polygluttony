@@ -41,6 +41,13 @@ const MAX_ENTRIES: usize = 256;
 const STAGING_SUFFIX: &str = ".import";
 const OLD_SUFFIX: &str = ".old";
 
+/// An import saves the setup it replaces in the app-data dir as
+/// `setup-backup-<epoch ms>.zip`, laid out like an export, so importing it
+/// is the undo. The newest [`BACKUPS_KEPT`] are kept.
+const BACKUP_PREFIX: &str = "setup-backup-";
+const BACKUP_SUFFIX: &str = ".zip";
+pub const BACKUPS_KEPT: usize = 3;
+
 const NOT_AN_EXPORT: &str = "This isn't a Polygluttony export.";
 const NEWER_EXPORT: &str =
     "This export was made by a newer Polygluttony. Update Polygluttony, then import it again.";
@@ -58,6 +65,9 @@ pub struct SetupSummary {
     pub skipped: Vec<String>,
     /// This install already has models or edited prompts, which the import replaces.
     pub replaces_existing: bool,
+    /// After an import that replaced a setup: the export of the replaced setup,
+    /// saved first. Importing it undoes the import. `None` before an import.
+    pub backup: Option<String>,
 }
 
 /// An export file, read and checked: ready to apply.
@@ -264,9 +274,14 @@ pub fn summary(imported: &Imported, current: &AppConfig, overrides_dir: &Path) -
         models: imported.config.models.iter().map(Model::label).collect(),
         edited_prompts: imported.prompts.len() as u32,
         skipped: imported.skipped.clone(),
-        replaces_existing: !current.models.is_empty()
-            || prompts::list_meta(overrides_dir).iter().any(|m| m.modified),
+        replaces_existing: has_setup(current, overrides_dir),
+        backup: None,
     }
+}
+
+/// This install has something an import would replace: models or edited prompts.
+fn has_setup(current: &AppConfig, overrides_dir: &Path) -> bool {
+    !current.models.is_empty() || prompts::list_meta(overrides_dir).iter().any(|m| m.modified)
 }
 
 // ---- import: applying -----------------------------------------------------------
@@ -353,6 +368,117 @@ pub fn apply(
              again to finish."
         ))
     })
+}
+
+// ---- import: the backup of the setup it replaces --------------------------------
+
+/// The epoch ms of a backup's file name, when `name` is one.
+fn backup_stamp(name: &str) -> Option<i64> {
+    name.strip_prefix(BACKUP_PREFIX)?.strip_suffix(BACKUP_SUFFIX)?.parse().ok()
+}
+
+/// The backups in `dir`, newest first.
+fn backups_in(dir: &Path) -> Vec<(i64, PathBuf)> {
+    let mut found: Vec<(i64, PathBuf)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some((backup_stamp(e.file_name().to_str()?)?, e.path())))
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found
+}
+
+/// Save this install's setup as it is on disk into a new
+/// `setup-backup-<at_ms>.zip` in `dir`: `config_file` byte for byte (the
+/// stored config, or `current` written out when there's no file yet) and
+/// every edited prompt's file, unchecked, so a prompt that wouldn't pass
+/// an import can't block the import that replaces it. Then only the newest
+/// [`BACKUPS_KEPT`] backups stay. Returns the new backup's path.
+pub fn backup_setup(
+    dir: &Path,
+    config_file: &Path,
+    current: &AppConfig,
+    overrides_dir: &Path,
+    at_ms: i64,
+) -> AppResult<PathBuf> {
+    let config = match fs::read(config_file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => config_document(current)?,
+        Err(e) => return Err(e.into()),
+    };
+    let mut prompt_files = Vec::new();
+    for e in prompts::entries() {
+        match fs::read(overrides_dir.join(e.file)) {
+            Ok(bytes) => prompt_files.push((prompt_entry_name(e), bytes)),
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    fs::create_dir_all(dir)?;
+    let mut stamp = at_ms.max(0);
+    let mut path = dir.join(format!("{BACKUP_PREFIX}{stamp}{BACKUP_SUFFIX}"));
+    while path.exists() {
+        stamp += 1;
+        path = dir.join(format!("{BACKUP_PREFIX}{stamp}{BACKUP_SUFFIX}"));
+    }
+    let tmp = with_suffix(&path, ".tmp");
+    let written = (|| -> AppResult<()> {
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let mut zip = ZipWriter::new(BufWriter::new(fs::File::create(&tmp)?));
+        zip.start_file(CONFIG_ENTRY, options).map_err(write_failed)?;
+        zip.write_all(&config)?;
+        for (name, bytes) in &prompt_files {
+            zip.start_file(name.as_str(), options).map_err(write_failed)?;
+            zip.write_all(bytes)?;
+        }
+        zip.finish().map_err(write_failed)?.flush()?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    for (_, old) in backups_in(dir).into_iter().skip(BACKUPS_KEPT) {
+        if let Err(e) = fs::remove_file(&old) {
+            tracing::warn!("couldn't remove the old setup backup {} ({e})", old.display());
+        }
+    }
+    Ok(path)
+}
+
+/// `apply`, after first saving the setup it replaces (when there is one) to
+/// a new backup in `backup_dir` (see [`backup_setup`]), so the import can be
+/// undone by importing the backup. Returns the backup's path when one was
+/// made. A backup that can't be written stops the import before anything
+/// changes.
+pub fn replace_with_backup(
+    imported: &Imported,
+    current: &AppConfig,
+    overrides_dir: &Path,
+    config_file: &Path,
+    backup_dir: &Path,
+    save: impl FnOnce(&AppConfig) -> AppResult<()>,
+) -> AppResult<Option<PathBuf>> {
+    let made = if has_setup(current, overrides_dir) {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let path = backup_setup(backup_dir, config_file, current, overrides_dir, at_ms).map_err(|e| {
+            AppError::Other(format!(
+                "Couldn't save a backup of your current setup first ({e}), so nothing was replaced."
+            ))
+        })?;
+        Some(path)
+    } else {
+        None
+    };
+    apply(imported, current, overrides_dir, save)?;
+    Ok(made)
 }
 
 #[cfg(test)]
@@ -495,7 +621,7 @@ mod tests {
         let err = export_to(&path, &configured(), &dir).unwrap_err().to_string();
         assert_eq!(
             err,
-            "Your edited \"Drift check\" prompt can't be exported: prompt is empty. Fix it on the \
+            "Your edited \"Verify\" prompt can't be exported: prompt is empty. Fix it on the \
              Prompts page, then export again."
         );
         assert_eq!(names_in(root.path()), ["prompts"], "no export, no temp file");
@@ -604,7 +730,7 @@ mod tests {
         assert_eq!(error(read(zip_of(&[("config.json", &over)]))), NOT_AN_EXPORT);
         assert_eq!(
             error(read(zip_of(&[("config.json", &ok), ("prompts/verify.txt", &over)]))),
-            "The edited \"Drift check\" prompt in this export can't be used: it's larger than 1 MB."
+            "The edited \"Verify\" prompt in this export can't be used: it's larger than 1 MB."
         );
         let imported = read(zip_of(&[("config.json", &ok), ("prompts/verify.txt", &max)])).unwrap();
         assert_eq!(imported.prompts[0].1.len(), max.len(), "exactly 1 MB is fine");
@@ -629,7 +755,7 @@ mod tests {
         let ok = config_document(&default_config()).unwrap();
         assert_eq!(
             error(read(zip_of(&[("config.json", &ok), ("prompts/verify.txt", &[0xff, 0xfe, 0xfd])]))),
-            "The edited \"Drift check\" prompt in this export can't be used: it isn't UTF-8 text."
+            "The edited \"Verify\" prompt in this export can't be used: it isn't UTF-8 text."
         );
     }
 
@@ -653,7 +779,7 @@ mod tests {
         };
         assert_eq!(
             error(read(damaged(b"check the lines"))),
-            "The edited \"Drift check\" prompt in this export can't be used: it can't be read."
+            "The edited \"Verify\" prompt in this export can't be used: it can't be read."
         );
         assert_eq!(error(read(damaged(b"zh\""))), NOT_AN_EXPORT, "the config, damaged");
     }
@@ -751,6 +877,132 @@ mod tests {
         assert_eq!(names_in(root.path()), ["prompts"]);
     }
 
+    // ---- backup before replacing ----
+
+    /// The stored config as the store plugin writes it, with a work folder.
+    fn write_config_file(root: &Path, cfg: &AppConfig) -> PathBuf {
+        let path = root.join("config.json");
+        let doc = json!({ CONFIG_KEY: serde_json::to_value(cfg).unwrap() });
+        fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn replacing_a_setup_saves_the_current_one_first_and_the_backup_brings_it_back() {
+        let (root, dir) = app_data(&[(Verify, "my check")]);
+        let current = AppConfig { default_workdir: Some("/here/subs".into()), ..configured() };
+        let config_file = write_config_file(root.path(), &current);
+        let incoming = Imported { config: default_config(), prompts: owned(&[(ToneFunny, "funnier")]), skipped: Vec::new() };
+        let mut saved = Vec::new();
+
+        let made = replace_with_backup(&incoming, &current, &dir, &config_file, root.path(), |cfg| {
+            saved.push(cfg.clone());
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        let name = made.file_name().unwrap().to_str().unwrap();
+        assert!(backup_stamp(name).is_some(), "{name}");
+        assert_eq!(made.parent(), Some(root.path()));
+        assert_eq!(prompts::resolve(ToneFunny, &dir).unwrap(), "funnier", "the import went through");
+
+        // The backup is what was here: the stored config and the edited prompts.
+        let restored = read_file(&made).unwrap();
+        assert_eq!(restored.config, AppConfig { default_workdir: None, ..configured() }, "without the work folder");
+        assert_eq!(restored.prompts, owned(&[(Verify, "my check")]));
+
+        // Undo: importing the backup puts it all back (and backs up the import in turn).
+        let now = saved.last().unwrap().clone();
+        let config_file = write_config_file(root.path(), &now);
+        let undo_backup = replace_with_backup(&restored, &now, &dir, &config_file, root.path(), |cfg| {
+            saved.push(cfg.clone());
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_ne!(undo_backup, made, "a new backup, the first one kept");
+        assert!(made.exists());
+        assert_eq!(saved.last().unwrap(), &current, "same models, steps, keys and work folder");
+        assert_eq!(prompts::resolve(Verify, &dir).unwrap(), "my check");
+        assert_eq!(prompts::resolve(ToneFunny, &dir).unwrap(), prompts::default_text(ToneFunny));
+        assert_eq!(read_file(&undo_backup).unwrap().prompts, owned(&[(ToneFunny, "funnier")]));
+    }
+
+    #[test]
+    fn an_edited_prompt_that_wouldnt_export_doesnt_block_an_import() {
+        let (root, dir) = app_data(&[(Verify, "  \n"), (ToneXianxia, "my xianxia")]);
+        let config_file = write_config_file(root.path(), &configured());
+        let incoming = Imported { config: default_config(), prompts: Vec::new(), skipped: Vec::new() };
+        let made = replace_with_backup(&incoming, &configured(), &dir, &config_file, root.path(), |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        // The backup holds the files as they were, the broken one included.
+        let mut zip = ZipArchive::new(fs::File::open(&made).unwrap()).unwrap();
+        let mut names: Vec<String> = zip.file_names().map(|n| n.unwrap().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["config.json", "prompts/tones/xianxia.txt", "prompts/verify.txt"]);
+        let mut verify = String::new();
+        zip.by_name("prompts/verify.txt").unwrap().read_to_string(&mut verify).unwrap();
+        assert_eq!(verify, "  \n");
+        let mut config = Vec::new();
+        zip.by_name("config.json").unwrap().read_to_end(&mut config).unwrap();
+        assert_eq!(config, fs::read(&config_file).unwrap(), "config.json byte for byte");
+    }
+
+    #[test]
+    fn only_the_newest_backups_are_kept() {
+        let (root, dir) = app_data(&[(Verify, "my check")]);
+        let backups = root.path().join("backups");
+        let config_file = root.path().join("no-config-yet.json");
+        let made: Vec<PathBuf> = (1..=5)
+            .map(|at| backup_setup(&backups, &config_file, &configured(), &dir, at * 1000).unwrap())
+            .collect();
+        let mut left = names_in(&backups);
+        left.sort();
+        assert_eq!(left, ["setup-backup-3000.zip", "setup-backup-4000.zip", "setup-backup-5000.zip"]);
+        // The config came from the loaded one when there was no file.
+        assert_eq!(read_file(&made[4]).unwrap().config.models.len(), 2);
+        // Two in the same millisecond don't overwrite each other.
+        let again = backup_setup(&backups, &config_file, &configured(), &dir, 5000).unwrap();
+        assert_eq!(again.file_name().unwrap(), "setup-backup-5001.zip");
+        // Other files are left alone.
+        fs::write(backups.join("setup-backup.zip"), "an old single backup").unwrap();
+        backup_setup(&backups, &config_file, &configured(), &dir, 9000).unwrap();
+        assert!(backups.join("setup-backup.zip").exists());
+        assert_eq!(backups_in(&backups).len(), BACKUPS_KEPT);
+    }
+
+    #[test]
+    fn nothing_to_replace_means_no_backup() {
+        let (root, dir) = app_data(&[]);
+        let incoming = read(export(&configured(), &dir)).unwrap();
+        let config_file = root.path().join("config.json");
+        let made = replace_with_backup(&incoming, &default_config(), &dir, &config_file, root.path(), |_| Ok(()))
+            .unwrap();
+        assert_eq!(made, None);
+        assert_eq!(names_in(root.path()), ["prompts"]);
+    }
+
+    #[test]
+    fn a_backup_that_cant_be_written_stops_the_import() {
+        let (root, dir) = app_data(&[(Verify, "my check")]);
+        let not_a_dir = root.path().join("not-a-dir");
+        fs::write(&not_a_dir, "a file").unwrap();
+        let config_file = root.path().join("config.json");
+        let incoming = Imported { config: default_config(), prompts: Vec::new(), skipped: Vec::new() };
+        let mut saved = false;
+        let err = replace_with_backup(&incoming, &configured(), &dir, &config_file, &not_a_dir, |_| {
+            saved = true;
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("Couldn't save a backup of your current setup"), "{err}");
+        assert!(err.ends_with("so nothing was replaced."), "{err}");
+        assert!(!saved, "the config wasn't touched");
+        assert_eq!(prompts::resolve(Verify, &dir).unwrap(), "my check");
+    }
+
     // ---- summary ----
 
     #[test]
@@ -768,6 +1020,7 @@ mod tests {
                 edited_prompts: 1,
                 skipped: vec!["notes.txt".into()],
                 replaces_existing: false,
+                backup: None,
             }
         );
         assert!(summary(&imported, &configured(), &empty).replaces_existing, "models here");

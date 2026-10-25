@@ -18,6 +18,13 @@ import type { RecentFolder } from "@/types/generated/RecentFolder";
 import type { Tone } from "@/types/generated/Tone";
 import type { GlossaryBackupInfo } from "@/types/generated/GlossaryBackupInfo";
 import type { GlossaryDoc } from "@/types/generated/GlossaryDoc";
+import type { GlossaryLoad } from "@/types/generated/GlossaryLoad";
+import type { GlossaryMeta } from "@/types/generated/GlossaryMeta";
+import type { GlossaryScope } from "@/types/generated/GlossaryScope";
+import type { GlossarySnapshot } from "@/types/generated/GlossarySnapshot";
+import type { GlossaryChangeKind } from "@/types/generated/GlossaryChangeKind";
+import type { FolderResults } from "@/types/generated/FolderResults";
+import type { TermLines } from "@/types/generated/TermLines";
 import type { NormalizeReview } from "@/types/generated/NormalizeReview";
 import type { ReferenceStatus } from "@/types/generated/ReferenceStatus";
 import type { ReferenceSummary } from "@/types/generated/ReferenceSummary";
@@ -60,8 +67,8 @@ export const ipc = {
     invoke<ConnectionsConfig>("set_shared_steps", { settings }),
   /** Switch the page to the per-step view; nothing else changes. */
   showEveryStep: () => invoke<ConnectionsConfig>("show_every_step"),
-  /** Back to one model: every step takes `modelId` and its settings, and models no step
-   *  uses any more leave the library. */
+  /** Back to one model: every step takes `modelId` and its settings. Only the steps move;
+   *  every library model and saved key stays. */
   useOneModel: (modelId: string) => invoke<ConnectionsConfig>("use_one_model", { modelId }),
   /** O5 — send one tiny test request. Custom endpoints get their API format detected.
    *  `webSearch` also exercises the provider's web-search tool. */
@@ -92,18 +99,62 @@ export const ipc = {
     tone: Tone
     sourceLang: string
     targetLang: string
+    /** Carry on from stored partial translations of stopped files. */
+    resume?: boolean
   }) => invoke<void>("start_translation", args),
   /** O17 — cancel the active run. */
   cancelTranslation: () => invoke<void>("cancel_translation"),
-  /** One episode of the current or last run, from the run's live board. */
-  episodeSnapshot: (file: string) => invoke<EpisodeView>("episode_snapshot", { file }),
-  /** Open the episode's live window, or focus it when it's already open. */
-  openEpisodeWindow: (file: string) => invoke<void>("open_episode_window", { file }),
-  /** O9 — load glossary.json (null when none exists). */
-  loadGlossary: (folder: string) => invoke<GlossaryDoc | null>("load_glossary", { folder }),
-  /** O14 — persist the whole glossary doc (atomic write). */
-  saveGlossary: (folder: string, doc: GlossaryDoc) =>
-    invoke<void>("save_glossary", { folder, doc }),
+  /** One episode of the current or last run, from the run's live board. With
+   *  `folder`, an episode outside the run comes back `stored` (from stored results). */
+  episodeSnapshot: (file: string, folder?: string) =>
+    invoke<EpisodeView>("episode_snapshot", { file, folder: folder ?? null }),
+  /** Open the episode's window, or focus it when it's already open. `folder` opens a
+   *  stored episode outside a run; `line` scrolls to and selects that line. */
+  openEpisodeWindow: (file: string, opts?: { folder?: string; line?: number }) =>
+    invoke<void>("open_episode_window", {
+      file,
+      folder: opts?.folder ?? null,
+      line: opts?.line ?? null,
+    }),
+  // ── Stored results and review ─────────────────────────────────────────────
+  /** Every stored episode result for a folder (outcome, open issues, output name). */
+  getFolderResults: (folder: string) => invoke<FolderResults>("get_folder_results", { folder }),
+  /** Retranslate just these lines of a finished episode; events on translation://event. */
+  retranslateLines: (folder: string, file: string, lineIds: number[]) =>
+    invoke<void>("retranslate_lines", { folder, file, lineIds }),
+  /** Save the user's own translation of one line into the output file. */
+  saveLine: (folder: string, file: string, lineId: number, text: string) =>
+    invoke<void>("save_line", { folder, file, lineId, text }),
+  /** "Looks fine" — drop one issue from the stored results. `term` picks the name
+   *  issue about that name; without it, every issue of that type on the line goes. */
+  dismissIssue: (
+    folder: string,
+    file: string,
+    lineId: number,
+    issueType: string,
+    term?: string | null,
+  ) => invoke<void>("dismiss_issue", { folder, file, lineId, issueType, term: term ?? null }),
+  /** Rename the .warning output to the clean name; the episode is done. */
+  markEpisodeDone: (folder: string, file: string) =>
+    invoke<void>("mark_episode_done", { folder, file }),
+  /** Lines of finished episodes whose source contains a glossary term. */
+  findTermLines: (folder: string, source: string) =>
+    invoke<TermLines[]>("find_term_lines", { folder, source }),
+  /** Retranslate every finished line that uses a glossary term; returns the line count. */
+  retranslateTerm: (folder: string, source: string) =>
+    invoke<number>("retranslate_term", { folder, source }),
+  /** O9 — load glossary.json with its metadata: missing / unreadable / ok. */
+  loadGlossary: (folder: string) => invoke<GlossaryLoad>("load_glossary", { folder }),
+  /** O14 — persist the whole glossary doc (atomic write). `meta` omitted = leave the
+   *  sidecar as it is. `snapshot` = save the current version to the history first,
+   *  labelled with the change about to happen. */
+  saveGlossary: (
+    folder: string,
+    doc: GlossaryDoc,
+    meta?: GlossaryMeta,
+    snapshot?: GlossaryChangeKind,
+  ) =>
+    invoke<void>("save_glossary", { folder, doc, meta: meta ?? null, snapshot: snapshot ?? null }),
   /** O10 — start a glossary build run (events on glossary://event). */
   startGlossaryBuild: (args: {
     folder: string
@@ -118,9 +169,19 @@ export const ipc = {
   }) => invoke<void>("start_glossary_build", args),
   /** Cancel the active glossary op (build / normalize / import). */
   cancelGlossaryBuild: () => invoke<void>("cancel_glossary_build"),
-  /** O12 — run normalization; returns a review, NOT saved. */
-  normalizeGlossary: (folder: string) =>
-    invoke<NormalizeReview>("normalize_glossary", { folder }),
+  /** O12 — Tidy up; returns a review, NOT saved. No scope = all terms. */
+  normalizeGlossary: (folder: string, scope?: GlossaryScope) =>
+    invoke<NormalizeReview>("normalize_glossary", { folder, scope: scope ?? null }),
+  /** Look up names online on the glossary as it is (no subtitle files read);
+   *  returns a review, NOT saved. No scope = all terms. */
+  lookupGlossaryNames: (folder: string, showName: string, scope?: GlossaryScope) =>
+    invoke<NormalizeReview>("lookup_glossary_names", { folder, showName, scope: scope ?? null }),
+  /** The glossary's version history, newest first. */
+  listGlossarySnapshots: (folder: string) =>
+    invoke<GlossarySnapshot[]>("list_glossary_snapshots", { folder }),
+  /** Restore a snapshot (the current version is snapshotted first). */
+  restoreGlossarySnapshot: (folder: string, id: string) =>
+    invoke<void>("restore_glossary_snapshot", { folder, id }),
   /** O11 — extract reference terms from picked .ass files (cached for builds). */
   importReferenceFiles: (folder: string, paths: string[]) =>
     invoke<ReferenceSummary>("import_reference_files", { folder, paths }),
@@ -171,6 +232,35 @@ export const ipc = {
 
 /** Tells episode windows to refetch; payload `EpisodeChanged` (`file: null` = all). */
 export const EPISODE_CHANGED_EVENT = "episode://changed";
+
+/** Sent by an episode window's "Fix in glossary"; the main window shows the Glossary
+ *  page with that term. Payload `GlossaryFocusTerm`. */
+export const GLOSSARY_FOCUS_TERM_EVENT = "glossary://focus-term";
+export interface GlossaryFocusTerm {
+  folder: string;
+  source: string;
+}
+
+/** Sent by an episode window after it saved the glossary ("Add to glossary"); the
+ *  main window reloads that folder's glossary. Payload `GlossaryChanged`. */
+export const GLOSSARY_CHANGED_EVENT = "glossary://changed";
+export interface GlossaryChanged {
+  folder: string;
+}
+
+/** Stored results changed (a run finished an episode, or a review edit landed);
+ *  payload `ResultsChanged`. */
+export const RESULTS_CHANGED_EVENT = "results://changed";
+
+/** Sent to an open episode window to scroll to and select a line. Payload
+ *  `EpisodeGoToLine`. */
+export const EPISODE_GO_TO_LINE_EVENT = "episode://go-to-line";
+export interface EpisodeGoToLine {
+  /** The folder the window was opened with; null = the run's. */
+  folder: string | null;
+  file: string;
+  line: number;
+}
 
 /** Subscribe to a backend-emitted event (progress, logs, …). Returns an unlisten fn. */
 export function onBackendEvent<T>(

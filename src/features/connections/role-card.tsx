@@ -64,12 +64,13 @@ export function CardEyebrow({
   );
 }
 
-export type StatusTone = "jade" | "amber" | "aqua" | "muted";
+export type StatusTone = "jade" | "amber" | "aqua" | "coral" | "muted";
 
 const TONE: Record<StatusTone, string> = {
   jade: "text-[color:var(--color-jade)]",
   amber: "text-[color:var(--color-amber)]",
   aqua: "text-[color:var(--color-aqua)]",
+  coral: "text-[color:var(--color-coral)]",
   muted: "text-muted-foreground",
 };
 
@@ -123,7 +124,7 @@ export function OptionRow({
 }) {
   return (
     <div className="flex min-h-10 flex-wrap items-center gap-x-3.5 gap-y-1 py-1">
-      <span id={labelId} className="w-[92px] shrink-0 text-[12px] font-medium">
+      <span id={labelId} className="w-[104px] shrink-0 text-[12px] leading-4 font-medium">
         {label}
       </span>
       {children}

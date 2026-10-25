@@ -4,4 +4,4 @@
  * Which field a failed connection test points at, so the UI can show the
  * error under it.
  */
-export type TestProblem = "key" | "model" | "address" | "other";
+export type TestProblem = "key" | "model" | "address" | "billing" | "rate_limit" | "server" | "other";
