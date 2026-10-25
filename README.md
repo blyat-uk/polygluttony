@@ -17,15 +17,15 @@
 
 ---
 
-Polygluttony translates `.ass` subtitle files with the AI model you connect, while guarding against the ways machine translation usually goes wrong. Open a folder, connect a model, optionally build a glossary, and translate, watching every batch land as it happens.
+Polygluttony translates `.ass` subtitle files with the AI model you connect, while guarding against the ways machine translation usually goes wrong. Connect a model, open a folder and press one button: Polygluttony builds a glossary of names and terms, then translates, and you can watch every batch land as it happens.
 
 ## Why it's different
 
 - **Line markers & partial-failure recovery** — every line is tracked, so when a model drops, merges, or reorders lines, Polygluttony detects exactly where it broke and salvages the correct prefix instead of failing the whole batch.
 - **Drift detection** — after each episode, a five-signal weighted check and an AI spot-check catch translations wandering off the source, and only the lines that drifted are retranslated.
 - **Your typesetting stays put** — override tags like `{\pos}` and `{\an8}` are lifted out before translating and put back after, and styles, timings and script info are copied from your file. Only the dialogue is translated.
-- **Cross-episode glossary** — for Chinese sources, a six-category glossary, with auto-detected world type (xianxia / wuxia / historical / modern), keeps names and terms consistent across a whole season.
-- **Verification, not a score** — every file checks its own work and surfaces an actionable issue list, never a number.
+- **Cross-episode glossary** — for Chinese sources, a six-category glossary, with auto-detected world type (xianxia / wuxia / historical / modern), keeps names and terms consistent across a whole season. It's built as part of translating and grows with each new episode; edit it in place, with undo and earlier versions to go back to.
+- **Verification, not a score** — every file checks its own work and lists the lines that need a look, never a number. Fix them in the episode's own window: retranslate a line, edit it, or correct the name in the glossary.
 - **Your choice of model** — Anthropic, OpenAI, Google, a local model through Ollama or LM Studio, or any OpenAI- or Anthropic-compatible endpoint. One model for everything, or a different one per step.
 
 ## Download
