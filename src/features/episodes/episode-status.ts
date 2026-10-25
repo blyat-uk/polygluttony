@@ -178,6 +178,15 @@ const failed = (reason: string | null): EpisodeStatus => ({
   issues: [],
 });
 
+/** An episode in a run that's on its glossary step: its names are read, being
+ *  read, or it waits its turn (and then for the translation). */
+export function glossaryStepStatus(state: "read" | "reading" | "waiting"): EpisodeStatus {
+  const base = { kind: "live" as const, detail: null, detailTone: "muted" as const, issues: [] };
+  if (state === "read") return { ...base, label: "Names read", color: COLOR.done, live: false };
+  if (state === "reading") return { ...base, label: "Reading names…", color: COLOR.new, live: true };
+  return { ...base, label: "Waiting", color: COLOR.idle, live: false };
+}
+
 /** "200/612 · batch 1 of 3", plus "↺ 1 · a reply came back incomplete" after a retry. */
 export function progressText(row: FileRow): string | null {
   if (row.total === 0) return null;

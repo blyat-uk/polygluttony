@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { Books, UploadSimple } from "@phosphor-icons/react";
@@ -39,16 +39,6 @@ export function CreateView({ view }: { view: ProjectView }) {
   const [tidy, setTidy] = useState(true);
   const [lookup, setLookup] = useState(false);
   const [showName, setShowName] = useState(() => folderTitle(view.folder));
-
-  // "Add new episodes" asked for from the Episodes page before any glossary
-  // exists: build from those episodes.
-  const pendingAdd = useGlossaryRun((s) => s.pendingAddEpisodes);
-  useEffect(() => {
-    if (!pendingAdd || pendingAdd.folder !== view.folder) return;
-    const wanted = new Set(pendingAdd.files);
-    setSelected(view.files.filter((f) => wanted.has(f.name)).map((f) => f.name));
-    useGlossaryRun.getState().clearAddEpisodes();
-  }, [pendingAdd, view.folder, view.files]);
 
   const { data: refStatus } = useQuery({
     queryKey: referenceStatusKey(view.folder),

@@ -11,4 +11,9 @@ export type FolderPrefs = { source_lang: string, target_lang: string, world_over
  * during a session, but never restored: every open ticks the episodes
  * that have no translation yet; see `open_folder`.
  */
-selected_files: Array<string>, };
+selected_files: Array<string>, 
+/**
+ * Build or update the glossary before translating: the tick next to the
+ * Episodes page's Translate button. On until unticked for this folder.
+ */
+glossary_first: boolean, };

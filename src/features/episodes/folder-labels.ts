@@ -2,7 +2,6 @@ import type { Language } from "@/types/generated/Language";
 import type { ProjectView } from "@/types/generated/ProjectView";
 import type { Tone } from "@/types/generated/Tone";
 import type { WorldType } from "@/types/generated/WorldType";
-import { plural } from "@/lib/utils";
 
 /** Tones in product order (not alphabetical). */
 export const TONES: Tone[] = ["standard", "xianxia", "wuxia", "comedic", "funny"];
@@ -27,12 +26,7 @@ export const languageName = (languages: Language[] | undefined, code: string) =>
 /** "Chinese → English · World type: Xianxia · Tone: Xianxia · Glossary 232 terms".
  *  World only shows when the source language detects one; the glossary part
  *  only when the source language supports a glossary. */
-export function settingsSummary(
-  view: ProjectView,
-  languages: Language[] | undefined,
-  /** glossary.json is there but can't be read: the caller says so itself. */
-  glossaryBroken = false,
-): string {
+export function settingsSummary(view: ProjectView, languages: Language[] | undefined): string {
   const { prefs } = view;
   const source = languages?.find((l) => l.code === prefs.source_lang);
   const parts = [
@@ -42,11 +36,6 @@ export function settingsSummary(
     parts.push(`World type: ${titleCase(prefs.world_override ?? view.detected_world)}`);
   }
   parts.push(`Tone: ${titleCase(prefs.tone)}`);
-  if (view.supports_glossary && !glossaryBroken) {
-    parts.push(
-      view.glossary_terms == null ? "No glossary yet" : `Glossary ${plural(view.glossary_terms, "term")}`,
-    );
-  }
   return parts.join(" · ");
 }
 

@@ -12,9 +12,9 @@ export function useFolderResults(folder: string) {
   });
 }
 
-/** The glossary with its metadata, for "Add N episodes to the glossary"
- *  (which ticked files it hasn't scanned). Its own key: the Glossary page keeps
- *  its own query. Refetched whenever Episodes mounts. */
+/** The glossary with its metadata, for the glossary row and the tick (which
+ *  ticked files it hasn't read). Its own key: the Glossary page keeps its own
+ *  query. Refetched whenever Episodes mounts and whenever the glossary changes. */
 export const glossaryLoadKey = (folder: string) => ["episodes", "glossary-load", folder] as const;
 
 export function useGlossaryLoad(folder: string, enabled: boolean) {

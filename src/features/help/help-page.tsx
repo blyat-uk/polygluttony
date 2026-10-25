@@ -67,14 +67,14 @@ const STEPS: {
     id: "glossary",
     title: "Build glossary",
     optional: true,
-    body: "A glossary keeps names and terms the same in every episode. Skip it and translate right away if you like.",
+    body: "A glossary keeps names and terms the same in every episode. Translate builds one first, and adds new episodes to it later, while “Build a glossary first” is ticked. You can also build it on its own on the Glossary page.",
     to: "/glossary",
     link: "Open Glossary",
   },
   {
     id: "translate",
     title: "Translate",
-    body: "Tick the episodes and press Translate. Polygluttony checks its own work as it goes and marks anything that needs a look.",
+    body: "Tick the episodes and press the gold button. Polygluttony reads them for the glossary first when that’s ticked, then translates, checks its own work as it goes and marks anything that needs a look.",
     to: "/episodes",
     link: "Open Episodes",
   },
@@ -228,8 +228,9 @@ function BehindTheScenes() {
             </>
           }
         >
-          Build glossary once — or Import from translated episodes you already have — and
-          Polygluttony hands those agreed translations to the AI on every episode.
+          Translate builds a glossary first and adds each new episode to it — or Import from
+          translated episodes you already have — and Polygluttony hands those agreed
+          translations to the AI on every episode.
         </Explainer>
 
         <Explainer

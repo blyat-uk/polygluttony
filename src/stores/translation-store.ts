@@ -81,6 +81,10 @@ interface TranslationRunState {
   requestStop: () => void
   /** `start_translation` rejected: back to idle, with the reason kept for the banner. */
   failStart: (message: string) => void
+  /** Forget how the last run ended (its banner and rows), when something newer
+   *  takes its place: a glossary step before the next run. The status bar's
+   *  result chip stays. */
+  clearOutcome: () => void
   applyEvent: (e: RunEvent) => void
   reset: () => void
 }
@@ -150,6 +154,11 @@ export const useTranslationRun = create<TranslationRunState>((set, get) => ({
       startError: message,
       logs: logLine(s, { file: null, level: "error", phase: "error", message }),
     })),
+
+  clearOutcome: () =>
+    set((s) =>
+      s.running ? {} : { files: {}, results: null, stopInfo: null, startError: null, logs: [] },
+    ),
 
   applyEvent: (e) => {
     // Every run opens with `run_started`. One this window didn't start (an

@@ -40,9 +40,36 @@ use crate::translation::parse_response;
 /// (`glossary_builder.py:136-138,235-241`; `reference_extractor.py:65-67,124-137`).
 /// The 30% headroom leaves room for prompt overhead.
 pub fn glossary_batches(lines: &[String], batch_limit: Option<u32>) -> Vec<String> {
+    lines.chunks(batch_lines(batch_limit)).map(|c| c.join("\n")).collect()
+}
+
+fn batch_lines(batch_limit: Option<u32>) -> usize {
     let limit = batch_limit.unwrap_or(crate::translation::batching::BATCH_LINE_LIMIT);
-    let per = (((limit as f64) * 0.7) as usize).max(1);
-    lines.chunks(per).map(|c| c.join("\n")).collect()
+    (((limit as f64) * 0.7) as usize).max(1)
+}
+
+/// Which files each batch holds lines of, by index. `lengths` are the files'
+/// line counts in the order their lines went into the stream; `per` is the
+/// batch size. A batch can span the end of one file and the start of the next.
+pub fn files_per_batch(lengths: &[usize], per: usize) -> Vec<Vec<usize>> {
+    let total: usize = lengths.iter().sum();
+    let per = per.max(1);
+    let mut out = Vec::with_capacity(total.div_ceil(per));
+    let mut start = 0;
+    while start < total {
+        let end = (start + per).min(total);
+        let mut files = Vec::new();
+        let mut offset = 0;
+        for (i, &n) in lengths.iter().enumerate() {
+            if n > 0 && offset < end && start < offset + n {
+                files.push(i);
+            }
+            offset += n;
+        }
+        out.push(files);
+        start = end;
+    }
+    out
 }
 
 /// Whether a build merges into the glossary already on disk or replaces it.
@@ -305,6 +332,7 @@ pub async fn build_glossary(
     // Files whose dialogue went into this build — the scanned files, once
     // every batch made it.
     let mut loaded_files: Vec<String> = Vec::new();
+    let mut loaded_lengths: Vec<usize> = Vec::new();
     for name in &job.files {
         match decode_file(&job.folder.join(name)) {
             Ok(text) => {
@@ -318,6 +346,7 @@ pub async fn build_glossary(
                 all_lines.extend(dialogues.iter().map(|d| strip_for_text(&d.text)));
                 files_processed += 1;
                 loaded_files.push(name.clone());
+                loaded_lengths.push(n);
                 log(&tx, LogLevel::Info, format!("loaded {name} ({n} lines)")).await;
             }
             Err(e) => {
@@ -363,6 +392,18 @@ pub async fn build_glossary(
     // ── Extracting: all batches through the LLM, one shared system prompt ──
     let batches = glossary_batches(&all_lines, job.batch_limit);
     let total = batches.len() as u32;
+    // An episode is read once every batch holding its lines has come back with
+    // an answer; one that failed (or was stopped) leaves it unread. Batches
+    // finish in any order, so count down per file.
+    let batch_files = files_per_batch(&loaded_lengths, batch_lines(job.batch_limit));
+    let mut left = vec![0u32; loaded_files.len()];
+    for files in &batch_files {
+        for &i in files {
+            left[i] += 1;
+        }
+    }
+    let left = std::sync::Arc::new(std::sync::Mutex::new(left));
+    let loaded = std::sync::Arc::new(loaded_files.clone());
     phase(&tx, GlossaryPhase::Extracting, Some(format!("{total} batches"))).await;
     let _ = tx.send(GlossaryEvent::Progress { done: 0, total }).await;
 
@@ -393,7 +434,8 @@ pub async fn build_glossary(
     let world = job.world_type.clone();
     let mut futs: FuturesOrdered<_> = batches
         .iter()
-        .map(|batch| {
+        .zip(batch_files)
+        .map(|(batch, files)| {
             let req = LlmRequest {
                 system: system.clone(),
                 user: prompts::extraction_user_prompt(batch),
@@ -402,10 +444,28 @@ pub async fn build_glossary(
             let completed = completed.clone();
             let seen = seen.clone();
             let world = world.clone();
+            let left = left.clone();
+            let loaded = loaded.clone();
             async move {
                 let result = svc.request(req).await;
                 let done = completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 let _ = tx.send(GlossaryEvent::Progress { done, total }).await;
+                let read: Vec<String> = if result.is_ok() {
+                    let mut left = left.lock().unwrap_or_else(|e| e.into_inner());
+                    files
+                        .iter()
+                        .filter(|&&i| {
+                            left[i] -= 1;
+                            left[i] == 0
+                        })
+                        .map(|&i| loaded[i].clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for file in read {
+                    let _ = tx.send(GlossaryEvent::FileRead { file }).await;
+                }
                 if let Ok(resp) = &result {
                     if let Ok(v) = parse_response::extract_object(&resp.text) {
                         let bg = Glossary::from_terms_value(&v, &world);
@@ -827,6 +887,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_episode_whose_batch_failed_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ass(dir.path(), "e1.ass", &["一"]); // batch 1
+        write_ass(dir.path(), "e2.ass", &["二"]); // batch 2
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![
+            Ok(r#"{"characters":{"林动":"Lin Dong"}}"#.into()),
+            Err(LlmError::Http { status: 401, body: "bad key".into(), retry_after: None }),
+        ]);
+        let svc = svc1(d, cancel.clone());
+        let (events, _) = run_and_collect(
+            job(dir.path(), vec!["e1.ass".into(), "e2.ass".into()], cancel),
+            &svc,
+            None,
+        )
+        .await;
+        let read: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                GlossaryEvent::FileRead { file } => Some(file.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(read, vec!["e1.ass"]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn auth_abort_suppresses_queued_cancel_noise() {
         let dir = tempfile::tempdir().unwrap();
         write_ass(dir.path(), "e1.ass", &["一", "二", "三"]); // limit 2 → 3 batches
@@ -939,6 +1026,55 @@ mod tests {
         assert_eq!(s.files_processed, 0);
         assert_eq!(s.errors, vec!["No dialogue found in the chosen files.".to_string()]);
         assert!(load_folder_glossary(dir.path()).is_none());
+    }
+
+    #[test]
+    fn batches_know_which_files_they_hold() {
+        // 3 + 2 + 4 lines in batches of 2: [0,1] [2,3] [4,5] [6,7] [8]
+        assert_eq!(
+            files_per_batch(&[3, 2, 4], 2),
+            vec![vec![0], vec![0, 1], vec![1, 2], vec![2], vec![2]]
+        );
+        assert!(files_per_batch(&[], 2).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_episode_is_read_once_all_its_batches_are_back() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ass(dir.path(), "e1.ass", &["一", "二"]); // batches 1 and 2 at limit 2
+        write_ass(dir.path(), "e2.ass", &["三"]); // batch 3
+        let cancel = CancellationToken::new();
+        let d = ScriptedDriver::new(vec![
+            Ok(r#"{"characters":{"a":"A"}}"#.into()),
+            Ok(r#"{"characters":{"b":"B"}}"#.into()),
+            Ok(r#"{"characters":{"c":"C"}}"#.into()),
+        ]);
+        let svc = svc1(d, cancel.clone());
+        let (events, _) = run_and_collect(
+            job(dir.path(), vec!["e1.ass".into(), "e2.ass".into()], cancel),
+            &svc,
+            None,
+        )
+        .await;
+        let mut read: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                GlossaryEvent::FileRead { file } => Some(file.as_str()),
+                _ => None,
+            })
+            .collect();
+        read.sort_unstable();
+        assert_eq!(read, vec!["e1.ass", "e2.ass"]);
+        // e1 is read only once both of its batches are back.
+        let at = events
+            .iter()
+            .position(|e| matches!(e, GlossaryEvent::FileRead { file } if file == "e1.ass"))
+            .unwrap();
+        let back = events[..at]
+            .iter()
+            .filter(|e| matches!(e, GlossaryEvent::Progress { done, .. } if *done > 0))
+            .count();
+        assert!(back >= 2, "e1 read after {back} batches");
     }
 
     #[tokio::test(start_paused = true)]

@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { plural } from "@/lib/utils";
 import { ReactorBar } from "@/features/translate/reactor-bar";
 import type { RunProgress } from "@/features/translate/telemetry";
+import type { GlossaryPhase } from "@/types/generated/GlossaryPhase";
 import type { StopInfo } from "@/types/generated/StopInfo";
 import {
   errorStopLine,
@@ -48,12 +49,117 @@ function Banner({ tone, children, actions }: { tone: Tone; children: ReactNode; 
 /** The banner's main action: outlined in gold, so the footer keeps the one gold button. */
 const LEAD = "border-[color:var(--color-gold)]/60 text-primary";
 
+/** A run that builds or updates the glossary first: which, and how many episodes it translates. */
+export interface TwoSteps {
+  first: boolean;
+  translating: number;
+}
+
+/** Where a glossary step is. */
+export interface GlossaryStepProgress {
+  phase: GlossaryPhase | null;
+  /** Batches back, of `total`. */
+  done: number;
+  total: number;
+  /** Episodes read, of `files`. */
+  read: number;
+  files: number;
+  /** Terms found so far. */
+  found: number;
+}
+
+/** What the glossary step added, said at the start of the finished banner. */
+export interface GlossaryNote {
+  first: boolean;
+  terms: number;
+  added: number;
+  /** Some of the episodes couldn't be read; they're offered again next time. */
+  partial: boolean;
+}
+
 export type BannerState =
-  | { kind: "running"; progress: RunProgress; stopping: boolean }
+  | { kind: "glossary_step"; steps: TwoSteps; progress: GlossaryStepProgress; stopping: boolean }
+  | { kind: "running"; progress: RunProgress; stopping: boolean; steps?: TwoSteps }
   | { kind: "start_error"; message: string; noModel: boolean; retry: { files: string[]; resume: boolean } | null }
   | { kind: "stopped"; info: StopInfo; tally: RunTally }
-  | { kind: "finished"; tally: RunTally }
+  | { kind: "finished"; tally: RunTally; glossary?: GlossaryNote }
+  | { kind: "glossary_stopped"; first: boolean; terms: number }
+  | { kind: "glossary_failed"; first: boolean; message: string; models: boolean }
   | { kind: "none" };
+
+const PHASE_LINE: Record<GlossaryPhase, string> = {
+  loading: "Reading the episodes…",
+  reference: "Reading your translated episodes…",
+  extracting: "Finding names",
+  normalizing: "Tidying up the glossary…",
+  personalizing: "Looking up names online…",
+  saving: "Saving the glossary…",
+};
+
+function glossaryStepLine(p: GlossaryStepProgress): string {
+  if (p.phase !== "extracting") return PHASE_LINE[p.phase ?? "loading"];
+  return `Finding names · ${p.read} of ${plural(p.files, "episode")} read · ${plural(p.found, "term")} found`;
+}
+
+/** How far the glossary step is: its batches, then full while it tidies up and saves. */
+function glossaryStepFraction(p: GlossaryStepProgress): number {
+  if (p.phase === "extracting") return p.total > 0 ? p.done / p.total : 0;
+  return p.phase === "normalizing" || p.phase === "personalizing" || p.phase === "saving" ? 1 : 0;
+}
+
+/** ① Build the glossary ── ② Translate 3 episodes, with the current step lit. */
+function StepTrail({ steps, at }: { steps: TwoSteps; at: 1 | 2 }) {
+  const items = [
+    steps.first ? "Build the glossary" : "Update the glossary",
+    `Translate ${plural(steps.translating, "episode")}`,
+  ];
+  return (
+    <ol className="flex items-center gap-2.5 text-[12px]">
+      {items.map((label, i) => {
+        const n = (i + 1) as 1 | 2;
+        const state = n < at ? "done" : n === at ? "now" : "next";
+        return (
+          <li key={label} className="flex items-center gap-2.5">
+            {i > 0 ? <span aria-hidden className="h-px w-8 bg-border" /> : null}
+            <span
+              aria-current={state === "now" ? "step" : undefined}
+              className={cn(
+                "flex items-center gap-1.5",
+                state === "now" && "text-foreground",
+                state === "done" && "text-[color:var(--color-success)]",
+                state === "next" && "text-muted-foreground",
+              )}
+            >
+              <span
+                className={cn(
+                  "grid size-[18px] place-items-center rounded-full border text-[10.5px] font-semibold",
+                  state === "now" && "border-primary bg-primary text-primary-foreground",
+                  state === "done" && "border-[color:var(--color-success)]",
+                  state === "next" && "border-border",
+                )}
+              >
+                {state === "done" ? "✓" : n}
+              </span>
+              {label}
+            </span>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+/** "Glossary built with 12 terms. ", "Glossary updated with 3 new terms. " */
+function glossarySentence(g: GlossaryNote): string {
+  const what = g.first
+    ? `Glossary built with ${plural(g.terms, "term")}`
+    : g.added > 0
+      ? `Glossary updated with ${plural(g.added, "new term")}`
+      : "No new names for the glossary";
+  return g.partial
+    ? `${what}, but part of the episodes couldn’t be read; they’ll be offered again next time. `
+    : `${what}. `;
+}
 
 /**
  * One slot above the table for what the run is doing or how it ended: live
@@ -65,12 +171,18 @@ export function RunBanner({
   busy,
   onResume,
   onRetry,
+  onRetryGlossary,
+  onCheckNewTerms,
 }: {
   state: BannerState;
   /** Something else is running; the banner's buttons wait. */
   busy: boolean;
   onResume: (files: string[]) => void;
   onRetry: (files: string[], resume: boolean) => void;
+  /** Run the glossary step and the translation again. */
+  onRetryGlossary: () => void;
+  /** Open the glossary on its NEW terms. */
+  onCheckNewTerms: () => void;
 }) {
   const navigate = useNavigate();
   const openModels = (
@@ -83,18 +195,66 @@ export function RunBanner({
     case "none":
       return null;
 
-    case "running": {
-      const { progress, stopping } = state;
-      if (progress.total === 0) return null;
+    case "glossary_step": {
+      const { steps, progress, stopping } = state;
       return (
         <div className="space-y-1.5 px-0.5">
-          <div className="flex justify-between text-[11px] text-muted-foreground tabular-nums">
+          <StepTrail steps={steps} at={1} />
+          <div className="flex justify-between gap-3 text-[11px] text-muted-foreground tabular-nums">
+            <span>
+              {stopping ? "Stopping… " : ""}
+              {glossaryStepLine(progress)}
+            </span>
+            <span className="shrink-0">Step 1 of 2</span>
+          </div>
+          <ReactorBar done={glossaryStepFraction(progress)} total={1} />
+        </div>
+      );
+    }
+
+    case "glossary_stopped":
+      return (
+        <Banner tone="neutral">
+          {state.first
+            ? `Stopped while building the glossary. ${plural(state.terms, "term")} kept; nothing was translated.`
+            : "Stopped while updating the glossary. Nothing was translated."}
+        </Banner>
+      );
+
+    case "glossary_failed":
+      return (
+        <Banner
+          tone="bad"
+          actions={
+            <>
+              {state.models ? openModels : null}
+              <Button variant="outline" size="xs" disabled={busy} onClick={onRetryGlossary}>
+                Try again
+              </Button>
+            </>
+          }
+        >
+          <span className="font-semibold">
+            The glossary couldn’t be {state.first ? "built" : "updated"}:{" "}
+          </span>
+          {sentence(state.message)} Nothing was translated.
+        </Banner>
+      );
+
+    case "running": {
+      const { progress, stopping, steps } = state;
+      if (progress.total === 0) return steps ? <StepTrail steps={steps} at={2} /> : null;
+      const pct = `${Math.round((progress.done / progress.total) * 100)}%`;
+      return (
+        <div className="space-y-1.5 px-0.5">
+          {steps ? <StepTrail steps={steps} at={2} /> : null}
+          <div className="flex justify-between gap-3 text-[11px] text-muted-foreground tabular-nums">
             <span>
               {stopping ? "Stopping… " : ""}
               {progress.done.toLocaleString()} of {plural(progress.total, "line")} ·{" "}
               {progress.finished} of {plural(progress.files, "episode")} finished
             </span>
-            <span>{Math.round((progress.done / progress.total) * 100)}%</span>
+            <span className="shrink-0">{steps ? `Step 2 of 2 · ${pct}` : pct}</span>
           </div>
           {/* One segment: thousands of line dividers would bury the fill. */}
           <ReactorBar done={progress.done / progress.total} total={1} />
@@ -176,20 +336,29 @@ export function RunBanner({
     }
 
     case "finished": {
-      const { tally } = state;
+      const { tally, glossary } = state;
       const failed = tally.failed.length;
       const tone: Tone = failed > 0 ? "bad" : tally.look.length > 0 ? "look" : "good";
+      const newTerms = glossary ? (glossary.first ? glossary.terms : glossary.added) : 0;
       return (
         <Banner
           tone={tone}
           actions={
-            failed > 0 ? (
-              <Button variant="outline" size="xs" disabled={busy} onClick={() => onRetry(tally.failed, false)}>
-                Try again
-              </Button>
-            ) : null
+            <>
+              {newTerms > 0 ? (
+                <Button variant="outline" size="xs" onClick={onCheckNewTerms}>
+                  Check the new terms
+                </Button>
+              ) : null}
+              {failed > 0 ? (
+                <Button variant="outline" size="xs" disabled={busy} onClick={() => onRetry(tally.failed, false)}>
+                  Try again
+                </Button>
+              ) : null}
+            </>
           }
         >
+          {glossary ? glossarySentence(glossary) : null}
           {finishedLine(tally)}
         </Banner>
       );

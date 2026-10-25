@@ -11,6 +11,7 @@ import type { ProjectView } from "@/types/generated/ProjectView"
 import { useAppStore } from "@/stores/app-store"
 import { queryClient } from "@/lib/query-client"
 import { projectKey } from "@/features/project/use-project"
+import { glossaryLoadKey } from "@/features/episodes/queries"
 
 /** HH:MM:SS receive-time stamp for log lines (close enough to emit time). */
 const now = () => new Date().toLocaleTimeString("en-GB", { hour12: false })
@@ -37,6 +38,8 @@ interface GlossaryRunStore {
   /** Live extraction terms streaming in per batch (category key → terms). */
   glossTerms: Record<string, { source: string; target: string }[]>
   glossTermCount: number
+  /** Episodes a build has been through every batch of, in the order they finished. */
+  filesRead: string[]
   logs: GlossaryLogLine[]
   summary: GlossaryBuildSummary | null
   lastDiff: GlossaryDiff | null
@@ -65,11 +68,6 @@ interface GlossaryRunStore {
   closeReview: () => void
   openUpdate: (folder: string) => void
   closeUpdate: () => void
-  /** Cross-page request: open "Add new episodes" with these files ticked. Set by
-   *  the Episodes page, consumed (and cleared) by the Glossary page. */
-  pendingAddEpisodes: { folder: string; files: string[] } | null
-  requestAddEpisodes: (folder: string, files: string[]) => void
-  clearAddEpisodes: () => void
   /** Cross-page request: show this term in the glossary (search + highlight). Set
    *  from "Fix in glossary" in an episode window, consumed by the Glossary page. */
   pendingFocusTerm: { folder: string; source: string } | null
@@ -79,9 +77,6 @@ interface GlossaryRunStore {
 }
 
 export const useGlossaryRun = create<GlossaryRunStore>((set) => ({
-  pendingAddEpisodes: null,
-  requestAddEpisodes: (folder, files) => set({ pendingAddEpisodes: { folder, files } }),
-  clearAddEpisodes: () => set({ pendingAddEpisodes: null }),
   pendingFocusTerm: null,
   requestFocusTerm: (folder, source) => set({ pendingFocusTerm: { folder, source } }),
   clearFocusTerm: () => set({ pendingFocusTerm: null }),
@@ -93,6 +88,7 @@ export const useGlossaryRun = create<GlossaryRunStore>((set) => ({
   total: 0,
   glossTerms: {},
   glossTermCount: 0,
+  filesRead: [],
   logs: [],
   summary: null,
   lastDiff: null,
@@ -118,6 +114,7 @@ export const useGlossaryRun = create<GlossaryRunStore>((set) => ({
       total: 0,
       glossTerms: {},
       glossTermCount: 0,
+      filesRead: [],
       logs: [],
       error: null,
       summary: op === "build" ? null : s.summary,
@@ -166,6 +163,8 @@ export const useGlossaryRun = create<GlossaryRunStore>((set) => ({
           }
           return { glossTerms: next, glossTermCount: s.glossTermCount + e.hits.length }
         }
+        case "file_read":
+          return { filesRead: [...s.filesRead, e.file] }
         case "log":
           return {
             logs: [
@@ -183,6 +182,8 @@ export const useGlossaryRun = create<GlossaryRunStore>((set) => ({
             queryClient.setQueryData<ProjectView>(projectKey(s.folder), (v) =>
               v ? { ...v, glossary_terms: e.summary.terms_final || null } : v,
             )
+            // The Episodes page's glossary row and tick read the new file.
+            void queryClient.invalidateQueries({ queryKey: glossaryLoadKey(s.folder) })
           }
           return {
             busy: null,
@@ -202,6 +203,7 @@ export const useGlossaryRun = create<GlossaryRunStore>((set) => ({
             ],
           }
         case "file_changed":
+          if (s.folder) void queryClient.invalidateQueries({ queryKey: glossaryLoadKey(s.folder) })
           return { fileTick: s.fileTick + 1 }
         default:
           return {}
@@ -211,7 +213,7 @@ export const useGlossaryRun = create<GlossaryRunStore>((set) => ({
   reset: () =>
     set({
       busy: null, folder: null, phase: null, phaseDetail: null, done: 0, total: 0,
-      glossTerms: {}, glossTermCount: 0,
+      glossTerms: {}, glossTermCount: 0, filesRead: [],
       logs: [], summary: null, lastDiff: null, error: null,
       opDetail: null, buildMode: null, reviewOpen: false, updateOpen: false, lastImport: null,
     }),

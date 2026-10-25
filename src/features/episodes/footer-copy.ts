@@ -58,28 +58,74 @@ export function formatMinutes(minutes: number): string {
 /** The model's own name from the Translate label: "Claude Sonnet 5.5 +2" → "Claude Sonnet 5.5". */
 export const modelName = (label: string) => label.replace(/\s\+\d+$/, "");
 
+/** Rough speed of a glossary build, which reads in big batches. */
+export const GLOSSARY_LINES_PER_MINUTE = 1800;
+
 /** "~1 min on Claude Sonnet 5.5 · uses glossary (232)"; null when nothing is ticked
- *  or there's no model to name. */
+ *  or there's no model to name. `glossaryLines`: lines a glossary step reads first. */
 export function estimateLine(
   lines: number,
   translationLabel: string | null,
   glossaryTerms: number | null,
+  glossaryLines = 0,
 ): string | null {
   if (lines === 0 || !translationLabel) return null;
-  const minutes = Math.max(1, Math.ceil(lines / LINES_PER_MINUTE));
+  const minutes = Math.max(
+    1,
+    Math.ceil(lines / LINES_PER_MINUTE + glossaryLines / GLOSSARY_LINES_PER_MINUTE),
+  );
   let text = `${formatMinutes(minutes)} on ${modelName(translationLabel)}`;
   if (glossaryTerms != null) text += ` · uses glossary (${glossaryTerms.toLocaleString()})`;
   return text;
 }
 
-/** Ticked files the glossary hasn't scanned yet — the footer offers to add
- *  them. Empty when the folder has no (readable) glossary. */
-export function unscannedFiles(selected: string[], glossary: GlossaryLoad | undefined): string[] {
-  if (glossary?.status !== "ok") return [];
-  const scanned = new Set(glossary.meta.scanned_files);
-  return selected.filter((n) => !scanned.has(n));
+/** The glossary has terms from episodes it has no record of: it was made
+ *  before PG kept track, or imported. */
+export function untracked(glossary: Extract<GlossaryLoad, { status: "ok" }>): boolean {
+  return glossary.meta.untracked ?? glossary.meta.scanned_files.length === 0;
 }
 
-/** "Add 1 episode to the glossary", "Add 3 episodes to the glossary". */
-export const addToGlossaryLabel = (n: number) =>
-  `Add ${n} ${n === 1 ? "episode" : "episodes"} to the glossary`;
+/**
+ * Whether the glossary has read an episode. For an untracked glossary an
+ * episode that has a translation counts as read too, so the ones offered are
+ * the new ones.
+ */
+export function glossaryHasRead(
+  glossary: GlossaryLoad | undefined,
+  files: SourceFile[],
+): (name: string) => boolean {
+  if (glossary?.status !== "ok") return () => false;
+  const read = new Set(glossary.meta.scanned_files);
+  if (untracked(glossary)) {
+    for (const f of files) if (f.translation !== "none") read.add(f.name);
+  }
+  return (name) => read.has(name);
+}
+
+/** The ticked episodes a glossary step would read: every one when there's no
+ *  glossary yet, else the ones it hasn't read. Empty while the glossary is
+ *  loading or can't be read. */
+export function glossaryStepFiles(
+  selected: string[],
+  files: SourceFile[],
+  glossary: GlossaryLoad | undefined,
+): string[] {
+  if (glossary?.status === "missing") return selected;
+  if (glossary?.status !== "ok") return [];
+  const read = glossaryHasRead(glossary, files);
+  return selected.filter((n) => !read(n));
+}
+
+/** "Build glossary, then translate 3 episodes", "Update glossary, then translate
+ *  1 episode · 1 replaces an existing translation". */
+export function combinedLabel(kind: "first" | "scan", count: number, replacing: number): string {
+  const verb = kind === "first" ? "Build" : "Update";
+  return `${verb} glossary, then t${translateLabel(count, replacing).slice(1)}`;
+}
+
+/** The tick next to the button: "Build a glossary first", "Add 1 episode to the glossary first". */
+export function glossaryTickLabel(kind: "first" | "scan", n: number): string {
+  return kind === "first"
+    ? "Build a glossary first"
+    : `Add ${n} ${n === 1 ? "episode" : "episodes"} to the glossary first`;
+}

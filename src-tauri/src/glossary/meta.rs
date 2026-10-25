@@ -78,6 +78,11 @@ pub struct GlossaryMeta {
     /// Source file names already scanned into this glossary.
     #[serde(default)]
     pub scanned_files: Vec<String>,
+    /// The glossary also has terms from episodes it has no record of: it was
+    /// made before PG kept track, or imported. `None` in a record from before
+    /// this field, where it holds when no episodes are on record.
+    #[serde(default)]
+    pub untracked: Option<bool>,
     /// Show name for Look up names online, remembered per folder.
     #[serde(default)]
     pub show_name: Option<String>,
@@ -211,6 +216,12 @@ impl GlossaryMeta {
             terms.sort();
             terms.dedup();
         }
+        // Settled before the first scan goes on record: terms already there with
+        // no episodes on record came from episodes nobody wrote down.
+        if self.untracked.is_none() {
+            self.untracked =
+                Some(before.is_some_and(|b| b.count() > 0) && self.scanned_files.is_empty());
+        }
         for f in scanned {
             if !self.scanned_files.contains(f) {
                 self.scanned_files.push(f.clone());
@@ -225,6 +236,7 @@ impl GlossaryMeta {
         self.origins.clear();
         self.unreviewed = all_sources(after);
         self.scanned_files = scanned.to_vec();
+        self.untracked = Some(false);
         self.last_change = Some(change);
     }
 
@@ -236,6 +248,7 @@ impl GlossaryMeta {
             .map(|(c, sources)| (c, sources.into_iter().map(|s| (s, TermOrigin::Yours)).collect()))
             .collect();
         self.unreviewed.clear();
+        self.untracked = Some(true);
         self.last_change = Some(change);
     }
 }
@@ -370,6 +383,7 @@ mod tests {
         assert_eq!(m.unreviewed["locations"], vec!["青阳镇".to_string()]);
         assert_eq!(m.unreviewed["items"], vec!["祖符".to_string()], "earlier NEW marks stay");
         assert_eq!(m.scanned_files, vec!["e1.ass".to_string(), "e2.ass".to_string()]);
+        assert_eq!(m.untracked, Some(false), "every term came from episodes on record");
         assert_eq!(m.show_name.as_deref(), Some("Martial Universe"));
         let lc = m.last_change.unwrap();
         assert_eq!(lc.kind, GlossaryChangeKind::Scan);
@@ -383,6 +397,23 @@ mod tests {
         m.record_scan(None, &after, &["e1.ass".into()], change(GlossaryChangeKind::Scan, None, &after));
         assert_eq!(m.unreviewed["characters"], vec!["林动".to_string()]);
         assert_eq!(m.scanned_files, vec!["e1.ass".to_string()]);
+        assert_eq!(m.untracked, Some(false));
+    }
+
+    /// A glossary from before PG kept track has terms but no episodes on
+    /// record: its first scan says so, and it stays said after more scans.
+    #[test]
+    fn record_scan_on_an_untracked_glossary_remembers_it() {
+        let before = glossary(&[("characters", "林动", "Lin Dong")]);
+        let after = glossary(&[("characters", "林动", "Lin Dong"), ("items", "祖符", "Symbol")]);
+        let mut m = GlossaryMeta::default();
+        let c = change(GlossaryChangeKind::Scan, Some(&before), &after);
+        m.record_scan(Some(&before), &after, &["e7.ass".into()], c);
+        assert_eq!(m.untracked, Some(true));
+        assert_eq!(m.scanned_files, vec!["e7.ass".to_string()]);
+        let c = change(GlossaryChangeKind::Scan, Some(&after), &after);
+        m.record_scan(Some(&after), &after, &["e8.ass".into()], c);
+        assert_eq!(m.untracked, Some(true));
     }
 
     /// A term that was deleted and found again is the AI's again, whatever a
@@ -412,6 +443,7 @@ mod tests {
         assert_eq!(m.unreviewed["characters"], vec!["林动".to_string()]);
         assert_eq!(m.unreviewed["items"], vec!["祖符".to_string()]);
         assert_eq!(m.scanned_files, vec!["e1.ass".to_string()]);
+        assert_eq!(m.untracked, Some(false));
         assert_eq!(m.show_name.as_deref(), Some("Martial Universe"));
         assert_eq!(m.last_change.unwrap().kind, GlossaryChangeKind::Rebuild);
     }
@@ -425,6 +457,7 @@ mod tests {
         assert_eq!(m.origins["characters"]["林动"], TermOrigin::Yours);
         assert_eq!(m.origins["items"]["祖符"], TermOrigin::Yours);
         assert!(m.unreviewed.is_empty());
+        assert_eq!(m.untracked, Some(true));
         assert_eq!(m.last_change.unwrap().kind, GlossaryChangeKind::Import);
     }
 }

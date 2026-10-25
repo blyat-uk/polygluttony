@@ -416,6 +416,7 @@ pub struct TermHit {
 /// result (e.g. final save IO failure); pre-flight failures surface as command
 /// errors, not events. `FileChanged` comes from the O15 watcher. `Terms` streams
 /// each batch's newly-found terms during extraction (some batches yield none).
+/// `FileRead` says a build has been through every batch of one episode.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "../../src/types/generated/")]
@@ -423,6 +424,7 @@ pub enum GlossaryEvent {
     Phase { phase: GlossaryPhase, detail: Option<String> },
     Progress { done: u32, total: u32 },
     Terms { batch: u32, hits: Vec<TermHit> },
+    FileRead { file: String },
     Log { level: LogLevel, message: String },
     Done { summary: GlossaryBuildSummary },
     Error { message: String },
