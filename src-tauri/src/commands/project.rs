@@ -75,18 +75,7 @@ pub async fn open_folder(app: AppHandle, path: String, now: i64) -> AppResult<Pr
     let app_cfg = config_store::load(&app)?;
     let projects_cfg = projects::load(&app)?;
     let saved = projects::get_prefs(&projects_cfg, &path);
-
-    // Discovery uses the saved-or-default language pair (fall back to zh→en).
-    let src_code = saved
-        .as_ref()
-        .map(|p| p.source_lang.clone())
-        .unwrap_or_else(|| app_cfg.default_source.clone());
-    let tgt_code = saved
-        .as_ref()
-        .map(|p| p.target_lang.clone())
-        .unwrap_or_else(|| app_cfg.default_target.clone());
-    let pair = LanguagePair::from_codes(&src_code, &tgt_code)
-        .or_else(|_| LanguagePair::from_codes("zh", "en"))?;
+    let pair = pair_for(saved.as_ref(), &app_cfg.default_source, &app_cfg.default_target)?;
 
     // Decode + parse every file off the async runtime thread (we're inside a
     // Tauri async command, which runs on the tokio runtime, so tokio's
@@ -165,6 +154,29 @@ fn prefs_for_open(
     (prefs, first_visit)
 }
 
+/// The folder's language pair: its saved one, else the defaults, else zh→en.
+fn pair_for(
+    saved: Option<&FolderPrefs>,
+    default_source: &str,
+    default_target: &str,
+) -> AppResult<LanguagePair> {
+    let src = saved.map_or(default_source, |p| p.source_lang.as_str());
+    let tgt = saved.map_or(default_target, |p| p.target_lang.as_str());
+    LanguagePair::from_codes(src, tgt).or_else(|_| LanguagePair::from_codes("zh", "en"))
+}
+
+/// Whether an episode of this folder has a translation on disk, by the
+/// folder's language pair. False when that can't be worked out.
+pub fn has_output<R: tauri::Runtime>(app: &AppHandle<R>, folder: &Path, file: &str) -> bool {
+    let (Ok(app_cfg), Ok(projects_cfg)) = (config_store::load(app), projects::load(app)) else {
+        return false;
+    };
+    let saved = projects::get_prefs(&projects_cfg, &folder.to_string_lossy());
+    pair_for(saved.as_ref(), &app_cfg.default_source, &app_cfg.default_target)
+        .map(|pair| output_on_disk(&folder.join(file), &pair).state != TranslationState::None)
+        .unwrap_or(false)
+}
+
 /// Names of the files with no translation on disk, in list order.
 fn untranslated_names(files: &[SourceFile]) -> Vec<String> {
     files
@@ -216,6 +228,25 @@ mod tests {
     use crate::config::projects::Tone;
     use crate::glossary::world_detector::WorldType;
     use std::fs;
+
+    #[test]
+    fn a_folder_pair_is_its_own_then_the_defaults_then_zh_en() {
+        let saved = FolderPrefs {
+            source_lang: "ja".into(),
+            target_lang: "en".into(),
+            world_override: None,
+            tone: Tone::Standard,
+            selected_files: vec![],
+            glossary_first: true,
+        };
+        let pair = |s: Option<&FolderPrefs>, src: &str, tgt: &str| {
+            let p = pair_for(s, src, tgt).unwrap();
+            (p.source, p.target)
+        };
+        assert_eq!(pair(Some(&saved), "zh", "en"), ("ja".into(), "en".into()));
+        assert_eq!(pair(None, "ko", "en"), ("ko".into(), "en".into()));
+        assert_eq!(pair(None, "en", "en"), ("zh".into(), "en".into()));
+    }
 
     const ASS: &str = "[Script Info]\nTitle: t\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好\nDialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,再见\n";
 

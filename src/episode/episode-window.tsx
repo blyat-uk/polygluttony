@@ -411,6 +411,18 @@ export function EpisodeWindow({
           : "This episode isn’t part of the current run."}
       </Notice_>
     );
+  } else if (view.kind === "no_record") {
+    body = (
+      <Notice_>
+        <p className="text-foreground/85">
+          This episode has a translation, but no record of how it went.
+        </p>
+        <p className="mt-1 text-[11.5px]">
+          It was translated with Polygluttony 2.x or earlier, or its stored results were
+          removed. Translate it again to review it line by line.
+        </p>
+      </Notice_>
+    );
   } else if (view.kind === "unreadable") {
     body = (
       <Notice_>

@@ -359,6 +359,9 @@ pub struct EpisodeGoToLine {
 pub enum EpisodeView {
     /// No run this session, or the current run doesn't include this episode.
     NotInRun,
+    /// There's a translation on disk but nothing stored about it: translated
+    /// with a version from before results were kept, or the results were removed.
+    NoRecord,
     /// In the run, but its source file couldn't be read.
     Unreadable { message: String },
     Live(EpisodeSnapshot),

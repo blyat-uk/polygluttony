@@ -52,8 +52,9 @@ pub async fn cancel_translation(app: AppHandle) -> AppResult<()> {
 /// live board, as before. With `folder`: `live` while the episode is in the
 /// run that is going now; otherwise `stored`, read from the stored results
 /// (so Review edits show at once), falling back to the last run's board for
-/// an episode with nothing stored; `not_in_run` when there's neither. Disk
-/// reads happen on a blocking thread.
+/// an episode with nothing stored; `no_record` for a translation on disk with
+/// nothing stored; `not_in_run` when there's none of these. Disk reads happen
+/// on a blocking thread.
 #[tauri::command]
 pub async fn episode_snapshot(
     app: AppHandle,
@@ -74,6 +75,7 @@ pub async fn episode_snapshot(
         match (stored, standing) {
             (Some(view), _) => view,
             (None, Standing::Finished) => board.snapshot(&file),
+            (None, _) if super::project::has_output(&app, &folder, &file) => EpisodeView::NoRecord,
             (None, _) => EpisodeView::NotInRun,
         }
     })

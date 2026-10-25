@@ -349,7 +349,10 @@ const TROUBLE: {
         Open the episode from Episodes to fix single lines, or open the translated .ass file in
         your subtitle editor. To change how a name or term is translated in every episode, change
         it on the Glossary page, or open the whole glossary in your own editor with{" "}
-        <span className="font-semibold text-foreground">Glossary ▸ Open in editor</span> —
+        <span className="font-semibold text-foreground">
+          Glossary ▸ ··· ▸ Open in your text editor
+        </span>{" "}
+        —
         Polygluttony reloads it automatically when you save.
       </>
     ),
