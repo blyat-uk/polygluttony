@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { Link } from "@tanstack/react-router";
 import { CaretDown, CaretUp } from "@phosphor-icons/react";
 import type { FolderPrefs } from "@/types/generated/FolderPrefs";
 import type { Language } from "@/types/generated/Language";
@@ -56,14 +55,11 @@ function PillSelect({
 export function FolderSettings({
   view,
   languages,
-  glossaryBroken = false,
   locked,
   onChange,
 }: {
   view: ProjectView;
   languages: Language[] | undefined;
-  /** glossary.json is there but can't be read. */
-  glossaryBroken?: boolean;
   /** A run is going in this folder; settings wait until it's done. */
   locked: boolean;
   onChange: (next: FolderPrefs) => void;
@@ -77,19 +73,7 @@ export function FolderSettings({
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2 text-[12.5px]">
-        <span className="text-muted-foreground">
-          {settingsSummary(view, languages, glossaryBroken)}
-          {glossaryBroken ? (
-            <>
-              {" · "}
-              <span className="text-[color:var(--color-alert)]">Glossary has a mistake</span>
-              {" · "}
-              <Link to="/glossary" className="text-primary underline-offset-2 hover:underline">
-                Fix it
-              </Link>
-            </>
-          ) : null}
-        </span>
+        <span className="text-muted-foreground">{settingsSummary(view, languages)}</span>
         <Button
           variant="ghost"
           size="xs"

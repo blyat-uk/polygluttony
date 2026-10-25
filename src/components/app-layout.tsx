@@ -26,6 +26,8 @@ import { projectKey } from "@/features/project/use-project"
 import { useAppStore } from "@/stores/app-store"
 import { useTranslationRun } from "@/stores/translation-store"
 import { useGlossaryRun } from "@/stores/glossary-store"
+import { watchCombinedRuns } from "@/features/episodes/combined-run"
+import { glossaryLoadKey } from "@/features/episodes/queries"
 import type { RunEvent } from "@/types/generated/RunEvent"
 import type { GlossaryEvent } from "@/types/generated/GlossaryEvent"
 import type { ResultsChanged } from "@/types/generated/ResultsChanged"
@@ -125,11 +127,16 @@ export function AppLayout({ children }: { children: ReactNode }) {
     }
   }, [applyGlossaryEvent])
 
+  // "Build glossary, then translate": the translation starts when the glossary
+  // lands, whichever page is open.
+  useEffect(() => watchCombinedRuns(), [])
+
   // An episode window's "Add to glossary" saved the glossary: reload it, even
   // right after a save of our own, so a later edit here can't save over the new term.
   useEffect(() => {
     const un = onBackendEvent<GlossaryChanged>(GLOSSARY_CHANGED_EVENT, (e) => {
       void queryClient.invalidateQueries({ queryKey: glossaryKey(e.payload.folder) })
+      void queryClient.invalidateQueries({ queryKey: glossaryLoadKey(e.payload.folder) })
     })
     return () => {
       un.then((f) => f())

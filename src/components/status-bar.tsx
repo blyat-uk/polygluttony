@@ -13,6 +13,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useGlossaryRun } from "@/stores/glossary-store";
 import { useTranslationRun, type FileRow } from "@/stores/translation-store";
 import { tallyRun } from "@/features/episodes/run-summary";
+import { useCombinedRun } from "@/features/episodes/combined-run";
 
 const WORLD_LABEL: Record<WorldType, string> = {
   xianxia: "Xianxia",
@@ -118,6 +119,9 @@ export function StatusBar() {
   const gBusy = useGlossaryRun((s) => s.busy);
   const gDone = useGlossaryRun((s) => s.done);
   const gTotal = useGlossaryRun((s) => s.total);
+  const gRead = useGlossaryRun((s) => s.filesRead.length);
+  // A "Build glossary, then translate" run lives on the Episodes page.
+  const chained = useCombinedRun((s) => s.pending);
   const { data: appInfo } = useQuery({ queryKey: ["app-info"], queryFn: ipc.appInfo });
   const { data: languages } = useQuery({
     queryKey: ["languages"],
@@ -128,9 +132,14 @@ export function StatusBar() {
   // Engine exclusivity means at most one of these is live at a time.
   const live = translating
     ? { to: "/episodes", label: translatingLabel(files) }
-    : gBusy
-      ? { to: "/glossary", label: glossaryLabel(gBusy, gDone, gTotal) }
-      : null;
+    : chained && gBusy === "build"
+      ? {
+          to: "/episodes",
+          label: `${chained.kind === "first" ? "Building" : "Updating"} glossary · ${Math.min(gRead, chained.glossaryFiles.length)} of ${chained.glossaryFiles.length}`,
+        }
+      : gBusy
+        ? { to: "/glossary", label: glossaryLabel(gBusy, gDone, gTotal) }
+        : null;
   // The last full run's result stays until the next one — for the folder it
   // belongs to. A review retranslating a few lines doesn't replace it.
   const tally =

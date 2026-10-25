@@ -13,12 +13,14 @@ import { useTranslationRun } from "@/stores/translation-store";
 import { usePrimaryAction } from "@/hooks/use-primary-action";
 import { projectKey, syncProjectStore, useProject } from "@/features/project/use-project";
 import { runProgress } from "@/features/translate/telemetry";
+import { useGlossaryUi } from "@/features/glossary/ui-store";
 import { FolderHeader } from "./folder-header";
 import { FolderSettings } from "./folder-settings";
+import { GlossaryRow } from "./glossary-row";
 import { EpisodeTable } from "./episode-table";
 import { EpisodesFooter } from "./episodes-footer";
-import { RunBanner, type BannerState } from "./run-banner";
-import { resolveStatus, type EpisodeStatus } from "./episode-status";
+import { RunBanner, type BannerState, type TwoSteps } from "./run-banner";
+import { glossaryStepStatus, resolveStatus, type EpisodeStatus } from "./episode-status";
 import {
   PRESETS,
   existingSelection,
@@ -27,15 +29,24 @@ import {
   type SelectPreset,
 } from "./selection";
 import {
-  addToGlossaryLabel,
   blockedReason,
+  combinedLabel,
   estimateLine,
+  glossaryStepFiles,
+  glossaryTickLabel,
   replacingCount,
   translateLabel,
-  unscannedFiles,
 } from "./footer-copy";
 import { tallyRun } from "./run-summary";
 import { folderResultsKey, glossaryLoadKey, useFolderResults, useGlossaryLoad } from "./queries";
+import {
+  forgetGlossaryStep,
+  startCombinedRun,
+  stopCombinedRun,
+  useCombinedRun,
+  type CombinedPlan,
+} from "./combined-run";
+import { startTranslationRun } from "./start-run";
 
 export function EpisodesPage() {
   const workdir = useAppStore((s) => s.workdir);
@@ -56,6 +67,14 @@ function useNow(active: boolean) {
   return now;
 }
 
+/** The glossary step's phases after it has read every episode. */
+const PAST_READING = new Set(["normalizing", "personalizing", "saving"]);
+
+const twoSteps = (plan: CombinedPlan): TwoSteps => ({
+  first: plan.kind === "first",
+  translating: plan.files.length,
+});
+
 function Episodes({ folder }: { folder: string }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
@@ -66,15 +85,27 @@ function Episodes({ folder }: { folder: string }) {
     staleTime: Infinity,
   });
   const { data: stored } = useFolderResults(folder);
-  const hasGlossary = !!view?.supports_glossary && view.glossary_terms != null;
   // Read whenever the folder can have one: a glossary.json that can't be read
-  // counts no terms, and the page says so instead of "No glossary yet".
+  // counts no terms, and the page says so instead of "none yet".
   const { data: glossary } = useGlossaryLoad(folder, !!view?.supports_glossary);
   const glossaryBroken = !!view?.supports_glossary && glossary?.status === "unreadable";
 
   const translationLabel = useAppStore((s) => s.translationLabel);
   const hasUsableConnection = useAppStore((s) => s.hasUsableConnection);
   const glossaryBusy = useGlossaryRun((s) => s.busy !== null);
+  const step = useGlossaryRun(
+    useShallow((s) => ({
+      phase: s.phase,
+      done: s.done,
+      total: s.total,
+      filesRead: s.filesRead,
+      found: s.glossTermCount,
+      logs: s.logs,
+    })),
+  );
+  const combined = useCombinedRun(
+    useShallow((s) => ({ pending: s.pending, stopRequested: s.stopRequested, last: s.last })),
+  );
   const run = useTranslationRun(
     useShallow((s) => ({
       running: s.running,
@@ -94,6 +125,10 @@ function Episodes({ folder }: { folder: string }) {
 
   const ours = run.folder === folder;
   const runningHere = ours && run.running;
+  // A "Build glossary, then translate" run on its glossary step, in this folder.
+  const pendingHere = combined.pending?.folder === folder ? combined.pending : null;
+  const lastHere = combined.last?.plan.folder === folder ? combined.last : null;
+  const busyHere = runningHere || pendingHere !== null;
   const throttleActive = runningHere && run.throttle !== null && run.throttle.until > Date.now();
   const now = useNow(throttleActive);
 
@@ -114,9 +149,32 @@ function Episodes({ folder }: { folder: string }) {
     };
   }, [refresh]);
 
+  // Episodes the glossary step has been through: all of them once it's past reading.
+  const pastReading = step.phase !== null && PAST_READING.has(step.phase);
+  const readNames = useMemo(() => new Set(step.filesRead), [step.filesRead]);
+
   const statusOf = useMemo(() => {
     const map = new Map<string, EpisodeStatus>();
+    // Episodes in a run on its glossary step: read, being read (the earliest
+    // unread one; batches go in order), or waiting.
+    const inStep = new Set([...(pendingHere?.files ?? []), ...(pendingHere?.glossaryFiles ?? [])]);
+    const reading = new Set(pendingHere?.glossaryFiles ?? []);
+    const firstUnread =
+      step.phase === "extracting"
+        ? pendingHere?.glossaryFiles.find((n) => !readNames.has(n))
+        : undefined;
     for (const file of view?.files ?? []) {
+      if (inStep.has(file.name)) {
+        const state = !reading.has(file.name)
+          ? "waiting"
+          : pastReading || readNames.has(file.name)
+            ? "read"
+            : file.name === firstUnread
+              ? "reading"
+              : "waiting";
+        map.set(file.name, glossaryStepStatus(state));
+        continue;
+      }
       map.set(
         file.name,
         resolveStatus({
@@ -131,10 +189,32 @@ function Episodes({ folder }: { folder: string }) {
       );
     }
     return (name: string) => map.get(name)!;
-  }, [view, ours, runningHere, run.external, run.files, run.throttle, stored, now]);
+  }, [
+    view,
+    ours,
+    runningHere,
+    run.external,
+    run.files,
+    run.throttle,
+    stored,
+    now,
+    pendingHere,
+    step.phase,
+    readNames,
+    pastReading,
+  ]);
 
   const selected = view ? existingSelection(view.prefs.selected_files, view.files) : [];
   const sameLanguage = !!view && view.prefs.source_lang === view.prefs.target_lang;
+
+  // The glossary step: which ticked episodes it would read, and whether it builds
+  // a glossary or adds to the one there.
+  const glossaryFiles = view?.supports_glossary
+    ? glossaryStepFiles(selected, view.files, glossary)
+    : [];
+  const stepKind = glossary?.status === "ok" ? "scan" : "first";
+  const glossaryFirst = glossaryFiles.length > 0 && !!view?.prefs.glossary_first;
+
   // While this folder's run goes, the footer shows Stop instead of Translate.
   const gate = {
     otherRun: run.running && !runningHere,
@@ -143,7 +223,7 @@ function Episodes({ folder }: { folder: string }) {
     sameLanguage,
   };
   const blocked = blockedReason({ ...gate, ticked: selected.length });
-  const canStart = !run.running && blocked === null;
+  const canStart = !run.running && !pendingHere && blocked === null;
   const canTranslateOne = !run.running && blockedReason({ ...gate, ticked: 1 }) === null;
 
   // The ticks live in the cached view for the session; every open seeds them afresh.
@@ -174,47 +254,76 @@ function Episodes({ folder }: { folder: string }) {
     if (langsChanged) refresh();
   };
 
-  // Every start resumes: the engine carries on only episodes whose stored
-  // result is a stop with the same source (and settings); the rest start
-  // fresh. So a stopped episode's kept batches are never thrown away.
+  /** Translate these episodes now, with no glossary step. */
   const startRun = (files: string[]) => {
     if (!view || files.length === 0) return;
-    const { prefs } = view;
-    const resume = true;
-    const store = useTranslationRun.getState();
-    store.start(files, folder, resume);
-    // Running a folder keeps its settings (and it's no longer a first visit).
-    void ipc.saveFolderPrefs(folder, prefs);
-    ipc
-      .startTranslation({
-        folder,
-        files,
-        tone: prefs.tone,
-        sourceLang: prefs.source_lang,
-        targetLang: prefs.target_lang,
-        resume,
-      })
-      .catch((err: unknown) => {
-        useTranslationRun.getState().failStart(err instanceof Error ? err.message : String(err));
-      });
+    forgetGlossaryStep();
+    startTranslationRun(folder, files, view.prefs);
+  };
+
+  /** The footer's button: the glossary step first when it's ticked. */
+  const start = () => {
+    if (!view || selected.length === 0) return;
+    if (!glossaryFirst) {
+      startRun(selected);
+      return;
+    }
+    startCombinedRun(view, {
+      folder,
+      kind: stepKind,
+      glossaryFiles,
+      files: selected,
+      prefs: view.prefs,
+    });
   };
 
   const stop = () => {
+    if (pendingHere) {
+      stopCombinedRun();
+      return;
+    }
     useTranslationRun.getState().requestStop();
     void ipc.cancelTranslation();
   };
 
-  usePrimaryAction(() => startRun(selected), canStart && !!view);
+  const checkNewTerms = () => {
+    const ui = useGlossaryUi.getState();
+    ui.forFolder(folder);
+    ui.setSearch("");
+    ui.setCategory(null);
+    ui.setShow("new");
+    void navigate({ to: "/glossary" });
+  };
+
+  usePrimaryAction(start, canStart && !!view);
 
   if (!view) return null;
 
   // ── banner ────────────────────────────────────────────────────────────────
   let banner: BannerState = { kind: "none" };
-  if (ours && run.running) {
+  const chainedHere = lastHere?.end.kind === "built" ? lastHere : null;
+  if (pendingHere) {
+    banner = {
+      kind: "glossary_step",
+      steps: twoSteps(pendingHere),
+      progress: {
+        phase: step.phase,
+        done: step.done,
+        total: step.total,
+        read: pastReading
+          ? pendingHere.glossaryFiles.length
+          : pendingHere.glossaryFiles.filter((n) => readNames.has(n)).length,
+        files: pendingHere.glossaryFiles.length,
+        found: step.found,
+      },
+      stopping: combined.stopRequested,
+    };
+  } else if (ours && run.running) {
     banner = {
       kind: "running",
       progress: runProgress(run.files, new Map(view.files.map((f) => [f.name, f.dialogue_count]))),
       stopping: run.stopRequested,
+      steps: chainedHere && !run.external ? twoSteps(chainedHere.plan) : undefined,
     };
   } else if (ours && run.startError) {
     banner = {
@@ -225,7 +334,30 @@ function Episodes({ folder }: { folder: string }) {
     };
   } else if (ours && run.results && !run.external) {
     const tally = tallyRun(run.files, run.results);
-    banner = run.stopInfo ? { kind: "stopped", info: run.stopInfo, tally } : { kind: "finished", tally };
+    const end = chainedHere?.end;
+    banner = run.stopInfo
+      ? { kind: "stopped", info: run.stopInfo, tally }
+      : {
+          kind: "finished",
+          tally,
+          glossary:
+            chainedHere && end?.kind === "built"
+              ? { first: chainedHere.plan.kind === "first", terms: end.terms, added: end.added }
+              : undefined,
+        };
+  } else if (lastHere?.end.kind === "stopped") {
+    banner = {
+      kind: "glossary_stopped",
+      first: lastHere.plan.kind === "first",
+      terms: lastHere.end.terms,
+    };
+  } else if (lastHere?.end.kind === "failed") {
+    banner = {
+      kind: "glossary_failed",
+      first: lastHere.plan.kind === "first",
+      message: lastHere.end.message,
+      models: !!lastHere.end.models,
+    };
   }
 
   // ── footer ────────────────────────────────────────────────────────────────
@@ -233,17 +365,18 @@ function Episodes({ folder }: { folder: string }) {
   const lines = view.files
     .filter((f) => tickedSet.has(f.name))
     .reduce((n, f) => n + f.dialogue_count, 0);
-  const unscanned = hasGlossary ? unscannedFiles(selected, glossary) : [];
-  const addToGlossary =
-    unscanned.length > 0 && !glossaryBusy
-      ? {
-          label: addToGlossaryLabel(unscanned.length),
-          onClick: () => {
-            useGlossaryRun.getState().requestAddEpisodes(folder, unscanned);
-            void navigate({ to: "/glossary" });
-          },
-        }
-      : null;
+  const stepSet = new Set(glossaryFiles);
+  const glossaryLines = glossaryFirst
+    ? view.files.filter((f) => stepSet.has(f.name)).reduce((n, f) => n + f.dialogue_count, 0)
+    : 0;
+  const replacing = replacingCount(selected, view.files);
+  const plainLabel = translateLabel(selected.length, replacing);
+  const withGlossaryLabel = combinedLabel(stepKind, selected.length, replacing);
+  const logs = pendingHere
+    ? step.logs.map((l) => ({ ...l, file: "glossary" }))
+    : ours
+      ? run.logs
+      : [];
 
   const watchable = runningHere ? new Set(Object.keys(run.files)) : new Set<string>();
   const pick = (preset: SelectPreset) =>
@@ -259,9 +392,23 @@ function Episodes({ folder }: { folder: string }) {
         <FolderSettings
           view={view}
           languages={languages}
-          glossaryBroken={glossaryBroken}
-          locked={runningHere}
+          locked={busyHere}
           onChange={(next) => void persist(next)}
+        />
+
+        <GlossaryRow
+          view={view}
+          glossary={glossary}
+          unread={glossary?.status === "ok" ? glossaryFiles : []}
+          building={
+            pendingHere
+              ? {
+                  kind: pendingHere.kind,
+                  found: step.found,
+                  files: pendingHere.glossaryFiles.length,
+                }
+              : null
+          }
         />
 
         {/* The presets come first, so they stay put while the count changes length. */}
@@ -288,6 +435,10 @@ function Episodes({ folder }: { folder: string }) {
           busy={run.running || glossaryBusy}
           onResume={(files) => startRun(files)}
           onRetry={(files) => startRun(files)}
+          onRetryGlossary={() => {
+            if (lastHere) startCombinedRun(view, { ...lastHere.plan, prefs: view.prefs });
+          }}
+          onCheckNewTerms={checkNewTerms}
         />
 
         <EpisodeTable
@@ -303,17 +454,34 @@ function Episodes({ folder }: { folder: string }) {
       </div>
 
       <EpisodesFooter
-        running={runningHere}
-        stopping={run.stopRequested}
-        label={translateLabel(selected.length, replacingCount(selected, view.files))}
+        running={busyHere}
+        stopping={pendingHere ? combined.stopRequested : run.stopRequested}
+        label={glossaryFirst ? withGlossaryLabel : plainLabel}
         blocked={blocked}
-        estimate={estimateLine(lines, translationLabel, view.glossary_terms)}
-        addToGlossary={addToGlossary}
+        estimate={estimateLine(
+          lines,
+          translationLabel,
+          glossaryFirst && stepKind === "first" ? null : view.glossary_terms,
+          glossaryLines,
+        )}
+        glossaryTick={
+          glossaryFiles.length > 0
+            ? {
+                label: glossaryTickLabel(stepKind, glossaryFiles.length),
+                checked: view.prefs.glossary_first,
+                onChange: (checked) => void persist({ ...view.prefs, glossary_first: checked }),
+                otherLabel: glossaryFirst ? plainLabel : withGlossaryLabel,
+              }
+            : null
+        }
         note={glossaryBroken ? "The glossary can't be read, so this run won't use it." : null}
-        logs={ours ? run.logs : []}
+        runningNote={
+          pendingHere ? "Stopping now keeps the terms found so far and doesn’t translate." : null
+        }
+        logs={logs}
         logsOpen={logsOpen}
         onToggleLogs={() => setLogsOpen((o) => !o)}
-        onStart={() => startRun(selected)}
+        onStart={start}
         onStop={stop}
       />
     </div>

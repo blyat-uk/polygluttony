@@ -295,6 +295,7 @@ mod tests {
             world_override: Some(WorldType::Wuxia),
             tone: Tone::Comedic,
             selected_files: vec!["ep01.ass".into(), "ep02.ass".into(), "ep03.ass".into()],
+            glossary_first: false,
         };
         let (prefs, first_visit) =
             prefs_for_open(Some(saved.clone()), &a.files, Some("ja"), "zh", "en");
@@ -304,6 +305,7 @@ mod tests {
         assert_eq!(prefs.source_lang, "zh");
         assert_eq!(prefs.world_override, Some(WorldType::Wuxia));
         assert_eq!(prefs.tone, Tone::Comedic);
+        assert!(!prefs.glossary_first);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { Play, Stop } from "@phosphor-icons/react";
 import { Link } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { LogPanel, LogToggleButton } from "@/components/log-drawer";
 import type { LogLine } from "@/stores/translation-store";
 import type { Blocked } from "./footer-copy";
@@ -11,8 +12,9 @@ export function EpisodesFooter({
   label,
   blocked,
   estimate,
-  addToGlossary,
+  glossaryTick,
   note = null,
+  runningNote = null,
   logs,
   logsOpen,
   onToggleLogs,
@@ -26,10 +28,20 @@ export function EpisodesFooter({
   label: string;
   blocked: Blocked;
   estimate: string | null;
-  addToGlossary: { label: string; onClick: () => void } | null;
+  /** "Build a glossary first": the run reads the ticked episodes for the glossary,
+   *  then translates. Null when there's nothing for the glossary to read. */
+  glossaryTick: {
+    label: string;
+    checked: boolean;
+    onChange: (checked: boolean) => void;
+    /** The button's label with the tick the other way. */
+    otherLabel: string;
+  } | null;
   /** A quiet word about the run, e.g. that it goes without the glossary. */
   note?: string | null;
-  logs: LogLine[];
+  /** The same, while it runs: what Stop does now. */
+  runningNote?: string | null;
+  logs: Pick<LogLine, "at" | "level" | "message" | "file">[];
   logsOpen: boolean;
   onToggleLogs: () => void;
   onStart: () => void;
@@ -44,24 +56,37 @@ export function EpisodesFooter({
           </Button>
         ) : (
           <Button disabled={blocked !== null} onClick={onStart}>
-            <Play weight="fill" /> {label}
+            <Play weight="fill" />
+            {/* As wide as the label for the tick's other state, so the tick
+                doesn't slide out from under the pointer when it's clicked. */}
+            <span className="grid justify-items-center">
+              <span className="col-start-1 row-start-1">{label}</span>
+              {glossaryTick ? (
+                <span aria-hidden className="invisible col-start-1 row-start-1">
+                  {glossaryTick.otherLabel}
+                </span>
+              ) : null}
+            </span>
           </Button>
         )}
 
+        {glossaryTick && !running ? (
+          <label className="flex shrink-0 cursor-pointer items-center gap-2 text-[12.5px] text-foreground select-none">
+            <Checkbox
+              checked={glossaryTick.checked}
+              onCheckedChange={(v) => glossaryTick.onChange(v === true)}
+            />
+            {glossaryTick.label}
+          </label>
+        ) : null}
         {running ? null : <FooterHint blocked={blocked} estimate={estimate} />}
         {note && !running ? <span className="text-[11.5px] text-muted-foreground">{note}</span> : null}
+        {runningNote && running ? (
+          <span className="text-[11.5px] text-muted-foreground">{runningNote}</span>
+        ) : null}
 
         <span className="flex-1" />
 
-        {addToGlossary && !running ? (
-          <button
-            type="button"
-            onClick={addToGlossary.onClick}
-            className="rounded-md text-[12px] text-primary underline-offset-2 outline-none hover:underline focus-visible:ring-[3px] focus-visible:ring-ring/50"
-          >
-            {addToGlossary.label}
-          </button>
-        ) : null}
         <LogToggleButton open={logsOpen} count={logs.length} onToggle={onToggleLogs} />
       </div>
       {logsOpen ? (

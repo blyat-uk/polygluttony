@@ -313,15 +313,6 @@ export function EditorView({ view, state }: { view: ProjectView; state: Glossary
 
   // ── cross-page requests ───────────────────────────────────────────────────
 
-  // Episodes → "Add new episodes" with these files ticked.
-  const pendingAdd = useGlossaryRun((s) => s.pendingAddEpisodes);
-  useEffect(() => {
-    if (!pendingAdd || pendingAdd.folder !== folder) return;
-    useGlossaryRun.getState().clearAddEpisodes();
-    openAddEpisodes(pendingAdd.files);
-    // openAddEpisodes reads the stores; only a new request matters here.
-  }, [pendingAdd, folder]);
-
   // Episode window → "Fix in glossary": show that term.
   const pendingFocus = useGlossaryRun((s) => s.pendingFocusTerm);
   useEffect(() => {

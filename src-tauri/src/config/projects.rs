@@ -42,6 +42,14 @@ pub struct FolderPrefs {
     /// that have no translation yet; see `open_folder`.
     #[serde(default)]
     pub selected_files: Vec<String>,
+    /// Build or update the glossary before translating: the tick next to the
+    /// Episodes page's Translate button. On until unticked for this folder.
+    #[serde(default = "glossary_first_default")]
+    pub glossary_first: bool,
+}
+
+fn glossary_first_default() -> bool {
+    true
 }
 
 /// One recent-folder entry.
@@ -127,6 +135,7 @@ pub fn resolve_prefs(
         world_override: None,
         tone: Tone::Standard,
         selected_files: Vec::new(),
+        glossary_first: true,
     }
 }
 
@@ -155,6 +164,15 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, cfg: &ProjectsConfig) -> AppResult<(
 mod tests {
     use super::*;
     use crate::glossary::world_detector::WorldType;
+
+    #[test]
+    fn prefs_saved_before_the_glossary_tick_start_with_it_on() {
+        let p: FolderPrefs = serde_json::from_str(
+            r#"{"source_lang":"zh","target_lang":"en","world_override":null,"tone":"standard"}"#,
+        )
+        .unwrap();
+        assert!(p.glossary_first);
+    }
 
     #[test]
     fn tone_for_world_maps_martial_worlds() {
@@ -197,6 +215,7 @@ mod tests {
             world_override: Some(WorldType::Wuxia),
             tone: Tone::Comedic,
             selected_files: vec!["a.ass".into()],
+            glossary_first: false,
         };
         set_prefs(&mut c, "/x", p.clone());
         assert_eq!(get_prefs(&c, "/x"), Some(p.clone()));
