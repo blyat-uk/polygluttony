@@ -24,6 +24,12 @@ last_change: GlossaryChange | null,
  */
 scanned_files: Array<string>, 
 /**
+ * The glossary also has terms from episodes it has no record of: it was
+ * made before PG kept track, or imported. `None` in a record from before
+ * this field, where it holds when no episodes are on record.
+ */
+untracked: boolean | null, 
+/**
  * Show name for Look up names online, remembered per folder.
  */
 show_name: string | null, };

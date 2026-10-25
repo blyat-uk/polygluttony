@@ -67,7 +67,14 @@ export function refOfKey(key: string): TermRef {
 }
 
 export function emptyMeta(): GlossaryMeta {
-  return { origins: {}, unreviewed: {}, last_change: null, scanned_files: [], show_name: null };
+  return {
+    origins: {},
+    unreviewed: {},
+    last_change: null,
+    scanned_files: [],
+    show_name: null,
+    untracked: null,
+  };
 }
 
 /** Code-point order, close to the engine's BTreeMap order. */

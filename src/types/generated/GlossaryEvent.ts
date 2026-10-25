@@ -9,5 +9,6 @@ import type { TermHit } from "./TermHit";
  * result (e.g. final save IO failure); pre-flight failures surface as command
  * errors, not events. `FileChanged` comes from the O15 watcher. `Terms` streams
  * each batch's newly-found terms during extraction (some batches yield none).
+ * `FileRead` says a build has been through every batch of one episode.
  */
-export type GlossaryEvent = { "kind": "phase", phase: GlossaryPhase, detail: string | null, } | { "kind": "progress", done: number, total: number, } | { "kind": "terms", batch: number, hits: Array<TermHit>, } | { "kind": "log", level: LogLevel, message: string, } | { "kind": "done", summary: GlossaryBuildSummary, } | { "kind": "error", message: string, } | { "kind": "file_changed" };
+export type GlossaryEvent = { "kind": "phase", phase: GlossaryPhase, detail: string | null, } | { "kind": "progress", done: number, total: number, } | { "kind": "terms", batch: number, hits: Array<TermHit>, } | { "kind": "file_read", file: string, } | { "kind": "log", level: LogLevel, message: string, } | { "kind": "done", summary: GlossaryBuildSummary, } | { "kind": "error", message: string, } | { "kind": "file_changed" };
