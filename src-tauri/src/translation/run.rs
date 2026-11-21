@@ -85,6 +85,8 @@ pub struct StartArgs {
     pub target_lang: String,
     /// Carry on from the stored partial translations of stopped files.
     pub resume: bool,
+    /// Styles written as they are (the folder's "Lines to translate").
+    pub kept_styles: Vec<String>,
 }
 
 /// Verify on Translate's model with Translate's settings shares Translate's
@@ -219,10 +221,14 @@ fn reset_board<'a>(
     app: &AppHandle,
     folder: &Path,
     files: &[String],
+    kept_styles: &std::collections::BTreeSet<String>,
     primed: impl IntoIterator<Item = (&'a String, &'a BTreeMap<u32, String>)>,
 ) {
     let board = app.state::<LiveBoard>();
     board.reset(folder, files);
+    for file in files {
+        board.keep_styles(file, kept_styles);
+    }
     for (file, translations) in primed {
         board.prime(
             file,
@@ -248,6 +254,7 @@ pub struct RunMeta {
     pub source_lang: String,
     pub target_lang: String,
     pub tone: Tone,
+    pub kept_styles: Vec<String>,
 }
 
 /// Pure: store how a file ended. Done and needs-a-look keep their issues and
@@ -287,6 +294,7 @@ pub fn store_outcome(
             total_lines: result.total_lines,
             translations: outcome.translations.clone(),
             output_hash: outcome.output_hash.clone(),
+            kept_styles: meta.kept_styles.clone(),
         }),
         _ => None,
     };
@@ -488,10 +496,12 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
     let pair = LanguagePair::from_codes(&args.source_lang, &args.target_lang)?;
     let prompts = prompts(&app, &pair, args.tone)?;
     let store = ResultsStore::for_app(&app)?;
+    let kept_styles: std::collections::BTreeSet<String> = args.kept_styles.iter().cloned().collect();
     let meta = RunMeta {
         source_lang: pair.source.clone(),
         target_lang: pair.target.clone(),
         tone: args.tone,
+        kept_styles: kept_styles.iter().cloned().collect(),
     };
 
     *guard = Some(RunHandle {
@@ -516,6 +526,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
             &app,
             &folder,
             &args.files,
+            &kept_styles,
             seeds.iter().map(|(f, s)| (f, &s.translations)),
         );
     }
@@ -561,11 +572,12 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&name);
-            let (stop, glossary, prompts, pair) = (
+            let (stop, glossary, prompts, pair, kept_styles) = (
                 stop.clone(),
                 glossary.clone(),
                 prompts.clone(),
                 pair.clone(),
+                kept_styles.clone(),
             );
             let (store, folder, meta, app, folder_arg) = (
                 store.clone(),
@@ -587,6 +599,7 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
                     stop: stop.clone(),
                     tx,
                     seed,
+                    kept_styles,
                 })
                 .await;
                 if let Err(e) = store_outcome(&store, &folder, &outcome, &meta, &stop) {
@@ -671,8 +684,14 @@ fn store_review(
         if let Some(lines) = lines {
             lines.translations = outcome.translations.clone();
             lines.output_hash = outcome.output_hash.clone();
+            lines.total_lines = outcome.result.total_lines;
         }
-        record.issues.retain(|i| !fixed.contains(&i.line_id));
+        // Counted by the plan: a 3.0 record counted every line of the file.
+        record.total_lines = outcome.result.total_lines;
+        // The output was rewritten: issues on lines that aren't sent are settled.
+        record.issues.retain(|i| {
+            !fixed.contains(&i.line_id) && (i.line_id == 0 || outcome.sent.contains(&i.line_id))
+        });
         let rechecked: Vec<_> =
             outcome.result.issues.iter().filter(|i| fixed.contains(&i.line_id)).cloned().collect();
         crate::translation::verify::insert_by_line(&mut record.issues, rechecked);
@@ -747,6 +766,7 @@ pub async fn start_review(
         }
     };
     for (file, (plan, _, _)) in &plans {
+        board.keep_styles(file, &plan.lines.kept());
         board.prime(
             file,
             plan.lines.translations.iter().map(|(id, t)| (*id, strip_for_text(t))),
@@ -796,6 +816,7 @@ pub async fn start_review(
                             source_hash: plan.lines.source_hash.clone(),
                             translations: plan.lines.translations.clone(),
                         }),
+                        kept_styles: plan.lines.kept(),
                     },
                     line_ids: plan.line_ids,
                     output_name: plan.output_name,
@@ -874,6 +895,7 @@ mod tests {
             source_lang: "zh".into(),
             target_lang: "en".into(),
             tone: Tone::Xianxia,
+            kept_styles: Vec::new(),
         }
     }
 
@@ -1136,6 +1158,8 @@ mod tests {
             issue(2, "meaning", None),
             issue(3, "untranslated", None),
         ];
+        // Stored by 3.0, which counted every line of the file.
+        look.result.total_lines = 10;
         store_outcome(&store, folder.path(), &look, &meta(), &RunStop::default()).unwrap();
 
         let review = ReviewOutcome {
@@ -1153,6 +1177,7 @@ mod tests {
             retranslated: vec![1, 2],
             output_hash: Some("h".into()),
             failed: None,
+            sent: (1..=3).collect(),
         };
         store_review(&store, folder.path(), "look.ass", &review).unwrap();
         let record = store.record(folder.path(), "look.ass").unwrap();
@@ -1162,6 +1187,8 @@ mod tests {
         let lines = store.lines(folder.path(), "look.ass").unwrap();
         assert_eq!(lines.translations[&1], "Listen to me.");
         assert_eq!(lines.output_hash.as_deref(), Some("h"));
+        // The review's count of lines to translate replaces the stored one.
+        assert_eq!((record.total_lines, record.translated_lines, lines.total_lines), (3, 2, 3));
     }
 
     #[tokio::test]

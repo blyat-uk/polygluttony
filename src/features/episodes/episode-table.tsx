@@ -39,6 +39,7 @@ import { leftoverNote } from "./episode-status";
 import { collapseQuietRuns } from "./collapse-rows";
 import { episodeName } from "./folder-labels";
 import { toggleOne } from "./selection";
+import { linesToTranslate } from "./lines";
 
 /** Open an episode's window (or focus it), optionally on one line. */
 export function openEpisode(file: string, folder: string, line?: number) {
@@ -67,6 +68,7 @@ const DETAIL_TONE: Record<EpisodeStatus["detailTone"], string> = {
 export function EpisodeTable({
   folder,
   files,
+  kept,
   selected,
   onSelect,
   statusOf,
@@ -76,6 +78,8 @@ export function EpisodeTable({
 }: {
   folder: string;
   files: SourceFile[];
+  /** The folder's styles kept as they are: the Lines column leaves them out. */
+  kept: readonly string[];
   selected: string[];
   onSelect: (next: string[]) => void;
   statusOf: (name: string) => EpisodeStatus;
@@ -120,7 +124,12 @@ export function EpisodeTable({
               />
             </th>
             <th className="px-3 py-2 text-left font-medium">Episode</th>
-            <th className="w-20 px-3 py-2 text-right font-medium">Lines</th>
+            <th
+              className="w-20 px-3 py-2 text-right font-medium"
+              title="Lines to translate: a sign repeated frame by frame counts once; song effects and kept styles don’t count"
+            >
+              Lines
+            </th>
             <th className="w-[42%] px-3 py-2 text-left font-medium">Status</th>
             <th className="w-36 py-2 pr-3" />
           </tr>
@@ -177,7 +186,7 @@ export function EpisodeTable({
                     ) : null}
                   </td>
                   <td className="px-3 py-2 text-right text-[12px] text-muted-foreground tabular-nums">
-                    {f.dialogue_count.toLocaleString()}
+                    {linesToTranslate(f, kept).toLocaleString()}
                   </td>
                   <td className="min-w-0 px-3 py-2" onClick={(e) => e.stopPropagation()}>
                     <div className="flex min-w-0 items-center gap-2">

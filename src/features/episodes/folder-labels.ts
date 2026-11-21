@@ -2,6 +2,7 @@ import type { Language } from "@/types/generated/Language";
 import type { ProjectView } from "@/types/generated/ProjectView";
 import type { Tone } from "@/types/generated/Tone";
 import type { WorldType } from "@/types/generated/WorldType";
+import { keptSummary } from "./lines-to-translate";
 
 /** Tones in product order (not alphabetical). */
 export const TONES: Tone[] = ["standard", "xianxia", "wuxia", "comedic", "funny"];
@@ -23,9 +24,9 @@ export const toneAfterWorldChange = (tone: Tone, from: WorldType, to: WorldType)
 export const languageName = (languages: Language[] | undefined, code: string) =>
   languages?.find((l) => l.code === code)?.name ?? code;
 
-/** "Chinese → English · World type: Xianxia · Tone: Xianxia · Glossary 232 terms".
- *  World only shows when the source language detects one; the glossary part
- *  only when the source language supports a glossary. */
+/** "Chinese → English · World type: Xianxia · Tone: Xianxia · Signs kept as they are".
+ *  World only shows when the source language detects one; the kept styles
+ *  only when some are unticked under Lines to translate. */
 export function settingsSummary(view: ProjectView, languages: Language[] | undefined): string {
   const { prefs } = view;
   const source = languages?.find((l) => l.code === prefs.source_lang);
@@ -36,6 +37,8 @@ export function settingsSummary(view: ProjectView, languages: Language[] | undef
     parts.push(`World type: ${titleCase(prefs.world_override ?? view.detected_world)}`);
   }
   parts.push(`Tone: ${titleCase(prefs.tone)}`);
+  const kept = keptSummary(view);
+  if (kept) parts.push(kept);
   return parts.join(" · ");
 }
 

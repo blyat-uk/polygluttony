@@ -23,7 +23,8 @@ Polygluttony translates `.ass` subtitle files with the AI model you connect, whi
 
 - **Line markers & partial-failure recovery** — every line is tracked, so when a model drops, merges, or reorders lines, Polygluttony detects exactly where it broke and salvages the correct prefix instead of failing the whole batch.
 - **Drift detection** — after each episode, a five-signal weighted check and an AI spot-check catch translations wandering off the source, and only the lines that drifted are retranslated.
-- **Your typesetting stays put** — override tags like `{\pos}` and `{\an8}` are lifted out before translating and put back after, and styles, timings and script info are copied from your file. Only the dialogue is translated.
+- **Your typesetting stays put** — override tags like `{\pos}` and `{\an8}` are lifted out before translating and put back after, and styles, timings and script info are copied from your file. Only the words are translated.
+- **Only the lines that need it** — a sign tracked frame by frame is translated once and every frame gets it; karaoke effects, drawings and empty lines are never sent. Untick a style, such as the signs, to keep it as it is.
 - **Cross-episode glossary** — for Chinese sources, a six-category glossary, with auto-detected world type (xianxia / wuxia / historical / modern), keeps names and terms consistent across a whole season. It's built as part of translating and grows with each new episode; edit it in place, with undo and earlier versions to go back to.
 - **Verification, not a score** — every file checks its own work and lists the lines that need a look, never a number. Fix them in the episode's own window: retranslate a line, edit it, or correct the name in the glossary.
 - **Your choice of model** — Anthropic, OpenAI, Google, a local model through Ollama or LM Studio, or any OpenAI- or Anthropic-compatible endpoint. One model for everything, or a different one per step.

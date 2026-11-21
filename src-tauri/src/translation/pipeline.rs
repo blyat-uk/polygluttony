@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 
 use crate::ass::decode::decode_file;
 use crate::ass::parse::{parse_dialogues, DialogueLine};
+use crate::ass::plan::LinePlan;
 use crate::ass::tags::strip_for_text;
 use crate::config::Step;
 use crate::events::{
@@ -76,6 +77,10 @@ const SCOPE_PADDING: u32 = 5;
 /// anything beyond folds into one aggregate entry.
 const MAX_UNTRANSLATED_ISSUES: usize = 10;
 
+/// Why a file with lines fails when none of them go to the model.
+pub const NOTHING_TO_TRANSLATE: &str = "Nothing in this file is left to translate: its lines are song \
+     effects, drawings, or styles this folder keeps as they are.";
+
 /// What an untranslated line's issue says.
 pub const UNTRANSLATED_DESCRIPTION: &str =
     "This line couldn't be translated and was left out of the file.";
@@ -101,6 +106,9 @@ pub struct FileJob<'a> {
     /// Translations an earlier run left for this file. Used only when they
     /// belong to the source as it is now; only the missing lines are sent.
     pub seed: Option<Seed>,
+    /// Styles written as they are, never sent (the folder's "Lines to
+    /// translate"; for a review, the ones the episode was translated with).
+    pub kept_styles: BTreeSet<String>,
 }
 
 /// Stored translations to start from.
@@ -206,14 +214,17 @@ fn scopes_for(report: &VerifyReport, all_ids: &[u32]) -> Vec<Scope> {
     compute_scopes(all_ids, &report.failed_line_ids, all_ids, SCOPE_PADDING)
 }
 
-/// Pure: the lines a reviewer asked for, as scopes of adjacent ids. Each
-/// scope's context is the translated lines just before it.
-pub fn review_scopes(ids: &[u32]) -> Vec<Scope> {
+/// Pure: the lines a reviewer asked for, as scopes of lines next to each
+/// other among `sent` (the ids that go to the model, in order: repeats and
+/// kept lines between two of them don't split a scope). Each scope's context
+/// is the translated lines just before it.
+pub fn review_scopes(ids: &[u32], sent: &[u32]) -> Vec<Scope> {
     let sorted: BTreeSet<u32> = ids.iter().copied().collect();
+    let next: BTreeMap<u32, u32> = sent.windows(2).map(|w| (w[0], w[1])).collect();
     let mut scopes: Vec<Scope> = Vec::new();
     for id in sorted {
         match scopes.last_mut() {
-            Some(s) if s.end_line + 1 == id => {
+            Some(s) if next.get(&s.end_line) == Some(&id) => {
                 s.end_line = id;
                 s.context_end = id;
             }
@@ -228,6 +239,8 @@ pub fn review_scopes(ids: &[u32]) -> Vec<Scope> {
 struct FileState<'j, 'a> {
     job: &'j FileJob<'a>,
     lines: Vec<DialogueLine>,
+    /// Which lines go to the model; `translations` only ever holds those.
+    plan: LinePlan,
     /// id → tagged translation (ASS override tags reapplied).
     translations: BTreeMap<u32, String>,
     /// Carryover context for the batch loop: (stripped src, stripped tgt),
@@ -243,9 +256,11 @@ struct FileState<'j, 'a> {
 
 impl<'j, 'a> FileState<'j, 'a> {
     fn new(job: &'j FileJob<'a>, lines: Vec<DialogueLine>) -> Self {
+        let plan = LinePlan::new(&lines, &job.kept_styles);
         Self {
             job,
             lines,
+            plan,
             translations: BTreeMap::new(),
             context: Vec::new(),
             retries: 0,
@@ -259,39 +274,52 @@ impl<'j, 'a> FileState<'j, 'a> {
         }
     }
 
-    /// The stored translations that fit this file's lines.
+    /// The stored translations that fit this file's lines: those of lines
+    /// that go to the model now.
     fn valid(&self, stored: &BTreeMap<u32, String>) -> BTreeMap<u32, String> {
-        let last = self.lines.len() as u32;
-        stored
-            .iter()
-            .filter(|(id, _)| (1..=last).contains(*id))
-            .map(|(id, t)| (*id, t.clone()))
-            .collect()
+        self.plan.own(stored)
+    }
+
+    /// How many lines go to the model.
+    fn total(&self) -> usize {
+        self.plan.translate_count()
+    }
+
+    /// The board's lines: the ones that go to the model.
+    async fn announce_lines(&self) {
+        self.emit(RunEvent::EpisodeLines {
+            file: self.job.file_name.clone(),
+            lines: episode_sources(&self.lines, &self.plan),
+            file_lines: self.lines.len() as u32,
+        })
+        .await;
     }
 
     async fn run(&mut self, original: &str) -> Result<Finished, FileError> {
         let job = self.job;
         // 1. Parse.
-        self.emit(RunEvent::EpisodeLines {
-            file: job.file_name.clone(),
-            lines: episode_sources(&self.lines),
-        })
-        .await;
+        self.announce_lines().await;
         if !self.translations.is_empty() {
             let kept: Vec<u32> = self.translations.keys().copied().collect();
             self.landed(&kept).await;
             self.log(
                 LogLevel::Info,
                 LogPhase::Parse,
-                format!("carrying on: {} of {} lines already translated", kept.len(), self.lines.len()),
+                format!("carrying on: {} of {} lines already translated", kept.len(), self.total()),
             )
             .await;
         }
         self.state(FileStateKind::Translating, None).await;
-        self.log(LogLevel::Info, LogPhase::Parse, format!("{} dialogue lines", self.lines.len())).await;
+        self.log(LogLevel::Info, LogPhase::Parse, self.parse_summary()).await;
         if self.lines.is_empty() {
             return Err(FileError::Failed {
                 message: "This file has no dialogue lines.".into(),
+                kind: ErrorKind::Other,
+            });
+        }
+        if self.total() == 0 {
+            return Err(FileError::Failed {
+                message: NOTHING_TO_TRANSLATE.into(),
                 kind: ErrorKind::Other,
             });
         }
@@ -305,7 +333,7 @@ impl<'j, 'a> FileState<'j, 'a> {
         self.run_cleanup(detector.as_ref()).await?;
 
         // 4. Verify + scoped retranslation loop (`translator.py:176-311`).
-        let all_ids: Vec<u32> = (1..=self.lines.len() as u32).collect();
+        let all_ids: Vec<u32> = self.plan.translate_ids();
         let mut issues: Vec<VerifyIssue> = Vec::new();
         let mut has_warnings = false;
         for attempt in 1..=MAX_RETRANSLATION_ATTEMPTS {
@@ -401,7 +429,7 @@ impl<'j, 'a> FileState<'j, 'a> {
         insert_by_line(&mut issues, name_issues(&self.stripped_pairs(), &job.glossary.all_terms()));
 
         // 5. Final write.
-        let untranslated = self.lines.len() - self.translations.len();
+        let untranslated = self.total().saturating_sub(self.translations.len());
         has_warnings |= untranslated > 0 || !issues.is_empty();
 
         // Warning-only files (untranslated lines, no verify issues) must still be
@@ -409,7 +437,9 @@ impl<'j, 'a> FileState<'j, 'a> {
         // (capped) AFTER the real verify issues, plus an aggregate overflow entry.
         // FileDone and FileResult share this vec, so both stay identical.
         if untranslated > 0 {
-            let missing: Vec<u32> = (1..=self.lines.len() as u32)
+            let missing: Vec<u32> = all_ids
+                .iter()
+                .copied()
                 .filter(|id| !self.translations.contains_key(id))
                 .collect();
             for id in missing.iter().take(MAX_UNTRANSLATED_ISSUES) {
@@ -451,7 +481,8 @@ impl<'j, 'a> FileState<'j, 'a> {
     }
 
     /// Write every translated line next to the source, and remove the other
-    /// variant (clean or `.warning`) of the output. Untranslated lines are
+    /// variant (clean or `.warning`) of the output. Repeats take their run's
+    /// translation, kept lines go in as they are; untranslated lines are
     /// dropped, not written back as source text (spec). Returns the path and
     /// the fingerprint of what was written.
     fn write_output(&self, original: &str, name: &str) -> Result<(PathBuf, String), FileError> {
@@ -459,18 +490,7 @@ impl<'j, 'a> FileState<'j, 'a> {
             Some(parent) => parent.join(name),
             None => PathBuf::from(name),
         };
-        let out_lines: Vec<DialogueLine> = self
-            .lines
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, d)| {
-                self.translations.get(&(idx as u32 + 1)).map(|t| {
-                    let mut d = d.clone();
-                    d.text = t.clone();
-                    d
-                })
-            })
-            .collect();
+        let out_lines = self.plan.output_lines(&self.lines, &self.translations);
         let hash = output::write(&self.job.input, &self.job.pair, name, original, &out_lines).map_err(|e| {
             FileError::Failed { message: format!("Couldn't write {name}: {e}"), kind: ErrorKind::Other }
         })?;
@@ -480,7 +500,7 @@ impl<'j, 'a> FileState<'j, 'a> {
     /// Send the file's last events and say how it ended.
     async fn finish(self, result: Result<Finished, FileError>, source_hash: Option<String>) -> FileOutcome {
         let file = self.job.file_name.clone();
-        let total_lines = self.lines.len() as u32;
+        let total_lines = self.total() as u32;
         let translated_lines = self.translations.len() as u32;
         match result {
             Ok(f) => {
@@ -588,6 +608,20 @@ impl<'j, 'a> FileState<'j, 'a> {
         &self.lines[(id - 1) as usize].text
     }
 
+    /// What the parse found, for the log.
+    fn parse_summary(&self) -> String {
+        let all = self.lines.len();
+        let total = self.total();
+        if total == all {
+            return format!("{all} dialogue lines");
+        }
+        format!(
+            "{all} dialogue lines: {total} to translate, {} repeat a sign, {} kept as they are",
+            self.plan.repeat_count(),
+            self.plan.kept_count()
+        )
+    }
+
     async fn emit(&self, event: RunEvent) {
         let _ = self.job.tx.send(event).await;
     }
@@ -610,7 +644,7 @@ impl<'j, 'a> FileState<'j, 'a> {
         self.emit(RunEvent::Progress {
             file: self.job.file_name.clone(),
             translated: self.translations.len() as u32,
-            total: self.lines.len() as u32,
+            total: self.total() as u32,
             batch,
             total_batches,
             retries: self.retries,
@@ -662,7 +696,10 @@ impl<'j, 'a> FileState<'j, 'a> {
     /// ≤7 translated pairs forward as context. Also serves the full-redo path
     /// (caller clears `translations` first) and Resume (seeded lines skip).
     async fn translate_all(&mut self) -> Result<(), FileError> {
-        let mut pending: Vec<u32> = (1..=self.lines.len() as u32)
+        let mut pending: Vec<u32> = self
+            .plan
+            .translate_ids()
+            .into_iter()
             .filter(|id| !self.translations.contains_key(id))
             .collect();
         let mut batch_size = initial_batch_size(self.job.batch_limit);
@@ -818,10 +855,9 @@ impl<'j, 'a> FileState<'j, 'a> {
         let Some(det) = detector else { return Ok(()) };
         self.state(FileStateKind::Cleanup, None).await;
         let sources: BTreeMap<u32, String> = self
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(idx, d)| (idx as u32 + 1, d.text.clone()))
+            .translations
+            .keys()
+            .map(|id| (*id, self.raw_text(*id).to_string()))
             .collect();
         // The same dirty set `cleanup_pass` computes, so the live board can
         // show the request it is about to make. Over the cap it sends nothing.
@@ -899,8 +935,10 @@ impl<'j, 'a> FileState<'j, 'a> {
             context.drain(..context.len() - CONTEXT_CARRYOVER_LINES);
         }
         let last_id = self.lines.len() as u32;
+        // Only the lines that go to the model: a scope's range also spans the
+        // repeats and kept lines between them.
         let raw: Vec<(u32, String)> = (scope.start_line..=scope.end_line)
-            .filter(|id| *id >= 1 && *id <= last_id)
+            .filter(|id| *id >= 1 && *id <= last_id && self.plan.translates(*id))
             .map(|id| (id, self.raw_text(id).to_string()))
             .collect();
         let mut landed = Vec::new();
@@ -983,6 +1021,9 @@ pub struct ReviewOutcome {
     /// Why nothing could be done (unreadable or changed source, a write
     /// error), as one plain sentence. Nothing was written or stored.
     pub failed: Option<String>,
+    /// The lines that go to the model: once the output is rewritten, issues
+    /// on any other line (stored by 3.0, which sent them all) are settled.
+    pub sent: BTreeSet<u32>,
 }
 
 /// Retranslate just `line_ids`, each run of adjacent lines as one scope with
@@ -999,7 +1040,7 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
         result: FileResult {
             file: job.file_name.clone(),
             success: false,
-            total_lines: st.lines.len() as u32,
+            total_lines: st.total() as u32,
             translated_lines: 0,
             has_warnings: review.needs_look,
             issues: review.issues.clone(),
@@ -1009,6 +1050,7 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
         retranslated: Vec::new(),
         output_hash: None,
         failed: Some(message),
+        sent: BTreeSet::new(),
     };
     // However it goes, the episode ends where it started: its output stays.
     let prior_state = if review.needs_look { FileStateKind::Warning } else { FileStateKind::Done };
@@ -1044,14 +1086,13 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
     };
     st.translations = st.valid(&seed.translations);
 
-    st.emit(RunEvent::EpisodeLines { file: job.file_name.clone(), lines: episode_sources(&st.lines) })
-        .await;
+    st.announce_lines().await;
     let kept: Vec<u32> = st.translations.keys().copied().collect();
     st.landed(&kept).await;
 
-    let last = st.lines.len() as u32;
-    let ids: Vec<u32> = review.line_ids.iter().copied().filter(|id| (1..=last).contains(id)).collect();
-    let scopes = review_scopes(&ids);
+    let sent = st.plan.translate_ids();
+    let ids: Vec<u32> = review.line_ids.iter().copied().filter(|id| st.plan.translates(*id)).collect();
+    let scopes = review_scopes(&ids, &sent);
     let detail = match ids.len() {
         1 => format!("line {}", ids[0]),
         n => format!("{n} lines"),
@@ -1091,6 +1132,9 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
             Ok((path, hash)) => {
                 output_path = Some(path.display().to_string());
                 output_hash = Some(hash);
+                // Repeats now read their line's translation and kept lines
+                // are written as they are: issues on them are settled.
+                issues.retain(|i| i.line_id == 0 || st.plan.translates(i.line_id));
             }
             Err(FileError::Failed { message, kind }) => {
                 st.emit(RunEvent::Error { file: job.file_name.clone(), message: message.clone(), error_kind: kind })
@@ -1112,12 +1156,13 @@ async fn review_in_scope(review: ReviewJob<'_>) -> ReviewOutcome {
         result: FileResult {
             file: job.file_name.clone(),
             success: true,
-            total_lines: last,
+            total_lines: st.total() as u32,
             translated_lines: st.translations.len() as u32,
             has_warnings: review.needs_look,
             issues,
             output_path,
         },
+        sent: st.plan.translate_ids().into_iter().collect(),
         translations: st.translations,
         retranslated,
         output_hash,
@@ -1184,6 +1229,18 @@ mod tests {
         seed: Option<Seed>,
         glossary: &Glossary,
     ) -> Ran {
+        run_kept(dir, source, responses, seed, glossary, &[]).await
+    }
+
+    /// `run_in` with styles the folder keeps as they are.
+    async fn run_kept(
+        dir: tempfile::TempDir,
+        source: &str,
+        responses: Vec<Result<String, crate::llm::error::LlmError>>,
+        seed: Option<Seed>,
+        glossary: &Glossary,
+        kept: &[&str],
+    ) -> Ran {
         let driver = ScriptedDriver::new(responses);
         let (tx, mut rx) = mpsc::channel(256);
         let stop = RunStop::default();
@@ -1209,6 +1266,7 @@ mod tests {
             stop: stop.clone(),
             tx: tx.clone(),
             seed,
+            kept_styles: kept.iter().map(|s| s.to_string()).collect(),
         })
         .await;
 
@@ -1229,6 +1287,159 @@ mod tests {
         // Return `dir` so callers keep it alive for as long as needed (e.g.
         // reading the output file). Bind to `_dir` when not needed.
         (ran.outcome.result, ran.events, ran.driver, ran.dir)
+    }
+
+    /// A typeset episode: two spoken lines, a sign tracked over two frames
+    /// plus its border layer, a karaoke syllable and an empty song line.
+    const TYPESET: &str = "[Script Info]\nTitle: t\n\n[Events]\n\
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,Fern,0,0,0,,你好\n\
+Dialogue: 2,0:00:01.00,0:00:01.04,Signs,,0,0,0,,{=8}{\\fnHiroshige\\pos(10,10)}城门\n\
+Dialogue: 2,0:00:01.04,0:00:01.08,Signs,,0,0,0,,{=8}{\\fnHiroshige\\pos(11,10)}城门\n\
+Dialogue: 1,0:00:01.00,0:00:01.04,Signs,,0,0,0,,{=8}{\\fnHiroshige\\bord3\\pos(10,10)}城门\n\
+Dialogue: 0,0:00:00.00,0:00:03.00,OP-R,,0,0,0,fx,{\\an5\\pos(1,1)}ka\n\
+Dialogue: 0,0:00:00.00,0:00:03.00,OP-R,,0,0,0,,\n\
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,Stark,0,0,0,,再见\n";
+
+    /// Every id the run sent to the model, in order.
+    fn sent_ids(events: &[RunEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::Sending { ids, .. } => Some(ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn written(result: &FileResult) -> String {
+        std::fs::read_to_string(result.output_path.as_ref().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_the_lines_to_translate_go_to_the_model() {
+        let (result, events, driver, _dir) = run_pipeline(
+            TYPESET,
+            vec![
+                Ok(ok_batch(&[(1, "Hello there friend"), (2, "City gate"), (7, "Goodbye for now")])),
+                Ok(r#"{"issues":[]}"#.into()),
+            ],
+        )
+        .await;
+        assert_eq!(sent_ids(&events), vec![1, 2, 7]);
+        assert_eq!(driver.call_count(), 2, "one batch and one verify");
+        assert!(result.success && !result.has_warnings, "{:?}", result.issues);
+        assert_eq!((result.translated_lines, result.total_lines), (3, 3));
+        let lines = events
+            .iter()
+            .find_map(|e| match e {
+                RunEvent::EpisodeLines { lines, file_lines, .. } => Some((lines.len(), *file_lines)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(lines, (3, 7));
+
+        let out = written(&result);
+        // Every frame and layer of the sign reads the translation, with its own tags.
+        assert!(out.contains("Signs,,0,0,0,,{=8}{\\fnHiroshige\\pos(10,10)}City gate\n"), "{out}");
+        assert!(out.contains("Signs,,0,0,0,,{=8}{\\fnHiroshige\\pos(11,10)}City gate\n"), "{out}");
+        assert!(out.contains("{=8}{\\fnHiroshige\\bord3\\pos(10,10)}City gate\n"), "{out}");
+        // Song effects and empty lines are written as they are.
+        assert!(out.contains("OP-R,,0,0,0,fx,{\\an5\\pos(1,1)}ka\n"), "{out}");
+        assert!(out.contains("Dialogue: 0,0:00:00.00,0:00:03.00,OP-R,,0,0,0,,\n"), "{out}");
+        assert!(out.contains("Hello there friend") && out.contains("Goodbye for now"));
+        assert_eq!(out.matches("Dialogue:").count(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_line_past_id_9999_is_translated() {
+        // A long karaoke-effect OP before the dialogue pushes its id past four digits.
+        let mut src = String::from(
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+        );
+        for _ in 0..10_000 {
+            src.push_str("Dialogue: 0,0:00:00.00,0:00:01.00,OP,,0,0,0,fx,{\\an5}la\n");
+        }
+        src.push_str("Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,你好\n");
+        let (result, events, _, _dir) = run_pipeline(
+            &src,
+            vec![Ok(ok_batch(&[(10_001, "Hello there friend")])), Ok(r#"{"issues":[]}"#.into())],
+        )
+        .await;
+        assert_eq!(sent_ids(&events), vec![10_001]);
+        assert!(result.success && !result.has_warnings, "{:?}", result.issues);
+        assert!(written(&result).contains("Default,,0,0,0,,Hello there friend\n"));
+    }
+
+    #[tokio::test]
+    async fn a_kept_style_is_written_as_it_is() {
+        let ran = run_kept(
+            tempfile::tempdir().unwrap(),
+            TYPESET,
+            vec![
+                Ok(ok_batch(&[(1, "Hello there friend"), (7, "Goodbye for now")])),
+                Ok(r#"{"issues":[]}"#.into()),
+            ],
+            None,
+            &Glossary::default(),
+            &["Signs"],
+        )
+        .await;
+        assert_eq!(sent_ids(&ran.events), vec![1, 7]);
+        let result = &ran.outcome.result;
+        assert!(result.success && !result.has_warnings, "{:?}", result.issues);
+        assert_eq!(result.total_lines, 2);
+        let out = written(result);
+        assert_eq!(out.matches("城门").count(), 3, "{out}");
+        assert!(out.contains("{=8}{\\fnHiroshige\\pos(11,10)}城门\n"));
+    }
+
+    #[tokio::test]
+    async fn a_file_with_nothing_to_translate_fails_plainly() {
+        let ran = run_kept(
+            tempfile::tempdir().unwrap(),
+            TYPESET,
+            vec![],
+            None,
+            &Glossary::default(),
+            &["Default", "Signs"],
+        )
+        .await;
+        assert_eq!(ran.driver.call_count(), 0);
+        assert_eq!(
+            ran.outcome.end,
+            FileEnd::Failed { reason: NOTHING_TO_TRANSLATE.into(), kind: ErrorKind::Other }
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_ignores_stored_lines_that_are_not_sent_any_more() {
+        // A 3.0 run stored every line, the sign's second frame and the
+        // karaoke syllable too; only lines 2 and 7 are missing now.
+        let seed = Seed {
+            source_hash: fingerprint(TYPESET),
+            translations: [
+                (1, "Hello there friend".to_string()),
+                (3, "Stale frame".to_string()),
+                (5, "{\\an5\\pos(1,1)}la".to_string()),
+            ]
+            .into(),
+        };
+        let ran = run_with(
+            TYPESET,
+            vec![
+                Ok(ok_batch(&[(2, "City gate"), (7, "Goodbye for now")])),
+                Ok(r#"{"issues":[]}"#.into()),
+            ],
+            Some(seed),
+        )
+        .await;
+        assert_eq!(sent_ids(&ran.events), vec![2, 7]);
+        let out = written(&ran.outcome.result);
+        assert!(!out.contains("Stale frame") && !out.contains("}la"), "{out}");
+        assert!(out.contains("{=8}{\\fnHiroshige\\pos(11,10)}City gate\n"), "{out}");
+        assert_eq!(ran.outcome.translations.keys().copied().collect::<Vec<_>>(), vec![1, 2, 7]);
     }
 
     #[tokio::test]
@@ -1498,6 +1709,7 @@ mod tests {
             stop,
             tx,
             seed: None,
+            kept_styles: Default::default(),
         })
         .await
         .result;
@@ -1794,6 +2006,7 @@ mod tests {
             stop,
             tx,
             seed: None,
+            kept_styles: Default::default(),
         })
         .await;
         assert!(!outcome.result.success);
@@ -1903,6 +2116,7 @@ mod tests {
             stop: stop.clone(),
             tx,
             seed: None,
+            kept_styles: Default::default(),
         })
         .await;
         drop(svc);
@@ -2040,6 +2254,7 @@ mod tests {
             stop,
             tx,
             seed: None,
+            kept_styles: Default::default(),
         })
         .await;
         drop(svc);
@@ -2073,10 +2288,20 @@ mod tests {
 
     #[test]
     fn review_scopes_group_adjacent_lines() {
-        let scopes = review_scopes(&[9, 3, 4, 4, 12]);
+        let sent: Vec<u32> = (1..=20).collect();
+        let scopes = review_scopes(&[9, 3, 4, 4, 12], &sent);
         let spans: Vec<(u32, u32, u32)> =
             scopes.iter().map(|s| (s.start_line, s.end_line, s.context_start)).collect();
         assert_eq!(spans, [(3, 4, 3), (9, 9, 9), (12, 12, 12)]);
+    }
+
+    #[test]
+    fn review_scopes_skip_lines_that_are_not_sent() {
+        // 5-8 are repeats of a sign or kept lines: 4 and 9 are next to each other.
+        let sent = [1, 2, 3, 4, 9, 10, 12];
+        let scopes = review_scopes(&[4, 9, 12], &sent);
+        let spans: Vec<(u32, u32)> = scopes.iter().map(|s| (s.start_line, s.end_line)).collect();
+        assert_eq!(spans, [(4, 9), (12, 12)]);
     }
 
     /// The output as it is on disk before a review, and as Polygluttony last
@@ -2143,6 +2368,7 @@ mod tests {
                     source_hash: hash,
                     translations: stored.iter().map(|(id, t)| (*id, t.to_string())).collect(),
                 }),
+                kept_styles: Default::default(),
             },
             line_ids: ids,
             output_name: "ep01.warning.eng.ass".into(),
@@ -2190,6 +2416,33 @@ mod tests {
             e,
             RunEvent::State { state: FileStateKind::Retranslating, detail: Some(d), .. } if d == "2 lines"
         )));
+    }
+
+    #[tokio::test]
+    async fn review_of_a_sign_rewrites_its_repeats_and_keeps_the_rest() {
+        let stored = [(1, "Hello there friend"), (2, "{=8}{\\fnHiroshige\\pos(10,10)}City gate"), (7, "Bye")];
+        let (outcome, _, driver, dir) = review(
+            TYPESET,
+            &stored,
+            fingerprint(TYPESET),
+            // 3 is a repeat of 2 and 5 a song effect: neither is sent.
+            vec![2, 3, 5],
+            vec![Ok(ok_batch(&[(2, "Castle gate")]))],
+        )
+        .await;
+        assert!(outcome.failed.is_none());
+        assert_eq!(outcome.retranslated, [2]);
+        assert_eq!(driver.call_count(), 1);
+        let written = std::fs::read_to_string(dir.path().join("ep01.warning.eng.ass")).unwrap();
+        assert!(written.contains("{=8}{\\fnHiroshige\\pos(11,10)}Castle gate\n"), "{written}");
+        assert!(written.contains("{=8}{\\fnHiroshige\\bord3\\pos(10,10)}Castle gate\n"), "{written}");
+        assert!(written.contains("OP-R,,0,0,0,fx,{\\an5\\pos(1,1)}ka\n"), "{written}");
+        assert!(!written.contains("City gate"));
+        assert_eq!(written.matches("Dialogue:").count(), 7);
+        // Line 2 was rewritten and line 4 (a karaoke syllable) is written as
+        // it is now: only line 1's issue is left.
+        assert_eq!(outcome.result.issues.iter().map(|i| i.line_id).collect::<Vec<_>>(), [1]);
+        assert_eq!(outcome.sent, [1, 2, 7].into());
     }
 
     #[tokio::test]
@@ -2340,6 +2593,7 @@ mod tests {
                     source_hash: fingerprint(&src),
                     translations: [(1, "Listen.".to_string()), (2, "Go.".to_string())].into(),
                 }),
+                kept_styles: Default::default(),
             },
             line_ids: vec![1, 2],
             output_name: "ep01.warning.eng.ass".into(),

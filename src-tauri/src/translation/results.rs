@@ -83,6 +83,17 @@ pub struct StoredLines {
     /// results stored before this was kept, and while there's no output.
     #[serde(default)]
     pub output_hash: Option<String>,
+    /// The styles written as they are when this was translated (the folder's
+    /// "Lines to translate" then). Empty for results stored before 3.1.
+    #[serde(default)]
+    pub kept_styles: Vec<String>,
+}
+
+impl StoredLines {
+    /// [`StoredLines::kept_styles`] as the line plan takes them.
+    pub fn kept(&self) -> std::collections::BTreeSet<String> {
+        self.kept_styles.iter().cloned().collect()
+    }
 }
 
 /// Stable 64-bit FNV-1a, hex. Unlike `DefaultHasher` it never changes
@@ -323,6 +334,7 @@ mod tests {
             total_lines: 2,
             translations: [(1, "{\\an8}One".to_string()), (2, "Two".to_string())].into(),
             output_hash: None,
+            kept_styles: Vec::new(),
         }
     }
 

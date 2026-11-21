@@ -4,7 +4,17 @@ import type { TranslationState } from "./TranslationState";
 /**
  * One discovered source file.
  */
-export type SourceFile = { path: string, name: string, dialogue_count: number, 
+export type SourceFile = { path: string, name: string, 
+/**
+ * Every dialogue line of the file.
+ */
+dialogue_count: number, 
+/**
+ * Style → lines to translate with that style ticked: repeats of a sign
+ * count once; song effects, drawings and lines with no words never
+ * count. The lines a run sends are the sum over the ticked styles.
+ */
+style_lines: { [key in string]: number }, 
 /**
  * Any translation output exists (clean or `.warning`).
  */

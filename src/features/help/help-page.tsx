@@ -313,9 +313,23 @@ function BehindTheScenes() {
             </>
           }
         >
-          Only the dialogue is translated. Styles, timings and positioning come back as they were,
+          Only the words are translated. Styles, timings and positioning come back as they were,
           and tags inside a line go back at the same relative spot. Embedded fonts and comment lines
           aren’t copied over.
+        </Explainer>
+
+        <Explainer
+          title="It sends only the lines that need translating"
+          example={
+            <>
+              e.g. a sign that moves across the screen can be hundreds of lines, one per frame. It’s
+              translated once and every frame gets that translation, each in its own position.
+            </>
+          }
+        >
+          Karaoke song effects, drawings and lines with no words stay as they are and are never
+          sent. To keep a whole style as it is, such as the signs, untick it under{" "}
+          <span className="font-semibold text-foreground">Episodes ▸ Edit ▸ Lines to translate</span>.
         </Explainer>
       </div>
     </Section>
@@ -357,6 +371,18 @@ const TROUBLE: {
       </>
     ),
     links: [{ to: "/glossary", label: "Glossary" }],
+  },
+  {
+    q: "Some lines in the translated file are still in the original language",
+    a: (
+      <>
+        Song effects (karaoke), drawings and lines with no words are always kept as they are, and
+        so is any style you unticked under{" "}
+        <span className="font-semibold text-foreground">Episodes ▸ Edit ▸ Lines to translate</span>.
+        Tick the style there and translate the episode again.
+      </>
+    ),
+    links: [{ to: "/episodes", label: "Episodes" }],
   },
   {
     q: "A batch failed or some lines came back wrong",

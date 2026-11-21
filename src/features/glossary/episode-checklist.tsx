@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { SourceFile } from "@/types/generated/SourceFile";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn, plural } from "@/lib/utils";
+import { linesToTranslate } from "@/features/episodes/lines";
 import { episodes } from "./episodes";
 
 /**
@@ -11,6 +12,7 @@ import { episodes } from "./episodes";
  */
 export function EpisodeChecklist({
   files,
+  kept,
   selected,
   onChange,
   tag,
@@ -18,6 +20,8 @@ export function EpisodeChecklist({
   className,
 }: {
   files: SourceFile[];
+  /** The folder's styles kept as they are: their lines aren't read. */
+  kept: readonly string[];
   selected: string[];
   onChange: (names: string[]) => void;
   /** A muted note at the end of a row, e.g. "in glossary". */
@@ -57,7 +61,7 @@ export function EpisodeChecklist({
               <span className="min-w-0 flex-1 truncate text-foreground">{f.name}</span>
               {tag ? <span className="shrink-0 text-[10.5px] text-muted-foreground">{tag(f)}</span> : null}
               <span className="w-16 shrink-0 text-right text-[10.5px] tabular-nums text-muted-foreground">
-                {plural(f.dialogue_count, "line")}
+                {plural(linesToTranslate(f, kept), "line")}
               </span>
             </label>
           </li>

@@ -4,14 +4,15 @@
 //! subtitle folder, so it's testable without Tauri; the commands add the
 //! run-slot checks and the events.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::ass::decode::decode_file;
-use crate::ass::parse::{parse_dialogues, DialogueLine};
+use crate::ass::parse::parse_dialogues;
+use crate::ass::plan::{LinePlan, Role};
 use crate::ass::tags::{reapply, reapply_missing, strip_for_text, strip_positional};
 use crate::error::{AppError, AppResult};
-use crate::events::{EpisodeLine, EpisodeSnapshot, EpisodeView, FileStateKind, LineStatus};
+use crate::events::{EpisodeLine, EpisodeSnapshot, EpisodeView, FileStateKind, LineStatus, VerifyIssue};
 use crate::models::language_pair::{output_filename, warning_filename, LanguagePair};
 use crate::translation::live::episode_sources;
 use crate::glossary::io::load_folder_glossary;
@@ -33,7 +34,14 @@ fn other(message: impl Into<String>) -> AppError {
 struct Source {
     text: String,
     hash: String,
-    lines: Vec<DialogueLine>,
+    lines: Vec<crate::ass::parse::DialogueLine>,
+}
+
+impl Source {
+    /// Which of its lines go to the model, with these kept styles.
+    fn plan(&self, kept: &BTreeSet<String>) -> LinePlan {
+        LinePlan::new(&self.lines, kept)
+    }
 }
 
 fn read_source(folder: &Path, file: &str) -> AppResult<Source> {
@@ -53,10 +61,16 @@ fn state_of(outcome: EpisodeOutcome) -> FileStateKind {
     }
 }
 
-/// A stored episode as its window shows it: the source's lines, the stored
-/// translations (when they still belong to that source) and the open
-/// issues. `None` when nothing is stored for it.
-pub fn stored_snapshot(store: &ResultsStore, folder: &Path, file: &str) -> Option<EpisodeView> {
+/// A stored episode as its window shows it: the source's lines to translate
+/// (planned with the styles it was translated with; `kept` when it has no
+/// stored lines), the stored translations (when they still belong to that
+/// source) and the open issues. `None` when nothing is stored for it.
+pub fn stored_snapshot(
+    store: &ResultsStore,
+    folder: &Path,
+    file: &str,
+    kept: &BTreeSet<String>,
+) -> Option<EpisodeView> {
     let record = store.record(folder, file)?;
     let source = match read_source(folder, file) {
         Ok(s) => s,
@@ -70,13 +84,14 @@ pub fn stored_snapshot(store: &ResultsStore, folder: &Path, file: &str) -> Optio
     let changed = stored
         .as_ref()
         .is_some_and(|l| l.source_hash != source.hash);
+    let plan = source.plan(&stored.as_ref().map_or_else(|| kept.clone(), StoredLines::kept));
     let translations: BTreeMap<u32, String> = match stored {
-        Some(l) if !changed => l.translations,
+        Some(l) if !changed => plan.own(&l.translations),
         _ => BTreeMap::new(),
     };
     // A stopped episode's missing lines are still to come (Resume).
     let complete = record.outcome != EpisodeOutcome::Stopped;
-    let lines: Vec<EpisodeLine> = episode_sources(&source.lines)
+    let lines: Vec<EpisodeLine> = episode_sources(&source.lines, &plan)
         .into_iter()
         .map(|src| {
             let translation = translations.get(&src.id).map(|t| strip_for_text(t));
@@ -105,35 +120,42 @@ pub fn stored_snapshot(store: &ResultsStore, folder: &Path, file: &str) -> Optio
         activity_since_ms: None,
         translated: lines.iter().filter(|l| l.translation.is_some()).count() as u32,
         total: lines.len() as u32,
+        file_lines: source.lines.len() as u32,
         lines,
-        issues: if changed { Vec::new() } else { record.issues },
+        issues: if changed { Vec::new() } else { shown_issues(record.issues, &plan) },
         throttle: None,
     }))
 }
 
+/// Issues as the window shows them: one stored by 3.0 on a repeat of a sign
+/// goes to the line it repeats (the one the window lists).
+fn shown_issues(issues: Vec<VerifyIssue>, plan: &LinePlan) -> Vec<VerifyIssue> {
+    issues
+        .into_iter()
+        .map(|mut i| {
+            if let Role::Repeat { of } = plan.role(i.line_id) {
+                i.line_id = of;
+            }
+            i
+        })
+        .collect()
+}
+
 /// Rewrite an episode's output from its source and translations, keeping
 /// the writer's header and event handling, and remove the other variant
-/// (clean or `.warning`). Untranslated lines stay out. Returns the
-/// fingerprint of what was written.
+/// (clean or `.warning`). Repeats take their run's translation and kept
+/// lines go in as they are, by `plan`; untranslated lines stay out. Returns
+/// the fingerprint of what was written.
 fn write_output(
     folder: &Path,
     file: &str,
     pair: &LanguagePair,
     output_name: &str,
     source: &Source,
+    plan: &LinePlan,
     translations: &BTreeMap<u32, String>,
 ) -> AppResult<String> {
-    let out: Vec<DialogueLine> = source
-        .lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, d)| {
-            translations.get(&(idx as u32 + 1)).map(|t| DialogueLine {
-                text: t.clone(),
-                ..d.clone()
-            })
-        })
-        .collect();
+    let out = plan.output_lines(&source.lines, translations);
     output::write(&folder.join(file), pair, output_name, &source.text, &out)
         .map_err(|e| other(format!("Couldn't write {output_name}: {e}")))
 }
@@ -190,9 +212,11 @@ pub fn save_line_when(
     store.edit_episode(folder, file, |record, lines| {
         free()?;
         let (output_name, lines) = finished(record, lines, &source)?;
+        let plan = source.plan(&lines.kept());
         let raw = line_id
             .checked_sub(1)
             .and_then(|i| source.lines.get(i as usize))
+            .filter(|_| plan.translates(line_id))
             .ok_or_else(|| other(format!("Line {line_id} isn't in this episode.")))?;
         let tagged = if text.contains("{\\") {
             reapply_missing(&strip_positional(&raw.text), &text)
@@ -201,17 +225,30 @@ pub fn save_line_when(
         };
         output::check_unchanged(folder, &output_name, lines.output_hash.as_deref())?;
         let pair = LanguagePair::from_codes(&lines.source_lang, &lines.target_lang)?;
+        lines.translations = plan.own(&lines.translations);
         lines.translations.insert(line_id, tagged);
-        let hash =
-            write_output(folder, file, &pair, &output_name, &source, &lines.translations)?;
+        let hash = write_output(
+            folder,
+            file,
+            &pair,
+            &output_name,
+            &source,
+            &plan,
+            &lines.translations,
+        )?;
         lines.output_hash = Some(hash);
-        record.issues.retain(|i| i.line_id != line_id);
+        // Repeats now read their line's translation and kept lines are
+        // written as they are: issues on them are settled too.
+        record.issues.retain(|i| i.line_id != line_id && (i.line_id == 0 || plan.translates(i.line_id)));
         let terms = load_folder_glossary(folder).map(|g| g.all_terms()).unwrap_or_default();
         let line = BTreeMap::from([(
             line_id,
             (strip_for_text(&raw.text), strip_for_text(&lines.translations[&line_id])),
         )]);
         insert_by_line(&mut record.issues, name_issues(&line, &terms));
+        // Counted by the plan: a 3.0 record counted every line of the file.
+        record.total_lines = plan.translate_count() as u32;
+        lines.total_lines = record.total_lines;
         record.translated_lines = lines.translations.len() as u32;
         Ok(())
     })
@@ -293,9 +330,10 @@ pub fn mark_episode_done(
             Ok(())
         })
     } else {
+        // Translated before results were stored: with every style.
         let count = |path: &Path| {
             decode_file(path)
-                .map(|t| parse_dialogues(&t).len() as u32)
+                .map(|t| LinePlan::new(&parse_dialogues(&t), &BTreeSet::new()).translate_count() as u32)
                 .unwrap_or(0)
         };
         let record = EpisodeRecord {
@@ -336,10 +374,12 @@ pub fn find_term_lines(store: &ResultsStore, folder: &Path, term: &str) -> Vec<T
         if source.hash != lines.source_hash {
             continue;
         }
+        let plan = source.plan(&lines.kept());
         let line_ids: Vec<u32> = lines
             .translations
             .keys()
             .copied()
+            .filter(|id| plan.translates(*id))
             .filter(|id| {
                 id.checked_sub(1)
                     .and_then(|i| source.lines.get(i as usize))
@@ -410,7 +450,8 @@ mod tests {
         let source = read_source(folder.path(), "ep01.ass").unwrap();
         let pair = LanguagePair::from_codes("zh", "en").unwrap();
         let output_hash =
-            write_output(folder.path(), "ep01.ass", &pair, output, &source, &translations).unwrap();
+            write_output(folder.path(), "ep01.ass", &pair, output, &source, &source.plan(&BTreeSet::new()), &translations)
+                .unwrap();
         let record = EpisodeRecord {
             file: "ep01.ass".into(),
             outcome,
@@ -434,6 +475,7 @@ mod tests {
             total_lines: 3,
             translations,
             output_hash: Some(output_hash),
+            kept_styles: Vec::new(),
         };
         store
             .put_episode(folder.path(), record, Some(&lines))
@@ -446,7 +488,7 @@ mod tests {
     }
 
     fn stored(fx: &Fixture) -> EpisodeSnapshot {
-        match stored_snapshot(&fx.store, fx.folder.path(), "ep01.ass") {
+        match stored_snapshot(&fx.store, fx.folder.path(), "ep01.ass", &BTreeSet::new()) {
             Some(EpisodeView::Stored(s)) => s,
             other => panic!("expected stored, got {other:?}"),
         }
@@ -466,7 +508,98 @@ mod tests {
         );
         assert_eq!(snap.lines[2].status, LineStatus::Untranslated);
         assert_eq!(snap.issues.len(), 3);
-        assert!(stored_snapshot(&fx.store, fx.folder.path(), "other.ass").is_none());
+        assert!(stored_snapshot(&fx.store, fx.folder.path(), "other.ass", &BTreeSet::new()).is_none());
+    }
+
+    /// A finished typeset episode: a spoken line, a sign over two frames, a
+    /// karaoke syllable and a note in a style the folder keeps as it is.
+    fn typeset_fixture() -> Fixture {
+        let data = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let store = ResultsStore::at(data.path());
+        let src = "[Events]\n\
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,Fern,0,0,0,,你好\n\
+Dialogue: 0,0:00:01.00,0:00:01.04,Signs,,0,0,0,,{\\pos(10,10)}城门\n\
+Dialogue: 0,0:00:01.04,0:00:01.08,Signs,,0,0,0,,{\\pos(11,10)}城门\n\
+Dialogue: 0,0:00:00.00,0:00:03.00,OP,,0,0,0,fx,{\\an5}ka\n\
+Dialogue: 0,0:00:00.00,0:00:03.00,Notes,,0,0,0,,注释\n";
+        std::fs::write(folder.path().join("ep01.ass"), src).unwrap();
+        let source = read_source(folder.path(), "ep01.ass").unwrap();
+        let kept = BTreeSet::from(["Notes".to_string()]);
+        // Stored the 3.0 way too: a stale translation of the repeat (3).
+        let translations: BTreeMap<u32, String> = [
+            (1, "Hello.".to_string()),
+            (2, "{\\pos(10,10)}City gate".to_string()),
+            (3, "{\\pos(11,10)}Stale".to_string()),
+        ]
+        .into();
+        let output = "ep01.eng.ass";
+        let pair = LanguagePair::from_codes("zh", "en").unwrap();
+        let output_hash =
+            write_output(folder.path(), "ep01.ass", &pair, output, &source, &source.plan(&kept), &translations)
+                .unwrap();
+        // Counted the 3.0 way: every line of the file, with issues on a
+        // repeat of the sign (3) and on the karaoke syllable (4).
+        let record = EpisodeRecord {
+            file: "ep01.ass".into(),
+            outcome: EpisodeOutcome::Done,
+            issues: vec![issue(3, "meaning"), issue(4, "untranslated")],
+            output_name: Some(output.into()),
+            finished_ms: 1,
+            total_lines: 5,
+            translated_lines: 5,
+            reason: None,
+        };
+        let lines = StoredLines {
+            file: "ep01.ass".into(),
+            source_lang: "zh".into(),
+            target_lang: "en".into(),
+            tone: Tone::Standard,
+            source_hash: fingerprint(src),
+            total_lines: 2,
+            translations,
+            output_hash: Some(output_hash),
+            kept_styles: vec!["Notes".into()],
+        };
+        store.put_episode(folder.path(), record, Some(&lines)).unwrap();
+        Fixture { _data: data, folder, store }
+    }
+
+    #[test]
+    fn the_stored_view_shows_only_the_lines_to_translate() {
+        let fx = typeset_fixture();
+        // The folder now keeps nothing: the episode keeps what it was translated with.
+        let snap = stored(&fx);
+        assert_eq!(snap.lines.iter().map(|l| l.id).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!((snap.translated, snap.total, snap.file_lines), (2, 2, 5));
+        // The repeat's issue shows on the sign's line; the kept line's stays
+        // stored (its 3.0 output really lacks it) but isn't a line to show.
+        assert_eq!(snap.issues.iter().map(|i| i.line_id).collect::<Vec<_>>(), [2, 4]);
+    }
+
+    #[test]
+    fn an_edited_sign_reaches_its_repeats_and_kept_lines_stay() {
+        let fx = typeset_fixture();
+        save_line(&fx.store, fx.folder.path(), "ep01.ass", 2, "Castle gate").unwrap();
+        let out = std::fs::read_to_string(fx.folder.path().join("ep01.eng.ass")).unwrap();
+        assert!(out.contains("Signs,,0,0,0,,{\\pos(10,10)}Castle gate\n"), "{out}");
+        assert!(out.contains("Signs,,0,0,0,,{\\pos(11,10)}Castle gate\n"), "{out}");
+        assert!(out.contains("OP,,0,0,0,fx,{\\an5}ka\n") && out.contains("Notes,,0,0,0,,注释\n"), "{out}");
+        assert!(!out.contains("Stale"));
+        // The stale repeat translation is gone from the store too, and the
+        // record counts the lines to translate, so none reads as missing.
+        let stored = fx.store.lines(fx.folder.path(), "ep01.ass").unwrap();
+        assert_eq!(stored.translations.keys().copied().collect::<Vec<_>>(), [1, 2]);
+        let record = fx.store.record(fx.folder.path(), "ep01.ass").unwrap();
+        assert_eq!((record.total_lines, record.translated_lines), (2, 2));
+        // The rewrite settled the issues on the repeat and the kept line.
+        assert!(record.issues.is_empty(), "{:?}", record.issues);
+        assert_eq!(stored.total_lines, 2);
+        // A repeat or a kept line can't be edited on its own.
+        for id in [3, 4, 5] {
+            let err = save_line(&fx.store, fx.folder.path(), "ep01.ass", id, "x").unwrap_err();
+            assert!(err.to_string().contains("isn't in this episode"), "{err}");
+        }
     }
 
     #[test]
@@ -775,6 +908,7 @@ mod tests {
                 ]
                 .into(),
                 output_hash: None,
+                kept_styles: Vec::new(),
             };
             fx.store
                 .put_episode(fx.folder.path(), record, Some(&lines))

@@ -112,7 +112,12 @@ export function CreateView({ view }: { view: ProjectView }) {
         <div className="grid gap-5 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
           <section className="flex min-w-0 flex-col gap-2">
             <h2 className="text-[13px] font-semibold text-foreground">Episodes to read</h2>
-            <EpisodeChecklist files={view.files} selected={selected} onChange={setSelected} />
+            <EpisodeChecklist
+              files={view.files}
+              kept={view.prefs.kept_styles}
+              selected={selected}
+              onChange={setSelected}
+            />
           </section>
 
           <section className="flex min-w-0 flex-col gap-4">

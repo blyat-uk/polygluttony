@@ -16,6 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { TONES, WORLDS, settingsSummary, titleCase, toneAfterWorldChange } from "./folder-labels";
+import { LinesToTranslate, hasLineChoices } from "./lines-to-translate";
 
 /** The app's own select: warm dark, pill-shaped, like its other inputs. */
 function PillSelect({
@@ -49,7 +50,7 @@ function PillSelect({
 
 /**
  * The folder's settings as one summary line, with Edit ▾ opening the language,
- * world type and tone controls in place. Starts open on a folder's first visit,
+ * world type, tone and lines-to-translate controls in place. Starts open on a folder's first visit,
  * when the detected settings are worth checking. Tone lives only here.
  */
 export function FolderSettings({
@@ -168,6 +169,13 @@ export function FolderSettings({
               />
             </SetupField>
           </div>
+          {hasLineChoices(view) ? (
+            <LinesToTranslate
+              view={view}
+              disabled={locked}
+              onChange={(kept) => onChange({ ...prefs, kept_styles: kept })}
+            />
+          ) : null}
           {locked ? (
             <p className="mb-3 text-[11px] text-muted-foreground">
               You can change these when the run is done.

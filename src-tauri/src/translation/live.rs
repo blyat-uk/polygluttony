@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ass::decode::decode_file;
 use crate::ass::parse::{parse_dialogues, DialogueLine};
+use crate::ass::plan::LinePlan;
 use crate::ass::tags::strip_for_text;
 use crate::events::{
     EpisodeActivity, EpisodeChanged, EpisodeLine, EpisodeSnapshot, EpisodeSource, EpisodeThrottle,
@@ -71,6 +72,11 @@ struct Episode {
     file: String,
     /// `None` until the pipeline parses the file (or a snapshot reads it).
     lines: Option<Vec<EpisodeSource>>,
+    /// Every dialogue line of the file; 0 until its lines are known.
+    file_lines: u32,
+    /// The styles this run keeps as they are in this episode, for reading
+    /// its lines before the pipeline does.
+    kept_styles: BTreeSet<String>,
     /// Latest translation per line id, tags stripped. Never cleared within a
     /// run: a full redo re-sends lines that keep their old text until new text
     /// lands, so they read as re-sending rather than blank.
@@ -91,6 +97,8 @@ impl Episode {
         Self {
             file,
             lines: None,
+            file_lines: 0,
+            kept_styles: BTreeSet::new(),
             translations: BTreeMap::new(),
             in_flight: BTreeSet::new(),
             activity: None,
@@ -156,6 +164,7 @@ impl Episode {
             activity_since_ms: self.activity_since_ms,
             translated: lines.iter().filter(|l| l.translation.is_some()).count() as u32,
             total: lines.len() as u32,
+            file_lines: self.file_lines,
             lines,
             issues: self.issues.clone(),
             // Only a request that hasn't gone out yet sits out the pause.
@@ -194,6 +203,14 @@ impl LiveBoard {
     /// Put back the board [`LiveBoard::replace`] took: its run never started.
     pub fn put_back(&self, previous: SetAside) {
         *self.lock() = previous.0;
+    }
+
+    /// The styles an episode of this run keeps as they are. Call right
+    /// after `reset` (or `replace`), before anything reads its lines.
+    pub fn keep_styles(&self, file: &str, kept: &BTreeSet<String>) {
+        let mut guard = self.lock();
+        let Some(board) = guard.as_mut() else { return };
+        board.update(file, |ep| ep.kept_styles = kept.clone());
     }
 
     /// Translations an episode starts the run with (Resume's kept lines, a
@@ -256,9 +273,10 @@ impl LiveBoard {
                 ep.state = FileStateKind::Failed;
                 ep.settle();
             }),
-            RunEvent::EpisodeLines { file, lines } => {
-                board.update(file, |ep| ep.lines = Some(lines.clone()))
-            }
+            RunEvent::EpisodeLines { file, lines, file_lines } => board.update(file, |ep| {
+                ep.lines = Some(lines.clone());
+                ep.file_lines = *file_lines;
+            }),
             RunEvent::Sending { file, ids, activity } => board.update(file, |ep| {
                 ep.in_flight = ids.iter().copied().collect();
                 ep.activity = Some(activity.clone());
@@ -296,11 +314,12 @@ impl LiveBoard {
             if ep.lines.is_some() {
                 return EpisodeView::Live(ep.snapshot(board.run_active, board.throttle.as_ref()));
             }
-            board.folder.clone()
+            (board.folder.clone(), ep.kept_styles.clone())
         };
+        let (folder, kept) = folder;
 
-        let lines = match read_sources(&folder.join(file)) {
-            Ok(lines) => lines,
+        let (lines, file_lines) = match read_sources(&folder.join(file), &kept) {
+            Ok(read) => read,
             Err(message) => return EpisodeView::Unreadable { message },
         };
 
@@ -318,7 +337,10 @@ impl LiveBoard {
             return EpisodeView::NotInRun;
         };
         // The pipeline may have parsed it meanwhile; its lines win.
-        ep.lines.get_or_insert(lines);
+        if ep.lines.is_none() {
+            ep.lines = Some(lines);
+            ep.file_lines = file_lines;
+        }
         EpisodeView::Live(ep.snapshot(run_active, throttle.as_ref()))
     }
 
@@ -364,13 +386,15 @@ pub fn same_folder(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The board's view of parsed dialogue: id = index + 1 (the pipeline's line
-/// ids), times clamped into `u32`, override tags stripped.
-pub fn episode_sources(lines: &[DialogueLine]) -> Vec<EpisodeSource> {
+/// The board's view of parsed dialogue: the lines the plan sends to the
+/// model (repeats and kept lines aren't shown), id = index + 1 (the
+/// pipeline's line ids), times clamped into `u32`, override tags stripped.
+pub fn episode_sources(lines: &[DialogueLine], plan: &LinePlan) -> Vec<EpisodeSource> {
     let cs = |v: i64| u32::try_from(v.max(0)).unwrap_or(u32::MAX);
     lines
         .iter()
         .enumerate()
+        .filter(|(idx, _)| plan.translates(*idx as u32 + 1))
         .map(|(idx, d)| EpisodeSource {
             id: idx as u32 + 1,
             start_cs: cs(d.start_cs),
@@ -380,11 +404,13 @@ pub fn episode_sources(lines: &[DialogueLine]) -> Vec<EpisodeSource> {
         .collect()
 }
 
-/// Decode and parse exactly as the pipeline does, so the lines match the ids
-/// it will send later.
-fn read_sources(path: &Path) -> Result<Vec<EpisodeSource>, String> {
+/// Decode, parse and plan exactly as the pipeline does, so the lines match
+/// the ids it will send later; with the file's dialogue line count.
+fn read_sources(path: &Path, kept: &BTreeSet<String>) -> Result<(Vec<EpisodeSource>, u32), String> {
     let text = decode_file(path).map_err(|e| e.to_string())?;
-    Ok(episode_sources(&parse_dialogues(&text)))
+    let lines = parse_dialogues(&text);
+    let plan = LinePlan::new(&lines, kept);
+    Ok((episode_sources(&lines, &plan), lines.len() as u32))
 }
 
 fn now_ms() -> u64 {
@@ -406,6 +432,7 @@ mod tests {
         board.apply(&RunEvent::EpisodeLines {
             file: "ep01.ass".into(),
             lines: (1..=n).map(|i| src(i, &format!("line {i}"))).collect(),
+            file_lines: n,
         });
         board
     }
@@ -578,7 +605,7 @@ mod tests {
     #[test]
     fn a_queued_request_sits_out_the_throttle_and_a_sent_one_does_not() {
         let board = board_with_lines(2);
-        board.apply(&RunEvent::EpisodeLines { file: "ep02.ass".into(), lines: vec![src(1, "a")] });
+        board.apply(&RunEvent::EpisodeLines { file: "ep02.ass".into(), lines: vec![src(1, "a")], file_lines: 1 });
         board.apply(&sending(&[1]));
         board.apply(&RunEvent::Sending {
             file: "ep02.ass".into(),
@@ -742,6 +769,7 @@ mod tests {
         board.apply(&RunEvent::EpisodeLines {
             file: "ep01.ass".into(),
             lines: vec![src(1, "line 1")],
+            file_lines: 1,
         });
         let snap = live(board.snapshot("ep01.ass"));
         assert!(snap.run_active);
@@ -792,7 +820,7 @@ mod tests {
     #[test]
     fn run_finished_settles_every_episode() {
         let board = board_with_lines(2);
-        board.apply(&RunEvent::EpisodeLines { file: "ep02.ass".into(), lines: vec![src(1, "a")] });
+        board.apply(&RunEvent::EpisodeLines { file: "ep02.ass".into(), lines: vec![src(1, "a")], file_lines: 1 });
         board.apply(&sending(&[1, 2]));
         board.apply(&RunEvent::Sending {
             file: "ep02.ass".into(),
@@ -841,6 +869,7 @@ mod tests {
         board.apply(&RunEvent::EpisodeLines {
             file: "ep01.ass".into(),
             lines: vec![src(1, "a"), src(2, "b")],
+            file_lines: 2,
         });
         assert_eq!(live(board.snapshot("ep01.ass")).total, 2);
     }
@@ -871,7 +900,10 @@ mod tests {
             text: text.into(),
         };
         let out =
-            episode_sources(&[line(-5, i64::MAX, "{\\i1}Hi{\\i0}\\nthere"), line(10, 20, "b")]);
+            {
+                let lines = [line(-5, i64::MAX, "{\\i1}Hi{\\i0}\\nthere"), line(10, 20, "b")];
+                episode_sources(&lines, &LinePlan::new(&lines, &Default::default()))
+            };
         assert_eq!(
             out[0],
             EpisodeSource { id: 1, start_cs: 0, end_cs: u32::MAX, text: "Hi\\nthere".into() }

@@ -5,6 +5,7 @@ import type { ProjectView } from "@/types/generated/ProjectView";
 import { ipc } from "@/lib/ipc";
 import { useAppStore } from "@/stores/app-store";
 import { keepSessionSelection } from "@/features/episodes/selection";
+import { folderLinesToTranslate } from "@/features/episodes/lines";
 
 export function projectKey(path: string) {
   return ["project", path] as const;
@@ -20,7 +21,7 @@ export function syncProjectStore(view: ProjectView) {
     worldType: view.prefs.world_override ?? view.detected_world,
     tone: view.prefs.tone,
     fileCount: view.files.length,
-    dialogueLineCount: view.total_dialogue_lines,
+    dialogueLineCount: folderLinesToTranslate(view),
     hasUntranslated: untranslated > 0,
     glossaryTerms: view.glossary_terms,
   });

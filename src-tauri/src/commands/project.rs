@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use tauri::AppHandle;
 
+use crate::ass::plan::{tally, LinePlan};
 use crate::ass::{decode::decode_file, parse::parse_dialogues, tags::strip_for_text};
 use crate::config::languages::{detect_source_language, get_language, languages, Language};
 use crate::config::projects::{self, FolderPrefs, RecentFolder};
@@ -12,7 +13,7 @@ use crate::config::store as config_store;
 use crate::error::{AppError, AppResult};
 use crate::glossary::world_detector::detect;
 use crate::models::language_pair::LanguagePair;
-use crate::models::{ProjectView, SourceFile, TranslationState};
+use crate::models::{AlwaysKept, ProjectView, SourceFile, StyleSummary, TranslationState};
 use crate::utils::discover::{discover_source_files, output_on_disk};
 
 #[tauri::command]
@@ -132,6 +133,8 @@ pub async fn open_folder(app: AppHandle, path: String, now: i64) -> AppResult<Pr
         supports_glossary,
         glossary_terms,
         first_visit,
+        styles: analyzed.styles,
+        always_kept: analyzed.always_kept,
     })
 }
 
@@ -177,6 +180,17 @@ pub fn has_output<R: tauri::Runtime>(app: &AppHandle<R>, folder: &Path, file: &s
         .unwrap_or(false)
 }
 
+/// The styles a folder keeps as they are, from its saved prefs (none when
+/// they can't be read).
+pub fn kept_styles<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    folder: &Path,
+) -> std::collections::BTreeSet<String> {
+    projects::load(app)
+        .map(|cfg| projects::kept_styles(&cfg, &folder.to_string_lossy()))
+        .unwrap_or_default()
+}
+
 /// Names of the files with no translation on disk, in list order.
 fn untranslated_names(files: &[SourceFile]) -> Vec<String> {
     files
@@ -188,18 +202,42 @@ fn untranslated_names(files: &[SourceFile]) -> Vec<String> {
 
 struct Analyzed {
     files: Vec<SourceFile>,
+    /// The lines to translate of every file, for language and world detection.
     combined_text: String,
+    styles: Vec<StyleSummary>,
+    always_kept: AlwaysKept,
 }
 
 fn analyze_folder(dir: &Path, pair: &LanguagePair) -> Analyzed {
     let mut files = Vec::new();
     let mut combined = String::new();
+    let mut styles: std::collections::BTreeMap<String, StyleSummary> = Default::default();
+    let mut always_kept = AlwaysKept::default();
     for src in discover_source_files(dir, pair) {
         let text = decode_file(&src).unwrap_or_default();
         let dialogues = parse_dialogues(&text);
-        for d in &dialogues {
-            combined.push_str(&strip_for_text(&d.text));
+        // Karaoke syllables and repeated sign frames say nothing about the
+        // language; they only slow detection down.
+        let plan = LinePlan::new(&dialogues, &Default::default());
+        for id in plan.translate_ids() {
+            combined.push_str(&strip_for_text(&dialogues[(id - 1) as usize].text));
             combined.push('\n');
+        }
+        let file_tally = tally(&dialogues);
+        always_kept.songs += file_tally.songs;
+        always_kept.no_text += file_tally.no_text;
+        for (name, t) in &file_tally.styles {
+            let style = styles.entry(name.clone()).or_insert_with(|| StyleSummary {
+                name: name.clone(),
+                lines: 0,
+                all_lines: 0,
+                sample: String::new(),
+            });
+            style.lines += t.translate;
+            style.all_lines += t.all;
+            if style.sample.is_empty() {
+                style.sample = t.sample.clone();
+            }
         }
         let output = output_on_disk(&src, pair);
         files.push(SourceFile {
@@ -214,11 +252,21 @@ fn analyze_folder(dir: &Path, pair: &LanguagePair) -> Analyzed {
                 .to_string(),
             path: src.to_string_lossy().into_owned(),
             dialogue_count: dialogues.len() as u32,
+            style_lines: file_tally
+                .styles
+                .iter()
+                .filter(|(_, t)| t.translate > 0)
+                .map(|(name, t)| (name.clone(), t.translate))
+                .collect(),
         });
     }
+    let mut styles: Vec<StyleSummary> = styles.into_values().filter(|s| s.lines > 0).collect();
+    styles.sort_by(|a, b| b.lines.cmp(&a.lines).then_with(|| a.name.cmp(&b.name)));
     Analyzed {
         files,
         combined_text: combined,
+        styles,
+        always_kept,
     }
 }
 
@@ -238,6 +286,7 @@ mod tests {
             tone: Tone::Standard,
             selected_files: vec![],
             glossary_first: true,
+            kept_styles: Vec::new(),
         };
         let pair = |s: Option<&FolderPrefs>, src: &str, tgt: &str| {
             let p = pair_for(s, src, tgt).unwrap();
@@ -279,6 +328,39 @@ mod tests {
 
     fn zh_en() -> LanguagePair {
         LanguagePair::from_codes("zh", "en").unwrap()
+    }
+
+    #[test]
+    fn analyze_counts_the_lines_to_translate_per_style() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+        let ep = |sign: &str| {
+            format!(
+                "{head}\
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好\n\
+Dialogue: 0,0:00:01.00,0:00:01.04,Signs,,0,0,0,,{{\\pos(1,1)}}{sign}\n\
+Dialogue: 0,0:00:01.04,0:00:01.08,Signs,,0,0,0,,{{\\pos(2,1)}}{sign}\n\
+Dialogue: 0,0:00:00.00,0:00:03.00,OP-E,,0,0,0,fx,{{\\an5}}la\n\
+Dialogue: 0,0:00:00.00,0:00:03.00,OP-E,,0,0,0,,\n"
+            )
+        };
+        fs::write(dir.path().join("ep01.ass"), ep("城门")).unwrap();
+        fs::write(dir.path().join("ep02.ass"), ep("皇宫")).unwrap();
+        let a = analyze_folder(dir.path(), &zh_en());
+
+        let names: Vec<(&str, u32, u32, &str)> = a
+            .styles
+            .iter()
+            .map(|s| (s.name.as_str(), s.lines, s.all_lines, s.sample.as_str()))
+            .collect();
+        // Most lines first; OP-E has nothing to translate, so it isn't listed.
+        assert_eq!(names, [("Default", 2, 2, "你好"), ("Signs", 2, 4, "城门")]);
+        assert_eq!(a.always_kept, AlwaysKept { songs: 2, no_text: 2 });
+        let ep1 = a.files.iter().find(|f| f.name == "ep01.ass").unwrap();
+        assert_eq!(ep1.dialogue_count, 5);
+        assert_eq!(ep1.style_lines, [("Default".to_string(), 1), ("Signs".to_string(), 1)].into());
+        // Detection reads the lines to translate only.
+        assert_eq!(a.combined_text.lines().count(), 4);
     }
 
     #[test]
@@ -327,6 +409,7 @@ mod tests {
             tone: Tone::Comedic,
             selected_files: vec!["ep01.ass".into(), "ep02.ass".into(), "ep03.ass".into()],
             glossary_first: false,
+            kept_styles: Vec::new(),
         };
         let (prefs, first_visit) =
             prefs_for_open(Some(saved.clone()), &a.files, Some("ja"), "zh", "en");

@@ -8,5 +8,6 @@
 
 pub mod decode;
 pub mod parse;
+pub mod plan;
 pub mod tags;
 pub mod writer;

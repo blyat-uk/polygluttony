@@ -30,6 +30,7 @@ use super::blocking;
 // Therefore JS MUST send camelCase keys: `sourceLang`, `targetLang`, etc.
 // (Override with `#[tauri::command(rename_all = "snake_case")]` if desired.)
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn start_translation(
     app: AppHandle,
     folder: String,
@@ -38,9 +39,12 @@ pub async fn start_translation(
     source_lang: String,
     target_lang: String,
     resume: Option<bool>,
+    kept_styles: Option<Vec<String>>,
 ) -> AppResult<()> {
     let resume = resume.unwrap_or(false);
-    run::start(app, StartArgs { folder, files, tone, source_lang, target_lang, resume }).await
+    let kept_styles = kept_styles.unwrap_or_default();
+    run::start(app, StartArgs { folder, files, tone, source_lang, target_lang, resume, kept_styles })
+        .await
 }
 
 #[tauri::command]
@@ -69,9 +73,10 @@ pub async fn episode_snapshot(
         if standing == Standing::Running {
             return board.snapshot(&file);
         }
+        let kept = super::project::kept_styles(&app, &folder);
         let stored = ResultsStore::for_app(&app)
             .ok()
-            .and_then(|store| review::stored_snapshot(&store, &folder, &file));
+            .and_then(|store| review::stored_snapshot(&store, &folder, &file, &kept));
         match (stored, standing) {
             (Some(view), _) => view,
             (None, Standing::Finished) => board.snapshot(&file),

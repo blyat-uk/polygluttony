@@ -22,6 +22,7 @@ export function startTranslationRun(folder: string, files: string[], prefs: Fold
       sourceLang: prefs.source_lang,
       targetLang: prefs.target_lang,
       resume,
+      keptStyles: prefs.kept_styles,
     })
     .catch((err: unknown) => {
       useTranslationRun.getState().failStart(err instanceof Error ? err.message : String(err));

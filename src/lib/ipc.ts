@@ -101,6 +101,8 @@ export const ipc = {
     targetLang: string
     /** Carry on from stored partial translations of stopped files. */
     resume?: boolean
+    /** Styles written as they are, never sent ("Lines to translate"). */
+    keptStyles?: string[]
   }) => invoke<void>("start_translation", args),
   /** O17 — cancel the active run. */
   cancelTranslation: () => invoke<void>("cancel_translation"),

@@ -82,6 +82,7 @@ export function AddEpisodesPanel({
       <PanelLabel>Episodes</PanelLabel>
       <EpisodeChecklist
         files={view.files}
+        kept={view.prefs.kept_styles}
         selected={selected}
         onChange={setSelected}
         tag={(f) => (scanned.has(f.name) ? "in glossary" : null)}
