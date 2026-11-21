@@ -8,7 +8,9 @@ use regex::Regex;
 
 use super::LinePair;
 
-static EXACT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<(\d{4}):[DL]>").unwrap());
+/// Ids are zero-padded to four digits and grow past that: a typeset episode
+/// can have more than 9,999 lines, and its ids are positions in the file.
+static EXACT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<(\d{4,}):[DL]>").unwrap());
 static FUZZY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)<\s*(\d+)\s*:\s*[DL]\s*>").unwrap());
 static RANGE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<(\d+)-(\d+):[DL]>").unwrap());
@@ -28,9 +30,8 @@ impl LineKind {
     }
 }
 
-/// `<0001:D> text`
+/// `<0001:D> text` (`<12001:D>` past 9,999).
 pub fn inject(id: u32, kind: LineKind, text: &str) -> String {
-    debug_assert!(id <= 9999, "marker ids are 4-digit");
     format!("<{:04}:{}> {}", id, kind.tag(), text)
 }
 
@@ -213,5 +214,13 @@ mod tests {
         assert!(!r.is_valid);
         assert_eq!(r.corrupted_markers.len(), 1);
         assert_eq!(r.first_mismatch_id, Some(1));
+    }
+
+    #[test]
+    fn ids_past_four_digits_round_trip() {
+        let marked = inject(12001, LineKind::Dialogue, "Hello");
+        assert_eq!(marked, "<12001:D> Hello");
+        assert_eq!(extract_all(&marked), vec![12001]);
+        assert_eq!(strip(&marked), "Hello");
     }
 }
