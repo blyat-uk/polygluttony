@@ -56,6 +56,7 @@ export function RebuildDialog({
         </DialogHeader>
         <EpisodeChecklist
           files={view.files}
+          kept={view.prefs.kept_styles}
           selected={selected}
           onChange={setSelected}
           className="min-h-0 flex-1"

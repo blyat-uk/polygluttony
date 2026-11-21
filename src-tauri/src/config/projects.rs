@@ -46,6 +46,10 @@ pub struct FolderPrefs {
     /// Episodes page's Translate button. On until unticked for this folder.
     #[serde(default = "glossary_first_default")]
     pub glossary_first: bool,
+    /// Styles whose lines are written as they are, never translated: the
+    /// unticked ones under "Lines to translate". Empty = every style.
+    #[serde(default)]
+    pub kept_styles: Vec<String>,
 }
 
 fn glossary_first_default() -> bool {
@@ -136,7 +140,16 @@ pub fn resolve_prefs(
         tone: Tone::Standard,
         selected_files: Vec::new(),
         glossary_first: true,
+        kept_styles: Vec::new(),
     }
+}
+
+/// The styles a folder keeps as they are (none for a folder without prefs).
+pub fn kept_styles(cfg: &ProjectsConfig, path: &str) -> std::collections::BTreeSet<String> {
+    cfg.folders
+        .get(path)
+        .map(|p| p.kept_styles.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 // ---- Tauri glue (thin; not unit-tested) ------------------------------------
@@ -216,6 +229,7 @@ mod tests {
             tone: Tone::Comedic,
             selected_files: vec!["a.ass".into()],
             glossary_first: false,
+            kept_styles: Vec::new(),
         };
         set_prefs(&mut c, "/x", p.clone());
         assert_eq!(get_prefs(&c, "/x"), Some(p.clone()));

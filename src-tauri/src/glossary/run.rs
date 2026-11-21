@@ -228,6 +228,9 @@ pub async fn start(app: AppHandle, args: StartArgs) -> AppResult<()> {
         prompts: prompt_pack,
         batch_limit: extract.batch_dialogue_limit,
         cancel: cancel.clone(),
+        kept_styles: crate::config::projects::load(&app)
+            .map(|cfg| crate::config::projects::kept_styles(&cfg, &args.folder))
+            .unwrap_or_default(),
     };
     let app_for_release = app.clone();
     tauri::async_runtime::spawn(async move {

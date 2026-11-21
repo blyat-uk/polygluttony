@@ -16,4 +16,9 @@ selected_files: Array<string>,
  * Build or update the glossary before translating: the tick next to the
  * Episodes page's Translate button. On until unticked for this folder.
  */
-glossary_first: boolean, };
+glossary_first: boolean, 
+/**
+ * Styles whose lines are written as they are, never translated: the
+ * unticked ones under "Lines to translate". Empty = every style.
+ */
+kept_styles: Array<string>, };

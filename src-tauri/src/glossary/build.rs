@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 
+use crate::ass::plan::LinePlan;
 use crate::ass::{decode::decode_file, parse::parse_dialogues, tags::strip_for_text};
 use crate::error::{AppError, AppResult};
 use crate::events::{GlossaryBuildSummary, GlossaryEvent, GlossaryPhase, LogLevel};
@@ -104,6 +105,9 @@ pub struct BuildJob {
     pub prompts: crate::prompts::GlossaryPrompts,
     pub batch_limit: Option<u32>,
     pub cancel: CancellationToken,
+    /// Styles the folder keeps as they are: their lines aren't read, like
+    /// song effects, drawings and repeats of a sign.
+    pub kept_styles: std::collections::BTreeSet<String>,
 }
 
 /// Existing terms always win; `new_terms` only fills gaps. Every save (the
@@ -336,14 +340,21 @@ pub async fn build_glossary(
     for name in &job.files {
         match decode_file(&job.folder.join(name)) {
             Ok(text) => {
+                // The lines a translation would send, nothing else.
                 let dialogues = parse_dialogues(&text);
-                if dialogues.is_empty() {
+                let plan = LinePlan::new(&dialogues, &job.kept_styles);
+                let words: Vec<String> = plan
+                    .translate_ids()
+                    .into_iter()
+                    .map(|id| strip_for_text(&dialogues[(id - 1) as usize].text))
+                    .collect();
+                if words.is_empty() {
                     log(&tx, LogLevel::Warning, format!("no dialogue text in {name} — skipped"))
                         .await;
                     continue;
                 }
-                let n = dialogues.len();
-                all_lines.extend(dialogues.iter().map(|d| strip_for_text(&d.text)));
+                let n = words.len();
+                all_lines.extend(words);
                 files_processed += 1;
                 loaded_files.push(name.clone());
                 loaded_lengths.push(n);
@@ -782,6 +793,7 @@ mod tests {
             prompts: crate::prompts::GlossaryPrompts::defaults(),
             batch_limit: Some(2), // ×0.7 → 1 line per batch
             cancel,
+            kept_styles: Default::default(),
         }
     }
 
@@ -835,6 +847,38 @@ mod tests {
         assert_eq!(saved.characters.get("林动").unwrap(), "Lin Dong"); // first wins
         assert_eq!(saved.locations.get("青阳镇").unwrap(), "Qingyang Town");
         assert_eq!(saved.world_type, "xianxia");
+    }
+
+    #[tokio::test]
+    async fn reads_only_the_lines_a_translation_would_send() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("e1.ass"),
+            "[Events]\n\
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,修仙第一句\n\
+Dialogue: 0,0:00:01.00,0:00:01.04,Signs,,0,0,0,,{\\pos(1,1)}青阳镇\n\
+Dialogue: 0,0:00:01.04,0:00:01.08,Signs,,0,0,0,,{\\pos(2,1)}青阳镇\n\
+Dialogue: 0,0:00:00.00,0:00:03.00,OP,,0,0,0,fx,{\\an5}la\n\
+Dialogue: 0,0:00:00.00,0:00:03.00,Notes,,0,0,0,,注释\n",
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        // One line per batch: the spoken line and the sign, once.
+        let d = ScriptedDriver::new(vec![
+            Ok(r#"{"characters":{"林动":"Lin Dong"}}"#.into()),
+            Ok(r#"{"locations":{"青阳镇":"Qingyang Town"}}"#.into()),
+        ]);
+        let svc = svc1(d.clone(), cancel.clone());
+        let mut job = job(dir.path(), vec!["e1.ass".into()], cancel);
+        job.kept_styles = ["Notes".to_string()].into();
+        let (events, s) = run_and_collect(job, &svc, None).await;
+        assert_eq!(s.batches_total, 2);
+        assert_eq!(d.call_count(), 2);
+        assert!(!d.last_request().unwrap().user.contains("注释"));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GlossaryEvent::Log { message, .. } if message == "loaded e1.ass (2 lines)"
+        )));
     }
 
     #[tokio::test(start_paused = true)]

@@ -180,9 +180,10 @@ pub enum RunEvent {
     /// A provider asked us to slow down; requests wait `seconds` first.
     Throttled { seconds: u32, provider: String },
     RunFinished { results: Vec<FileResult> },
-    /// The episode's dialogue lines, once parsed.
+    /// The episode's lines to translate, once parsed; `file_lines` counts
+    /// every dialogue line of the file, the kept and repeated ones too.
     #[ts(skip)]
-    EpisodeLines { file: String, lines: Vec<EpisodeSource> },
+    EpisodeLines { file: String, lines: Vec<EpisodeSource>, file_lines: u32 },
     /// These line ids just went to the model.
     #[ts(skip)]
     Sending { file: String, ids: Vec<u32>, activity: EpisodeActivity },
@@ -307,7 +308,13 @@ pub struct EpisodeSnapshot {
     pub activity_since_ms: Option<u64>,
     /// Lines with any translation.
     pub translated: u32,
+    /// Lines to translate (the window's lines).
     pub total: u32,
+    /// Every dialogue line of the file: the lines to translate, the repeats
+    /// of a sign that take its translation, and the lines kept as they are.
+    /// 0 when not known yet.
+    #[serde(default)]
+    pub file_lines: u32,
     pub lines: Vec<EpisodeLine>,
     /// Final verify issues; empty until the episode finishes.
     pub issues: Vec<VerifyIssue>,

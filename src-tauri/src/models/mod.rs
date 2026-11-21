@@ -83,7 +83,12 @@ pub struct FirstRunStatus {
 pub struct SourceFile {
     pub path: String,
     pub name: String,
+    /// Every dialogue line of the file.
     pub dialogue_count: u32,
+    /// Style → lines to translate with that style ticked: repeats of a sign
+    /// count once; song effects, drawings and lines with no words never
+    /// count. The lines a run sends are the sum over the ticked styles.
+    pub style_lines: BTreeMap<String, u32>,
     /// Any translation output exists (clean or `.warning`).
     pub has_translation: bool,
     /// What's on disk for this file.
@@ -123,4 +128,33 @@ pub struct ProjectView {
     /// No preferences were saved for this folder yet: the detected settings
     /// are worth a look, so the Episodes page opens them.
     pub first_visit: bool,
+    /// Every style with lines to translate across the folder, most lines
+    /// first: "Lines to translate".
+    pub styles: Vec<StyleSummary>,
+    /// Lines no run sends, whatever is ticked.
+    pub always_kept: AlwaysKept,
+}
+
+/// One style of a folder's episodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct StyleSummary {
+    pub name: String,
+    /// Lines to translate with it ticked, across the folder.
+    pub lines: u32,
+    /// Every dialogue line in it, across the folder (repeats of a sign,
+    /// song effects and lines with no words too).
+    pub all_lines: u32,
+    /// Its first line to translate, tags stripped.
+    pub sample: String,
+}
+
+/// Lines written as they are in every run, across a folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../src/types/generated/")]
+pub struct AlwaysKept {
+    /// Karaoke effects and timed syllables.
+    pub songs: u32,
+    /// Lines with no words, and drawings.
+    pub no_text: u32,
 }

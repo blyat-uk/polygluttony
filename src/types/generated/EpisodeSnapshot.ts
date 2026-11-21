@@ -20,7 +20,17 @@ activity_since_ms: number | null,
 /**
  * Lines with any translation.
  */
-translated: number, total: number, lines: Array<EpisodeLine>, 
+translated: number, 
+/**
+ * Lines to translate (the window's lines).
+ */
+total: number, 
+/**
+ * Every dialogue line of the file: the lines to translate, the repeats
+ * of a sign that take its translation, and the lines kept as they are.
+ * 0 when not known yet.
+ */
+file_lines: number, lines: Array<EpisodeLine>, 
 /**
  * Final verify issues; empty until the episode finishes.
  */

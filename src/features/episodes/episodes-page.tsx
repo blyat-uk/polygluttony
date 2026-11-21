@@ -47,6 +47,7 @@ import {
   type CombinedPlan,
 } from "./combined-run";
 import { startTranslationRun } from "./start-run";
+import { linesToTranslate } from "./lines";
 
 export function EpisodesPage() {
   const workdir = useAppStore((s) => s.workdir);
@@ -321,7 +322,10 @@ function Episodes({ folder }: { folder: string }) {
   } else if (ours && run.running) {
     banner = {
       kind: "running",
-      progress: runProgress(run.files, new Map(view.files.map((f) => [f.name, f.dialogue_count]))),
+      progress: runProgress(
+        run.files,
+        new Map(view.files.map((f) => [f.name, linesToTranslate(f, view.prefs.kept_styles)])),
+      ),
       stopping: run.stopRequested,
       steps: chainedHere && !run.external ? twoSteps(chainedHere.plan) : undefined,
     };
@@ -367,12 +371,13 @@ function Episodes({ folder }: { folder: string }) {
 
   // ── footer ────────────────────────────────────────────────────────────────
   const tickedSet = new Set(selected);
+  const kept = view.prefs.kept_styles;
   const lines = view.files
     .filter((f) => tickedSet.has(f.name))
-    .reduce((n, f) => n + f.dialogue_count, 0);
+    .reduce((n, f) => n + linesToTranslate(f, kept), 0);
   const stepSet = new Set(glossaryFiles);
   const glossaryLines = glossaryFirst
-    ? view.files.filter((f) => stepSet.has(f.name)).reduce((n, f) => n + f.dialogue_count, 0)
+    ? view.files.filter((f) => stepSet.has(f.name)).reduce((n, f) => n + linesToTranslate(f, kept), 0)
     : 0;
   const replacing = replacingCount(selected, view.files);
   const plainLabel = translateLabel(selected.length, replacing);
@@ -447,6 +452,7 @@ function Episodes({ folder }: { folder: string }) {
         <EpisodeTable
           folder={folder}
           files={view.files}
+          kept={view.prefs.kept_styles}
           selected={selected}
           onSelect={setSelection}
           statusOf={statusOf}
