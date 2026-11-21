@@ -13,13 +13,16 @@ pub fn strip_for_text(s: &str) -> String {
     TAG_RE.replace_all(s, "").into_owned()
 }
 
-/// Matches only ASS override tag blocks: `{` followed by `\` then non-`}` chars then `}`.
-/// Plain brace groups like `{note}` do not match (`ass_tags.py:68`).
+/// Matches every `{...}` block: override tags (`{\an8}`) and comments
+/// (`{=8}`, `{TL note}`) alike, since a renderer shows neither. Deliberate
+/// deviation from `ass_tags.py:68`, which left comments in the text: the model
+/// then saw `{=8}At the far…`, and a tag right after the comment came back
+/// after the translation's first letter, which rendered in the wrong font.
 /// Note: positions are tracked in CHARS (not bytes) unlike Python's `original_position`
 /// which is a code-point (character) offset from `match.start()`. Both yield the same result for stripped_position
 /// because Python's `_calculate_stripped_position` also slices by chars via str indexing.
 static TAG: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\{\\[^}]+\}").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"\{[^}]*\}").unwrap());
 
 /// One override tag with where it sat in the original and stripped text.
 /// Positions are in CHARS (not bytes) — translations are sliced by chars.
@@ -171,10 +174,13 @@ pub fn reapply_missing(source: &TagStrip, typed: &str) -> String {
         .tags
         .iter()
         .filter_map(|t| {
-            let kept: String = overrides(&t.content)
-                .into_iter()
-                .filter(|o| !typed_settings.contains(&setting(o)))
-                .collect();
+            let parts = overrides(&t.content);
+            if parts.is_empty() {
+                // A comment (`{=8}`): kept, unless the typed text has it already.
+                return (!typed.contains(&t.content)).then(|| t.clone());
+            }
+            let kept: String =
+                parts.into_iter().filter(|o| !typed_settings.contains(&setting(o))).collect();
             (!kept.is_empty()).then(|| PlacedTag { content: format!("{{{kept}}}"), ..t.clone() })
         })
         .collect();
@@ -308,10 +314,29 @@ mod tests {
     }
 
     #[test]
-    fn non_override_braces_are_not_tags() {
+    fn comment_blocks_are_stripped_like_tags() {
         let r = strip_positional("{note} hello");
-        assert!(r.tags.is_empty());
-        assert_eq!(r.stripped, "{note} hello");
+        assert_eq!(r.tags.len(), 1);
+        assert_eq!(r.stripped, " hello");
+    }
+
+    #[test]
+    fn a_tag_after_a_leading_comment_stays_in_front() {
+        // Cifer's signs: `{=8}` then the sign's font, size and position.
+        let r = strip_positional(r"{=8}{\fnHiroshige\an6\fs40}At the far northern edge,");
+        assert_eq!(r.stripped, "At the far northern edge,");
+        assert_eq!(
+            reapply(&r, "No extremo norte,"),
+            r"{=8}{\fnHiroshige\an6\fs40}No extremo norte,"
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_the_source_comments() {
+        let src = strip_positional(r"{=8}{\an8}Hello");
+        assert_eq!(reapply_missing(&src, "Olá"), r"{=8}{\an8}Olá");
+        // Typed with the comment already there: not twice.
+        assert_eq!(reapply_missing(&src, r"{=8}Olá"), r"{\an8}{=8}Olá");
     }
 
     #[test]
