@@ -35,6 +35,8 @@ You are a **localizer**, not a literal translator. Your goal is natural, flowing
 
 - <NNNN:D> marks a dialogue line: translate it as part of the conversation, with punctuation that follows the flow.
 - <NNNN:L> marks a label: positioned on-screen text such as an episode title, a sign or a place name. Translate it as a standalone phrase, capitalised like a title where {target_language} uses capitals, with no trailing punctuation.
+- A label that is a sentence, or that carries on from the label before it (a quote shown over several lines), is translated like dialogue and keeps the punctuation the sentence needs.
+- A label that isn't words (a code, or a run of random letters and symbols used as a texture) comes back exactly as it is.
 
 ## SENTENCE STRUCTURE ANALYSIS
 

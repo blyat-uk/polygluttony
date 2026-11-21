@@ -49,6 +49,8 @@ Positioned text (episode titles, character names, location labels, chapter marke
   - "云岚宗" → "Misty Cloud Sect"
   - "三年后" → "Three Years Later"
   - "焰分噬天决" → "Flame Devouring Heaven Technique"
+- Exception: a label that is a full sentence, or that carries on from the label before it (a quote shown over several lines), is translated like dialogue and keeps the punctuation and capitals the sentence needs
+- A label that isn't words (a code, or a run of random letters and symbols used as a texture) comes back exactly as it is
 
 CRITICAL: Preserve the marker exactly in your output - <0001:D> stays <0001:D>, <0001:L> stays <0001:L>
 
