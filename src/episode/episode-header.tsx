@@ -124,11 +124,24 @@ export function EpisodeHeader({
             </button>
           ) : null}
           {snapshot && (running || !nav || nav.flagged === 0) ? (
-            <span className="text-[11.5px] tabular-nums text-muted-foreground">
+            <span
+              className="text-[11.5px] tabular-nums text-muted-foreground"
+              title={
+                snapshot.file_lines > snapshot.total
+                  ? `The file has ${plural(snapshot.file_lines, "line")}. The others are repeats of a sign, which get its translation, or lines kept as they are: song effects, drawings, lines with no words and styles this folder keeps.`
+                  : undefined
+              }
+            >
               <b className="font-semibold text-[color:var(--color-gold-hi)]">
                 {snapshot.translated.toLocaleString()}
               </b>{" "}
               / {plural(snapshot.total, "line")}
+              {snapshot.file_lines > snapshot.total ? (
+                <span className="text-muted-foreground/70">
+                  {" "}
+                  · {snapshot.file_lines.toLocaleString()} in the file
+                </span>
+              ) : null}
             </span>
           ) : null}
         </div>
